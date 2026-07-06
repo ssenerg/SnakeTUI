@@ -40,6 +40,37 @@ pub fn palette_name(idx: usize) -> &'static str {
     PALETTE[idx % PALETTE.len()].0
 }
 
+/// Selectable icons for food items, as `(name, glyph)`. Only single-width
+/// characters — the board renders each cell as the glyph plus a space.
+pub const GLYPHS: &[(&str, &str)] = &[
+    ("dot", "●"),
+    ("circle", "○"),
+    ("diamond", "◆"),
+    ("diamond outline", "◇"),
+    ("star", "★"),
+    ("star outline", "☆"),
+    ("heart", "♥"),
+    ("square", "■"),
+    ("square outline", "□"),
+    ("triangle up", "▲"),
+    ("triangle down", "▼"),
+    ("cross", "✖"),
+    ("plus", "✚"),
+    ("asterisk", "*"),
+    ("at sign", "@"),
+    ("dollar", "$"),
+    ("hash", "#"),
+    ("percent", "%"),
+];
+
+pub fn glyph_name(idx: usize) -> &'static str {
+    GLYPHS[idx % GLYPHS.len()].0
+}
+
+pub fn glyph_char(idx: usize) -> &'static str {
+    GLYPHS[idx % GLYPHS.len()].1
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WallMode {
     Full,
@@ -48,17 +79,16 @@ pub enum WallMode {
 }
 
 impl WallMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            WallMode::Full => "full_edge_wall",
-            WallMode::Open => "no_edge_wall",
-            WallMode::Gaps => "some_edge_wall",
-        }
-    }
-    const ALL: [WallMode; 3] = [WallMode::Full, WallMode::Open, WallMode::Gaps];
+    pub const ALL: [WallMode; 3] = [WallMode::Full, WallMode::Open, WallMode::Gaps];
+    const LABELS: [&'static str; 3] = ["full_edge_wall", "no_edge_wall", "some_edge_wall"];
+    const DISPLAY: [&'static str; 3] = ["solid", "none (wrap)", "gaps"];
 
-    fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.label() == label)
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap()
+    }
+
+    pub fn label(self) -> &'static str {
+        Self::LABELS[self.index()]
     }
 }
 
@@ -71,31 +101,29 @@ pub enum InnerWalls {
 }
 
 impl InnerWalls {
-    pub fn label(self) -> &'static str {
-        match self {
-            InnerWalls::Off => "off",
-            InnerWalls::Few => "few",
-            InnerWalls::Medium => "medium",
-            InnerWalls::Many => "many",
-        }
+    pub const ALL: [InnerWalls; 4] = [
+        InnerWalls::Off,
+        InnerWalls::Few,
+        InnerWalls::Medium,
+        InnerWalls::Many,
+    ];
+    const LABELS: [&'static str; 4] = ["off", "few", "medium", "many"];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap()
     }
-        pub fn density_percent(self) -> usize {
+
+    pub fn label(self) -> &'static str {
+        Self::LABELS[self.index()]
+    }
+
+    pub fn density_percent(self) -> usize {
         match self {
             InnerWalls::Off => 0,
             InnerWalls::Few => 6,
             InnerWalls::Medium => 12,
             InnerWalls::Many => 18,
         }
-    }
-    const ALL: [InnerWalls; 4] = [
-        InnerWalls::Off,
-        InnerWalls::Few,
-        InnerWalls::Medium,
-        InnerWalls::Many,
-    ];
-
-    fn from_label(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.label() == label)
     }
 }
 
@@ -106,10 +134,48 @@ pub enum GrowthMode {
 }
 
 impl GrowthMode {
+    pub const ALL: [GrowthMode; 2] = [GrowthMode::Instant, GrowthMode::AtTail];
+    const LABELS: [&'static str; 2] = ["instant", "at_tail"];
+    const DISPLAY: [&'static str; 2] = ["instant", "when food reaches tail"];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap()
+    }
+
     pub fn label(self) -> &'static str {
+        Self::DISPLAY[self.index()]
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ColorSlot {
+    Head,
+    Body,
+    Food,
+    SuperFood,
+    Poison,
+    Wall,
+    Background,
+}
+
+pub const COLOR_SLOTS: usize = 7;
+
+#[derive(Clone, Copy)]
+pub enum IconSlot {
+    Food,
+    SuperFood,
+    Poison,
+}
+
+pub const ICON_SLOTS: usize = 3;
+
+impl IconSlot {
+    /// The color slot this icon is drawn with, used for menu previews.
+    pub fn color_slot(self) -> ColorSlot {
         match self {
-            GrowthMode::Instant => "instant",
-            GrowthMode::AtTail => "when food reaches tail",
+            IconSlot::Food => ColorSlot::Food,
+            IconSlot::SuperFood => ColorSlot::SuperFood,
+            IconSlot::Poison => ColorSlot::Poison,
         }
     }
 }
@@ -121,22 +187,18 @@ pub struct GameConfig {
     pub tick_ms: u64,
     pub wall_mode: WallMode,
     pub inner_walls: InnerWalls,
-        pub food_interval_s: u64,
-    pub food_ttl_s: u64,     pub super_interval_s: u64,
+    pub food_interval_s: u64,
+    pub food_ttl_s: u64,
+    pub super_interval_s: u64,
     pub super_ttl_s: u64,
     pub poison_interval_s: u64,
     pub poison_ttl_s: u64,
     pub growth_mode: GrowthMode,
     pub pass_through_self: bool,
     pub super_growth: u32,
-        pub boost_duration_s: u64,
-        pub color_head: usize,
-    pub color_body: usize,
-    pub color_food: usize,
-    pub color_super: usize,
-    pub color_poison: usize,
-    pub color_wall: usize,
-    pub color_bg: usize,
+    pub boost_duration_s: u64,
+    pub icons: [usize; ICON_SLOTS],
+    pub colors: [usize; COLOR_SLOTS],
 }
 
 impl Default for GameConfig {
@@ -157,128 +219,392 @@ impl Default for GameConfig {
             pass_through_self: false,
             super_growth: 3,
             boost_duration_s: 5,
-            color_head: 3,               color_body: 2,               color_food: 1,               color_super: 5,              color_poison: 8,             color_wall: 13,              color_bg: 15,            }
+            // food ●, super food ★, poison ✖
+            icons: [0, 4, 11],
+            // head, body, food, super food, poison, wall, background
+            colors: [3, 2, 1, 5, 8, 13, 15],
+        }
     }
 }
 
-pub const CONFIG_ITEMS: usize = 22;
-
-fn step_num(v: u64, delta: i64, min: u64, max: u64, step: u64) -> u64 {
-    (v as i64 + delta * step as i64).clamp(min as i64, max as i64) as u64
+#[derive(Clone, Copy)]
+pub enum NumFmt {
+    Plain,
+    Millis,
+    Secs,
+    SecsOrOff,
+    Plus,
 }
 
-fn secs_or_off(v: u64) -> String {
-    if v == 0 { "off".into() } else { format!("{v} s") }
+impl NumFmt {
+    fn render(self, v: u64) -> String {
+        match self {
+            NumFmt::Plain => v.to_string(),
+            NumFmt::Millis => format!("{v} ms"),
+            NumFmt::Secs => format!("{v} s"),
+            NumFmt::SecsOrOff => {
+                if v == 0 {
+                    "off".into()
+                } else {
+                    format!("{v} s")
+                }
+            }
+            NumFmt::Plus => format!("+{v}"),
+        }
+    }
 }
+
+pub enum Kind {
+    Num {
+        get: fn(&GameConfig) -> u64,
+        set: fn(&mut GameConfig, u64),
+        min: u64,
+        max: u64,
+        step: u64,
+        fmt: NumFmt,
+    },
+    Choice {
+        get: fn(&GameConfig) -> usize,
+        set: fn(&mut GameConfig, usize),
+        saved: &'static [&'static str],
+        shown: &'static [&'static str],
+    },
+    Color(ColorSlot),
+    Icon(IconSlot),
+}
+
+pub struct Setting {
+    pub label: &'static str,
+    pub key: &'static str,
+    pub kind: Kind,
+}
+
+pub const SECTIONS: &[(&str, usize)] = &[
+    ("Board", 0),
+    ("Food", 5),
+    ("Gameplay", 11),
+    ("Icons", 15),
+    ("Colors", 18),
+];
+
+pub const SETTINGS: &[Setting] = &[
+    Setting {
+        label: "board width",
+        key: "width",
+        kind: Kind::Num {
+            get: |c| c.width as u64,
+            set: |c, v| c.width = v as u16,
+            min: 10,
+            max: 80,
+            step: 1,
+            fmt: NumFmt::Plain,
+        },
+    },
+    Setting {
+        label: "board height",
+        key: "height",
+        kind: Kind::Num {
+            get: |c| c.height as u64,
+            set: |c, v| c.height = v as u16,
+            min: 8,
+            max: 40,
+            step: 1,
+            fmt: NumFmt::Plain,
+        },
+    },
+    Setting {
+        label: "tick speed",
+        key: "tick_ms",
+        kind: Kind::Num {
+            get: |c| c.tick_ms,
+            set: |c, v| c.tick_ms = v,
+            min: 50,
+            max: 1000,
+            step: 25,
+            fmt: NumFmt::Millis,
+        },
+    },
+    Setting {
+        label: "edge walls",
+        key: "edge_walls",
+        kind: Kind::Choice {
+            get: |c| c.wall_mode.index(),
+            set: |c, i| c.wall_mode = WallMode::ALL[i],
+            saved: &WallMode::LABELS,
+            shown: &WallMode::DISPLAY,
+        },
+    },
+    Setting {
+        label: "inner walls",
+        key: "inner_walls",
+        kind: Kind::Choice {
+            get: |c| c.inner_walls.index(),
+            set: |c, i| c.inner_walls = InnerWalls::ALL[i],
+            saved: &InnerWalls::LABELS,
+            shown: &InnerWalls::LABELS,
+        },
+    },
+    Setting {
+        label: "food spawns every",
+        key: "food_interval_s",
+        kind: Kind::Num {
+            get: |c| c.food_interval_s,
+            set: |c, v| c.food_interval_s = v,
+            min: 1,
+            max: 60,
+            step: 1,
+            fmt: NumFmt::Secs,
+        },
+    },
+    Setting {
+        label: "food lifetime",
+        key: "food_ttl_s",
+        kind: Kind::Num {
+            get: |c| c.food_ttl_s,
+            set: |c, v| c.food_ttl_s = v,
+            min: 0,
+            max: 120,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "super food spawns every",
+        key: "super_interval_s",
+        kind: Kind::Num {
+            get: |c| c.super_interval_s,
+            set: |c, v| c.super_interval_s = v,
+            min: 0,
+            max: 180,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "super food lifetime",
+        key: "super_ttl_s",
+        kind: Kind::Num {
+            get: |c| c.super_ttl_s,
+            set: |c, v| c.super_ttl_s = v,
+            min: 0,
+            max: 120,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "poison spawns every",
+        key: "poison_interval_s",
+        kind: Kind::Num {
+            get: |c| c.poison_interval_s,
+            set: |c, v| c.poison_interval_s = v,
+            min: 0,
+            max: 180,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "poison lifetime",
+        key: "poison_ttl_s",
+        kind: Kind::Num {
+            get: |c| c.poison_ttl_s,
+            set: |c, v| c.poison_ttl_s = v,
+            min: 0,
+            max: 120,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "growth mode",
+        key: "growth",
+        kind: Kind::Choice {
+            get: |c| c.growth_mode.index(),
+            set: |c, i| c.growth_mode = GrowthMode::ALL[i],
+            saved: &GrowthMode::LABELS,
+            shown: &GrowthMode::DISPLAY,
+        },
+    },
+    Setting {
+        label: "pass through self",
+        key: "pass_through_self",
+        kind: Kind::Choice {
+            get: |c| c.pass_through_self as usize,
+            set: |c, i| c.pass_through_self = i != 0,
+            saved: &["false", "true"],
+            shown: &["no", "yes"],
+        },
+    },
+    Setting {
+        label: "super food growth",
+        key: "super_growth",
+        kind: Kind::Num {
+            get: |c| c.super_growth as u64,
+            set: |c, v| c.super_growth = v as u32,
+            min: 1,
+            max: 9,
+            step: 1,
+            fmt: NumFmt::Plus,
+        },
+    },
+    Setting {
+        label: "super food speed boost",
+        key: "boost_duration_s",
+        kind: Kind::Num {
+            get: |c| c.boost_duration_s,
+            set: |c, v| c.boost_duration_s = v,
+            min: 0,
+            max: 60,
+            step: 1,
+            fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "food icon",
+        key: "icon_food",
+        kind: Kind::Icon(IconSlot::Food),
+    },
+    Setting {
+        label: "super food icon",
+        key: "icon_super",
+        kind: Kind::Icon(IconSlot::SuperFood),
+    },
+    Setting {
+        label: "poison icon",
+        key: "icon_poison",
+        kind: Kind::Icon(IconSlot::Poison),
+    },
+    Setting {
+        label: "snake head",
+        key: "color_head",
+        kind: Kind::Color(ColorSlot::Head),
+    },
+    Setting {
+        label: "snake body",
+        key: "color_body",
+        kind: Kind::Color(ColorSlot::Body),
+    },
+    Setting {
+        label: "food",
+        key: "color_food",
+        kind: Kind::Color(ColorSlot::Food),
+    },
+    Setting {
+        label: "super food",
+        key: "color_super",
+        kind: Kind::Color(ColorSlot::SuperFood),
+    },
+    Setting {
+        label: "poison",
+        key: "color_poison",
+        kind: Kind::Color(ColorSlot::Poison),
+    },
+    Setting {
+        label: "walls",
+        key: "color_wall",
+        kind: Kind::Color(ColorSlot::Wall),
+    },
+    Setting {
+        label: "background",
+        key: "color_bg",
+        kind: Kind::Color(ColorSlot::Background),
+    },
+];
 
 impl GameConfig {
-    pub fn item_label(i: usize) -> &'static str {
-        match i {
-            0 => "board width",
-            1 => "board height",
-            2 => "tick speed",
-            3 => "edge walls",
-            4 => "inner walls",
-            5 => "food spawns every",
-            6 => "food lifetime",
-            7 => "super food spawns every",
-            8 => "super food lifetime",
-            9 => "poison spawns every",
-            10 => "poison lifetime",
-            11 => "growth mode",
-            12 => "pass through self",
-            13 => "super food growth",
-            14 => "super food speed boost",
-            15 => "color: snake head",
-            16 => "color: snake body",
-            17 => "color: food",
-            18 => "color: super food",
-            19 => "color: poison",
-            20 => "color: wall",
-            21 => "color: background",
-            _ => "",
+    pub fn color(&self, slot: ColorSlot) -> Color {
+        palette_color(self.colors[slot as usize])
+    }
+
+    pub fn icon(&self, slot: IconSlot) -> &'static str {
+        glyph_char(self.icons[slot as usize])
+    }
+
+    pub fn value_str(&self, i: usize) -> String {
+        match &SETTINGS[i].kind {
+            Kind::Num { get, fmt, .. } => fmt.render(get(self)),
+            Kind::Choice { get, shown, .. } => shown[get(self)].to_string(),
+            Kind::Color(slot) => palette_name(self.colors[*slot as usize]).to_string(),
+            Kind::Icon(slot) => glyph_name(self.icons[*slot as usize]).to_string(),
         }
     }
 
-    pub fn item_value(&self, i: usize) -> String {
-        match i {
-            0 => self.width.to_string(),
-            1 => self.height.to_string(),
-            2 => format!("{} ms", self.tick_ms),
-            3 => self.wall_mode.label().into(),
-            4 => self.inner_walls.label().into(),
-            5 => format!("{} s", self.food_interval_s),
-            6 => secs_or_off(self.food_ttl_s),
-            7 => secs_or_off(self.super_interval_s),
-            8 => secs_or_off(self.super_ttl_s),
-            9 => secs_or_off(self.poison_interval_s),
-            10 => secs_or_off(self.poison_ttl_s),
-            11 => self.growth_mode.label().into(),
-            12 => if self.pass_through_self { "yes" } else { "no" }.into(),
-            13 => format!("+{}", self.super_growth),
-            14 => secs_or_off(self.boost_duration_s),
-            15 => palette_name(self.color_head).into(),
-            16 => palette_name(self.color_body).into(),
-            17 => palette_name(self.color_food).into(),
-            18 => palette_name(self.color_super).into(),
-            19 => palette_name(self.color_poison).into(),
-            20 => palette_name(self.color_wall).into(),
-            21 => palette_name(self.color_bg).into(),
-            _ => String::new(),
+    pub fn swatch(&self, i: usize) -> Option<Color> {
+        match SETTINGS[i].kind {
+            Kind::Color(slot) => Some(self.color(slot)),
+            _ => None,
         }
     }
 
-        pub fn item_swatch(&self, i: usize) -> Option<Color> {
-        let idx = match i {
-            15 => self.color_head,
-            16 => self.color_body,
-            17 => self.color_food,
-            18 => self.color_super,
-            19 => self.color_poison,
-            20 => self.color_wall,
-            21 => self.color_bg,
-            _ => return None,
-        };
-        Some(palette_color(idx))
+    /// Glyph preview (glyph, its in-game color) for setting `i`, if it is an
+    /// icon setting.
+    pub fn icon_preview(&self, i: usize) -> Option<(&'static str, Color)> {
+        match SETTINGS[i].kind {
+            Kind::Icon(slot) => Some((self.icon(slot), self.color(slot.color_slot()))),
+            _ => None,
+        }
     }
 
     pub fn adjust(&mut self, i: usize, delta: i64) {
         let cycle = |cur: usize, len: usize| (cur as i64 + delta).rem_euclid(len as i64) as usize;
-        match i {
-            0 => self.width = step_num(self.width as u64, delta, 10, 80, 1) as u16,
-            1 => self.height = step_num(self.height as u64, delta, 8, 40, 1) as u16,
-            2 => self.tick_ms = step_num(self.tick_ms, delta, 50, 1000, 25),
-            3 => {
-                let cur = WallMode::ALL.iter().position(|m| *m == self.wall_mode).unwrap();
-                self.wall_mode = WallMode::ALL[cycle(cur, WallMode::ALL.len())];
+        match &SETTINGS[i].kind {
+            Kind::Num {
+                get,
+                set,
+                min,
+                max,
+                step,
+                ..
+            } => {
+                let v = (get(self) as i64 + delta * *step as i64).clamp(*min as i64, *max as i64);
+                set(self, v as u64);
             }
-            4 => {
-                let cur = InnerWalls::ALL.iter().position(|m| *m == self.inner_walls).unwrap();
-                self.inner_walls = InnerWalls::ALL[cycle(cur, InnerWalls::ALL.len())];
+            Kind::Choice {
+                get, set, saved, ..
+            } => set(self, cycle(get(self), saved.len())),
+            Kind::Color(slot) => {
+                let slot = *slot as usize;
+                self.colors[slot] = cycle(self.colors[slot], PALETTE.len());
             }
-            5 => self.food_interval_s = step_num(self.food_interval_s, delta, 1, 60, 1),
-            6 => self.food_ttl_s = step_num(self.food_ttl_s, delta, 0, 120, 1),
-            7 => self.super_interval_s = step_num(self.super_interval_s, delta, 0, 180, 1),
-            8 => self.super_ttl_s = step_num(self.super_ttl_s, delta, 0, 120, 1),
-            9 => self.poison_interval_s = step_num(self.poison_interval_s, delta, 0, 180, 1),
-            10 => self.poison_ttl_s = step_num(self.poison_ttl_s, delta, 0, 120, 1),
-            11 => {
-                self.growth_mode = match self.growth_mode {
-                    GrowthMode::Instant => GrowthMode::AtTail,
-                    GrowthMode::AtTail => GrowthMode::Instant,
+            Kind::Icon(slot) => {
+                let slot = *slot as usize;
+                self.icons[slot] = cycle(self.icons[slot], GLYPHS.len());
+            }
+        }
+    }
+
+    fn saved_value(&self, i: usize) -> String {
+        match &SETTINGS[i].kind {
+            Kind::Num { get, .. } => get(self).to_string(),
+            Kind::Choice { get, saved, .. } => saved[get(self)].to_string(),
+            Kind::Color(slot) => self.colors[*slot as usize].to_string(),
+            Kind::Icon(slot) => self.icons[*slot as usize].to_string(),
+        }
+    }
+
+    fn set_from_saved(&mut self, i: usize, value: &str) {
+        match &SETTINGS[i].kind {
+            Kind::Num { set, min, max, .. } => {
+                if let Ok(n) = value.parse::<u64>() {
+                    set(self, n.clamp(*min, *max));
                 }
             }
-            12 => self.pass_through_self = !self.pass_through_self,
-            13 => self.super_growth = step_num(self.super_growth as u64, delta, 1, 9, 1) as u32,
-            14 => self.boost_duration_s = step_num(self.boost_duration_s, delta, 0, 60, 1),
-            15 => self.color_head = cycle(self.color_head, PALETTE.len()),
-            16 => self.color_body = cycle(self.color_body, PALETTE.len()),
-            17 => self.color_food = cycle(self.color_food, PALETTE.len()),
-            18 => self.color_super = cycle(self.color_super, PALETTE.len()),
-            19 => self.color_poison = cycle(self.color_poison, PALETTE.len()),
-            20 => self.color_wall = cycle(self.color_wall, PALETTE.len()),
-            21 => self.color_bg = cycle(self.color_bg, PALETTE.len()),
-            _ => {}
+            Kind::Choice { set, saved, .. } => {
+                if let Some(idx) = saved.iter().position(|s| *s == value) {
+                    set(self, idx);
+                }
+            }
+            Kind::Color(slot) => {
+                if let Ok(n) = value.parse::<usize>() {
+                    self.colors[*slot as usize] = n % PALETTE.len();
+                }
+            }
+            Kind::Icon(slot) => {
+                if let Ok(n) = value.parse::<usize>() {
+                    self.icons[*slot as usize] = n % GLYPHS.len();
+                }
+            }
         }
     }
 
@@ -286,7 +612,7 @@ impl GameConfig {
         data_dir().join("config")
     }
 
-                pub fn load() -> Self {
+    pub fn load() -> Self {
         let mut cfg = Self::default();
         let Ok(contents) = fs::read_to_string(Self::path()) else {
             return cfg;
@@ -295,161 +621,23 @@ impl GameConfig {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let (key, value) = (key.trim(), value.trim());
-            let num = value.parse::<u64>();
-            match key {
-                "width" => {
-                    if let Ok(n) = num {
-                        cfg.width = n.clamp(10, 80) as u16;
-                    }
-                }
-                "height" => {
-                    if let Ok(n) = num {
-                        cfg.height = n.clamp(8, 40) as u16;
-                    }
-                }
-                "tick_ms" => {
-                    if let Ok(n) = num {
-                        cfg.tick_ms = n.clamp(50, 1000);
-                    }
-                }
-                "edge_walls" => {
-                    if let Some(m) = WallMode::from_label(value) {
-                        cfg.wall_mode = m;
-                    }
-                }
-                "inner_walls" => {
-                    if let Some(m) = InnerWalls::from_label(value) {
-                        cfg.inner_walls = m;
-                    }
-                }
-                "food_interval_s" => {
-                    if let Ok(n) = num {
-                        cfg.food_interval_s = n.clamp(1, 60);
-                    }
-                }
-                "food_ttl_s" => {
-                    if let Ok(n) = num {
-                        cfg.food_ttl_s = n.min(120);
-                    }
-                }
-                "super_interval_s" => {
-                    if let Ok(n) = num {
-                        cfg.super_interval_s = n.min(180);
-                    }
-                }
-                "super_ttl_s" => {
-                    if let Ok(n) = num {
-                        cfg.super_ttl_s = n.min(120);
-                    }
-                }
-                "poison_interval_s" => {
-                    if let Ok(n) = num {
-                        cfg.poison_interval_s = n.min(180);
-                    }
-                }
-                "poison_ttl_s" => {
-                    if let Ok(n) = num {
-                        cfg.poison_ttl_s = n.min(120);
-                    }
-                }
-                "growth" => {
-                    cfg.growth_mode = match value {
-                        "instant" => GrowthMode::Instant,
-                        "at_tail" => GrowthMode::AtTail,
-                        _ => cfg.growth_mode,
-                    }
-                }
-                "pass_through_self" => cfg.pass_through_self = value == "true",
-                "super_growth" => {
-                    if let Ok(n) = num {
-                        cfg.super_growth = n.clamp(1, 9) as u32;
-                    }
-                }
-                "boost_duration_s" => {
-                    if let Ok(n) = num {
-                        cfg.boost_duration_s = n.min(60);
-                    }
-                }
-                "color_head" => {
-                    if let Ok(n) = num {
-                        cfg.color_head = n as usize % PALETTE.len();
-                    }
-                }
-                "color_body" => {
-                    if let Ok(n) = num {
-                        cfg.color_body = n as usize % PALETTE.len();
-                    }
-                }
-                "color_food" => {
-                    if let Ok(n) = num {
-                        cfg.color_food = n as usize % PALETTE.len();
-                    }
-                }
-                "color_super" => {
-                    if let Ok(n) = num {
-                        cfg.color_super = n as usize % PALETTE.len();
-                    }
-                }
-                "color_poison" => {
-                    if let Ok(n) = num {
-                        cfg.color_poison = n as usize % PALETTE.len();
-                    }
-                }
-                "color_wall" => {
-                    if let Ok(n) = num {
-                        cfg.color_wall = n as usize % PALETTE.len();
-                    }
-                }
-                "color_bg" => {
-                    if let Ok(n) = num {
-                        cfg.color_bg = n as usize % PALETTE.len();
-                    }
-                }
-                _ => {}
+            if let Some(i) = SETTINGS.iter().position(|s| s.key == key.trim()) {
+                cfg.set_from_saved(i, value.trim());
             }
         }
         cfg
     }
 
     pub fn save(&self) {
-        let growth = match self.growth_mode {
-            GrowthMode::Instant => "instant",
-            GrowthMode::AtTail => "at_tail",
-        };
-        let contents = format!(
-            "width={}\nheight={}\ntick_ms={}\nedge_walls={}\ninner_walls={}\n\
-             food_interval_s={}\nfood_ttl_s={}\nsuper_interval_s={}\nsuper_ttl_s={}\n\
-             poison_interval_s={}\npoison_ttl_s={}\ngrowth={}\npass_through_self={}\n\
-             super_growth={}\nboost_duration_s={}\ncolor_head={}\ncolor_body={}\n\
-             color_food={}\ncolor_super={}\ncolor_poison={}\ncolor_wall={}\ncolor_bg={}\n",
-            self.width,
-            self.height,
-            self.tick_ms,
-            self.wall_mode.label(),
-            self.inner_walls.label(),
-            self.food_interval_s,
-            self.food_ttl_s,
-            self.super_interval_s,
-            self.super_ttl_s,
-            self.poison_interval_s,
-            self.poison_ttl_s,
-            growth,
-            self.pass_through_self,
-            self.super_growth,
-            self.boost_duration_s,
-            self.color_head,
-            self.color_body,
-            self.color_food,
-            self.color_super,
-            self.color_poison,
-            self.color_wall,
-            self.color_bg,
-        );
+        let contents: String = SETTINGS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}={}\n", s.key, self.saved_value(i)))
+            .collect();
         let _ = fs::write(Self::path(), contents);
     }
 
-            pub fn record_key(&self) -> String {
+    pub fn record_key(&self) -> String {
         format!(
             "size:{}x{} tick:{} edge:{} inner:{} food:{}/{} super:{}/{} poison:{}/{} growth:{} ghost:{} supergrow:{} boost:{}",
             self.width,
@@ -468,5 +656,48 @@ impl GameConfig {
             self.super_growth,
             self.boost_duration_s,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let mut cfg = GameConfig::default();
+        for i in 0..SETTINGS.len() {
+            cfg.adjust(i, 1);
+        }
+        let mut restored = GameConfig::default();
+        for (i, s) in SETTINGS.iter().enumerate() {
+            let _ = s;
+            restored.set_from_saved(i, &cfg.saved_value(i));
+        }
+        assert_eq!(cfg.record_key(), restored.record_key());
+        assert_eq!(cfg.colors, restored.colors);
+        assert_eq!(cfg.icons, restored.icons);
+    }
+
+    #[test]
+    fn adjust_respects_bounds() {
+        let mut cfg = GameConfig::default();
+        for _ in 0..200 {
+            cfg.adjust(0, -1);
+        }
+        assert_eq!(cfg.width, 10);
+        for _ in 0..200 {
+            cfg.adjust(0, 1);
+        }
+        assert_eq!(cfg.width, 80);
+    }
+
+    #[test]
+    fn config_keys_are_unique() {
+        for (i, a) in SETTINGS.iter().enumerate() {
+            for b in &SETTINGS[i + 1..] {
+                assert_ne!(a.key, b.key);
+            }
+        }
     }
 }

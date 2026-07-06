@@ -15,10 +15,10 @@ impl Records {
         let mut map = HashMap::new();
         if let Ok(contents) = fs::read_to_string(&path) {
             for line in contents.lines() {
-                if let Some((key, value)) = line.rsplit_once('\t') {
-                    if let Ok(n) = value.trim().parse() {
-                        map.insert(key.to_string(), n);
-                    }
+                if let Some((key, value)) = line.rsplit_once('\t')
+                    && let Ok(n) = value.trim().parse()
+                {
+                    map.insert(key.to_string(), n);
                 }
             }
         }

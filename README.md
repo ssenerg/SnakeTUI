@@ -1,4 +1,4 @@
-# snaketui
+# SnakeTUI
 
 A highly configurable snake game for your terminal, built in Rust with
 [ratatui](https://ratatui.rs).
@@ -9,9 +9,9 @@ A highly configurable snake game for your terminal, built in Rust with
   the tick timer. Press an arrow three times within one tick and the snake
   moves three times.
 - **Three edge-wall modes**
-  - `full_edge_wall` — the board is enclosed; hitting the border ends the game
-  - `no_edge_wall` — the snake wraps around to the opposite side
-  - `some_edge_wall` — random border walls with gaps; gaps are generated in
+  - `solid` — the board is enclosed; hitting the border ends the game
+  - `none (wrap)` — the snake wraps around to the opposite side
+  - `gaps` — random border walls with gaps; gaps are generated in
     mirrored pairs, so wrapping through a gap always lands on an open cell
 - **Inner wall generation** with two guarantees: every free cell stays
   reachable (the snake can always reach its maximum possible length), and no
@@ -59,9 +59,11 @@ cargo run --release
 
 | Key | Action |
 | --- | --- |
-| `↑ ↓ ← →` / `WASD` | Move (config menu: select / change value) |
+| `↑ ↓ ← →` / `WASD` | Move (settings menu: select / change value) |
 | `Enter` | Start game / confirm |
-| `Esc` | Pause (resume or quit to menu) |
+| `Esc` / `p` | Pause (resume or quit to menu) |
+| `d` | Reset settings to defaults (in the menu) |
+| `r` | Play again with the same settings (after game over) |
 | `q` | Quit |
 
 ### Config options
@@ -70,7 +72,7 @@ cargo run --release
 | --- | --- |
 | board width / height | Board size in cells |
 | tick speed | Milliseconds between automatic moves |
-| edge walls | `full_edge_wall`, `no_edge_wall`, or `some_edge_wall` |
+| edge walls | `solid` (enclosed), `none (wrap)`, or `gaps` (mirrored openings) |
 | inner walls | Amount of randomly generated interior walls |
 | food / super food / poison spawns every | Spawn interval per item type (`off` disables) |
 | food / super food / poison lifetime | Seconds before an uneaten item disappears (`off` = forever) |
@@ -78,10 +80,11 @@ cargo run --release
 | pass through self | If `yes`, the snake can cross its own body |
 | super food growth | Length gained from super food |
 | super food speed boost | Duration of the 2× speed boost (`off` disables) |
-| color: … | Per-cell-type colors |
+| food / super food / poison icon | Glyph drawn on the board (dot, star, heart, cross, …) |
+| colors | Per-cell-type colors (head, body, food, super food, poison, walls, background) |
 
-The HUD shows your current length, the record for the active configuration,
-and the elapsed play time.
+The board's frame shows your current length, the record for the active
+configuration, and the elapsed play time in its heading.
 
 ## Data files
 

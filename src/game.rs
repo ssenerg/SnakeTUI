@@ -1,10 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rand::RngExt;
 
-use crate::config::{GameConfig, GrowthMode, WallMode};
+use crate::board;
+use crate::config::{GameConfig, GrowthMode};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Point {
@@ -38,6 +39,26 @@ pub enum FoodKind {
     Poison,
 }
 
+impl FoodKind {
+    pub const ALL: [FoodKind; 3] = [FoodKind::Normal, FoodKind::Super, FoodKind::Poison];
+}
+
+fn spawn_interval_s(cfg: &GameConfig, kind: FoodKind) -> u64 {
+    match kind {
+        FoodKind::Normal => cfg.food_interval_s,
+        FoodKind::Super => cfg.super_interval_s,
+        FoodKind::Poison => cfg.poison_interval_s,
+    }
+}
+
+fn ttl_s(cfg: &GameConfig, kind: FoodKind) -> u64 {
+    match kind {
+        FoodKind::Normal => cfg.food_ttl_s,
+        FoodKind::Super => cfg.super_ttl_s,
+        FoodKind::Poison => cfg.poison_ttl_s,
+    }
+}
+
 pub struct Food {
     pub pos: Point,
     pub kind: FoodKind,
@@ -63,7 +84,7 @@ pub struct Game {
     growth: Vec<u32>,
     pub clock: Duration,
     tick_accum: Duration,
-    next_spawn: [Option<Duration>; 3],
+    next_spawn: [Option<Duration>; FoodKind::ALL.len()],
     boost_until: Duration,
     pub over: Option<GameOverReason>,
     free_cells: usize,
@@ -73,14 +94,18 @@ pub struct Game {
 impl Game {
     pub fn new(cfg: GameConfig) -> Result<Self> {
         let (width, height) = (cfg.width, cfg.height);
-        let walls = generate_walls(&cfg);
+        let walls = board::generate_walls(&cfg);
         let free_cells = walls.iter().filter(|w| !**w).count();
-        let (snake, dir) = place_snake(&walls, width, height)?;
-        let next_spawn = [
-            (cfg.food_interval_s > 0).then(|| Duration::from_secs(1)),
-            (cfg.super_interval_s > 0).then(|| Duration::from_secs(cfg.super_interval_s)),
-            (cfg.poison_interval_s > 0).then(|| Duration::from_secs(cfg.poison_interval_s)),
-        ];
+        let (snake, dir) = board::place_snake(&walls, width, height)?;
+        let next_spawn = FoodKind::ALL.map(|kind| {
+            let interval = spawn_interval_s(&cfg, kind);
+            let first = if kind == FoodKind::Normal {
+                1
+            } else {
+                interval
+            };
+            (interval > 0).then(|| Duration::from_secs(first))
+        });
         Ok(Self {
             cfg,
             width,
@@ -124,10 +149,22 @@ impl Game {
     fn wrap_next(&self, p: Point, dir: Direction) -> Point {
         let (w, h) = (self.width, self.height);
         match dir {
-            Direction::Up => Point { x: p.x, y: (p.y + h - 1) % h },
-            Direction::Down => Point { x: p.x, y: (p.y + 1) % h },
-            Direction::Left => Point { x: (p.x + w - 1) % w, y: p.y },
-            Direction::Right => Point { x: (p.x + 1) % w, y: p.y },
+            Direction::Up => Point {
+                x: p.x,
+                y: (p.y + h - 1) % h,
+            },
+            Direction::Down => Point {
+                x: p.x,
+                y: (p.y + 1) % h,
+            },
+            Direction::Left => Point {
+                x: (p.x + w - 1) % w,
+                y: p.y,
+            },
+            Direction::Right => Point {
+                x: (p.x + 1) % w,
+                y: p.y,
+            },
         }
     }
 
@@ -152,20 +189,17 @@ impl Game {
         self.clock += dt;
 
         let clock = self.clock;
-        self.foods.retain(|f| f.expires_at.is_none_or(|e| e > clock));
+        self.foods
+            .retain(|f| f.expires_at.is_none_or(|e| e > clock));
 
-        for k in 0..3 {
-            let (kind, interval) = match k {
-                0 => (FoodKind::Normal, self.cfg.food_interval_s),
-                1 => (FoodKind::Super, self.cfg.super_interval_s),
-                _ => (FoodKind::Poison, self.cfg.poison_interval_s),
-            };
-            while let Some(t) = self.next_spawn[k] {
+        for (i, kind) in FoodKind::ALL.into_iter().enumerate() {
+            let interval = spawn_interval_s(&self.cfg, kind);
+            while let Some(t) = self.next_spawn[i] {
                 if clock < t {
                     break;
                 }
                 self.spawn_food(kind);
-                self.next_spawn[k] = Some(t + Duration::from_secs(interval));
+                self.next_spawn[i] = Some(t + Duration::from_secs(interval));
             }
         }
 
@@ -197,9 +231,8 @@ impl Game {
 
         if !self.cfg.pass_through_self && self.snake.contains(&next) {
             let tail = *self.snake.back().unwrap();
-            let tail_vacates = !grow
-                && next == tail
-                && self.snake.iter().filter(|&&p| p == tail).count() == 1;
+            let tail_vacates =
+                !grow && next == tail && self.snake.iter().filter(|&&p| p == tail).count() == 1;
             if !tail_vacates {
                 self.over = Some(GameOverReason::HitSelf);
                 return;
@@ -276,237 +309,20 @@ impl Game {
         }
         let mut rng = rand::rng();
         let pos = cells[rng.random_range(0..cells.len())];
-        let ttl = match kind {
-            FoodKind::Normal => self.cfg.food_ttl_s,
-            FoodKind::Super => self.cfg.super_ttl_s,
-            FoodKind::Poison => self.cfg.poison_ttl_s,
-        };
+        let ttl = ttl_s(&self.cfg, kind);
         let expires_at = (ttl > 0).then(|| self.clock + Duration::from_secs(ttl));
-        self.foods.push(Food { pos, kind, expires_at });
+        self.foods.push(Food {
+            pos,
+            kind,
+            expires_at,
+        });
     }
-}
-
-fn generate_walls(cfg: &GameConfig) -> Vec<bool> {
-    let w = cfg.width as usize;
-    let h = cfg.height as usize;
-    let mut walls = vec![false; w * h];
-    let mut rng = rand::rng();
-
-    match cfg.wall_mode {
-        WallMode::Full => {
-            for x in 0..w {
-                walls[x] = true;
-                walls[(h - 1) * w + x] = true;
-            }
-            for y in 0..h {
-                walls[y * w] = true;
-                walls[y * w + w - 1] = true;
-            }
-        }
-        WallMode::Open => {}
-        WallMode::Gaps => {
-            for &(x, y) in &[(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
-                walls[y * w + x] = true;
-            }
-            for x in 1..w - 1 {
-                let is_wall = rng.random_range(0..100) < 65;
-                walls[x] = is_wall;
-                walls[(h - 1) * w + x] = is_wall;
-            }
-            for y in 1..h - 1 {
-                let is_wall = rng.random_range(0..100) < 65;
-                walls[y * w] = is_wall;
-                walls[y * w + w - 1] = is_wall;
-            }
-        }
-    }
-
-    let density = cfg.inner_walls.density_percent();
-    if density > 0 && w > 2 && h > 2 {
-        let target = (w - 2) * (h - 2) * density / 100;
-        let mut placed = 0;
-        let mut attempts = 0;
-        while placed < target && attempts < target * 50 + 100 {
-            attempts += 1;
-            let x = rng.random_range(1..w - 1);
-            let y = rng.random_range(1..h - 1);
-            let i = y * w + x;
-            if walls[i] {
-                continue;
-            }
-            walls[i] = true;
-            if all_free_connected(&walls, w, h) && no_dead_ends(&walls, w, h) {
-                placed += 1;
-            } else {
-                walls[i] = false;
-            }
-        }
-    }
-
-    walls
-}
-
-fn no_dead_ends(walls: &[bool], w: usize, h: usize) -> bool {
-    for y in 0..h {
-        for x in 0..w {
-            if walls[y * w + x] {
-                continue;
-            }
-            let exits = [
-                ((x + 1) % w, y),
-                ((x + w - 1) % w, y),
-                (x, (y + 1) % h),
-                (x, (y + h - 1) % h),
-            ]
-            .iter()
-            .filter(|&&(nx, ny)| !walls[ny * w + nx])
-            .count();
-            if exits < 2 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn all_free_connected(walls: &[bool], w: usize, h: usize) -> bool {
-    let total_free = walls.iter().filter(|x| !**x).count();
-    let Some(start) = walls.iter().position(|x| !*x) else {
-        return false;
-    };
-    let mut seen = vec![false; w * h];
-    seen[start] = true;
-    let mut count = 1;
-    let mut queue = VecDeque::from([start]);
-    while let Some(i) = queue.pop_front() {
-        let (x, y) = (i % w, i / w);
-        for (nx, ny) in [
-            ((x + 1) % w, y),
-            ((x + w - 1) % w, y),
-            (x, (y + 1) % h),
-            (x, (y + h - 1) % h),
-        ] {
-            let ni = ny * w + nx;
-            if !seen[ni] && !walls[ni] {
-                seen[ni] = true;
-                count += 1;
-                queue.push_back(ni);
-            }
-        }
-    }
-    count == total_free
-}
-
-fn place_snake(walls: &[bool], w: u16, h: u16) -> Result<(VecDeque<Point>, Direction)> {
-    let wu = w as usize;
-    let free: Vec<Point> = (0..h)
-        .flat_map(|y| (0..w).map(move |x| Point { x, y }))
-        .filter(|p| !walls[p.y as usize * wu + p.x as usize])
-        .collect();
-    if free.is_empty() {
-        return Err(anyhow!("board has no free cells"));
-    }
-    let mut rng = rand::rng();
-
-    for target_len in [3usize, 2, 1] {
-        for _ in 0..300 {
-            let mut body = vec![free[rng.random_range(0..free.len())]];
-            while body.len() < target_len {
-                let cur = *body.last().unwrap();
-                let mut cands = Vec::new();
-                if cur.x > 0 {
-                    cands.push(Point { x: cur.x - 1, y: cur.y });
-                }
-                if cur.x + 1 < w {
-                    cands.push(Point { x: cur.x + 1, y: cur.y });
-                }
-                if cur.y > 0 {
-                    cands.push(Point { x: cur.x, y: cur.y - 1 });
-                }
-                if cur.y + 1 < h {
-                    cands.push(Point { x: cur.x, y: cur.y + 1 });
-                }
-                cands.retain(|p| !walls[p.y as usize * wu + p.x as usize] && !body.contains(p));
-                if cands.is_empty() {
-                    break;
-                }
-                body.push(cands[rng.random_range(0..cands.len())]);
-            }
-            if body.len() == target_len {
-                let dir = if target_len >= 2 {
-                    let (head, neck) = (body[0], body[1]);
-                    if head.x > neck.x {
-                        Direction::Right
-                    } else if head.x < neck.x {
-                        Direction::Left
-                    } else if head.y > neck.y {
-                        Direction::Down
-                    } else {
-                        Direction::Up
-                    }
-                } else {
-                    match rng.random_range(0..4) {
-                        0 => Direction::Up,
-                        1 => Direction::Down,
-                        2 => Direction::Left,
-                        _ => Direction::Right,
-                    }
-                };
-                return Ok((VecDeque::from(body), dir));
-            }
-        }
-    }
-    Err(anyhow!("could not place the snake on the board"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::InnerWalls;
-
-    #[test]
-    fn gap_walls_are_mirrored_and_connected() {
-        let mut cfg = GameConfig::default();
-        cfg.wall_mode = WallMode::Gaps;
-        cfg.inner_walls = InnerWalls::Many;
-        for _ in 0..20 {
-            let (w, h) = (cfg.width as usize, cfg.height as usize);
-            let walls = generate_walls(&cfg);
-            for x in 0..w {
-                assert_eq!(walls[x], walls[(h - 1) * w + x], "top/bottom mirror at x={x}");
-            }
-            for y in 0..h {
-                assert_eq!(walls[y * w], walls[y * w + w - 1], "left/right mirror at y={y}");
-            }
-            assert!(all_free_connected(&walls, w, h), "free area must be connected");
-        }
-    }
-
-    #[test]
-    fn full_walls_keep_interior_connected() {
-        let mut cfg = GameConfig::default();
-        cfg.wall_mode = WallMode::Full;
-        cfg.inner_walls = InnerWalls::Many;
-        for _ in 0..20 {
-            let (w, h) = (cfg.width as usize, cfg.height as usize);
-            let walls = generate_walls(&cfg);
-            assert!(all_free_connected(&walls, w, h));
-        }
-    }
-
-    #[test]
-    fn inner_walls_never_create_dead_ends() {
-        for wall_mode in [WallMode::Full, WallMode::Open, WallMode::Gaps] {
-            let mut cfg = GameConfig::default();
-            cfg.wall_mode = wall_mode;
-            cfg.inner_walls = InnerWalls::Many;
-            for _ in 0..20 {
-                let (w, h) = (cfg.width as usize, cfg.height as usize);
-                let walls = generate_walls(&cfg);
-                assert!(no_dead_ends(&walls, w, h), "free cell with < 2 exits");
-            }
-        }
-    }
+    use crate::config::{InnerWalls, WallMode};
 
     #[test]
     fn snake_wraps_on_open_board() {
