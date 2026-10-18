@@ -18,6 +18,14 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut last_frame = Instant::now();
 
     loop {
+        // The snake must never move while its board isn't on screen.
+        let size = terminal.size()?;
+        if matches!(app.screen, Screen::Playing)
+            && app.game.as_ref().is_some_and(|g| !ui::board_fits(g, size))
+        {
+            app.screen = Screen::Paused { selected: 0 };
+        }
+
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         let timeout = if matches!(app.screen, Screen::Playing) {
@@ -25,12 +33,17 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         } else {
             Duration::from_millis(100)
         };
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && !app.handle_key(key.code)
-        {
-            return Ok(());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !app.handle_key(key) {
+                        return Ok(());
+                    }
+                }
+                // Re-check the fit before the game moves at the new size.
+                Event::Resize(..) => continue,
+                _ => {}
+            }
         }
 
         let now = Instant::now();

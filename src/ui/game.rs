@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use ratatui::Frame;
-use ratatui::layout::Alignment;
+use ratatui::layout::{Alignment, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
@@ -14,13 +14,23 @@ use crate::game::{FoodKind, Game};
 const PAD_X: u16 = 2;
 const PAD_Y: u16 = 1;
 
+/// Terminal size the board needs: two columns per cell, plus border and padding.
+fn board_size(game: &Game) -> (u16, u16) {
+    (game.width * 2 + 2 + 2 * PAD_X, game.height + 2 + 2 * PAD_Y)
+}
+
+/// Whether the board is drawn at all; below this size only a warning is shown.
+pub fn board_fits(game: &Game, size: Size) -> bool {
+    let (need_w, need_h) = board_size(game);
+    size.width >= need_w && size.height >= need_h
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let Some(game) = &app.game else { return };
     let area = frame.area();
 
-    let need_w = game.width * 2 + 2 + 2 * PAD_X;
-    let need_h = game.height + 2 + 2 * PAD_Y;
-    if area.width < need_w || area.height < need_h {
+    let (need_w, need_h) = board_size(game);
+    if !board_fits(game, area.as_size()) {
         frame.render_widget(
             Paragraph::new(format!(
                 "terminal too small — need at least {need_w}x{need_h}"

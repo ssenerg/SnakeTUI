@@ -9,6 +9,8 @@ use ratatui::widgets::{Block, BorderType, Clear};
 
 use crate::app::{App, Screen};
 
+pub use game::board_fits;
+
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Menu => menu::draw(frame, app),

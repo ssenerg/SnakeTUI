@@ -136,11 +136,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 
     let record = app.records.get(&app.cfg.record_key());
+    let hint = if app.confirm_reset {
+        Line::from("press r again to reset all settings · any other key cancels").style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::from("↑↓ select · ←→ adjust · Enter play · r reset · q quit")
+            .style(Style::default().fg(Color::DarkGray))
+    };
     let footer = vec![
         Line::from(format!("★ best for this setup: {record}"))
             .style(Style::default().fg(Color::Cyan)),
-        Line::from("↑↓ select · ←→ adjust · Enter play · d defaults · q quit")
-            .style(Style::default().fg(Color::DarkGray)),
+        hint,
     ];
     frame.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),

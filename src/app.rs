@@ -1,4 +1,4 @@
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{GameConfig, SETTINGS};
 use crate::game::{Direction, Game};
@@ -19,6 +19,8 @@ pub struct App {
     pub records: Records,
     pub record: u32,
     pub screen: Screen,
+    /// Set by the first press of the reset key; a second press resets.
+    pub confirm_reset: bool,
 }
 
 impl App {
@@ -30,6 +32,7 @@ impl App {
             records: Records::load(),
             record: 0,
             screen: Screen::Menu,
+            confirm_reset: false,
         }
     }
 
@@ -56,22 +59,39 @@ impl App {
         self.screen = Screen::Menu;
     }
 
-    pub fn handle_key(&mut self, code: KeyCode) -> bool {
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Raw mode delivers Ctrl+C as a key press, not as a signal.
+            if matches!(key.code, KeyCode::Char('c' | 'C')) {
+                self.save_record();
+                return false;
+            }
+            return true;
+        }
+        // Shift and Caps Lock don't change what a letter key does.
+        let code = match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            code => code,
+        };
         match self.screen {
-            Screen::Menu => match code {
-                KeyCode::Esc | KeyCode::Char('q') => return false,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected = self.selected.checked_sub(1).unwrap_or(SETTINGS.len() - 1);
+            Screen::Menu => {
+                let confirm_reset = std::mem::take(&mut self.confirm_reset);
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => return false,
+                    KeyCode::Up | KeyCode::Char('w' | 'k') => {
+                        self.selected = self.selected.checked_sub(1).unwrap_or(SETTINGS.len() - 1);
+                    }
+                    KeyCode::Down | KeyCode::Char('s' | 'j') => {
+                        self.selected = (self.selected + 1) % SETTINGS.len();
+                    }
+                    KeyCode::Left | KeyCode::Char('a' | 'h') => self.cfg.adjust(self.selected, -1),
+                    KeyCode::Right | KeyCode::Char('d' | 'l') => self.cfg.adjust(self.selected, 1),
+                    KeyCode::Char('r') if confirm_reset => self.cfg = GameConfig::default(),
+                    KeyCode::Char('r') => self.confirm_reset = true,
+                    KeyCode::Enter => self.start_game(),
+                    _ => {}
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected = (self.selected + 1) % SETTINGS.len();
-                }
-                KeyCode::Left | KeyCode::Char('h') => self.cfg.adjust(self.selected, -1),
-                KeyCode::Right | KeyCode::Char('l') => self.cfg.adjust(self.selected, 1),
-                KeyCode::Char('d') => self.cfg = GameConfig::default(),
-                KeyCode::Enter => self.start_game(),
-                _ => {}
-            },
+            }
             Screen::Playing => {
                 let dir = match code {
                     KeyCode::Esc | KeyCode::Char('p') => {
@@ -92,7 +112,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('r') | KeyCode::Char('p') => {
                     self.screen = Screen::Playing;
                 }
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('k') | KeyCode::Char('j') => {
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('w' | 's' | 'k' | 'j') => {
                     self.screen = Screen::Paused {
                         selected: 1 - selected,
                     };

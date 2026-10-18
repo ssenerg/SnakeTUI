@@ -13,9 +13,10 @@ A highly configurable snake game for your terminal, built in Rust with
   - `none (wrap)` — the snake wraps around to the opposite side
   - `gaps` — random border walls with gaps; gaps are generated in
     mirrored pairs, so wrapping through a gap always lands on an open cell
-- **Inner wall generation** with two guarantees: every free cell stays
-  reachable (the snake can always reach its maximum possible length), and no
-  dead-end pockets are created that the snake could enter but never leave.
+- **Inner wall generation** that never boxes you in: every free cell stays
+  reachable, and no single cell is a bottleneck. Every part of the board has
+  at least two separate ways in and out, so there are no dead ends and no
+  rooms behind a one-cell doorway that the snake could enter but never leave.
 - **Food, super food, and poison**, each with a configurable spawn frequency
   and an independent time-to-live — uneaten items disappear.
 - **Super food** grows the snake by a configurable amount and can optionally
@@ -55,16 +56,22 @@ cargo run --release
 3. Eat food to grow. Poison and walls kill you; so does your own body unless
    pass-through-self is enabled.
 
+If the terminal gets too small to show the whole board, the game pauses until
+you make the window bigger again and resume.
+
 ### Controls
 
 | Key | Action |
 | --- | --- |
-| `↑ ↓ ← →` / `WASD` | Move (settings menu: select / change value) |
+| `↑ ↓ ← →` / `WASD` | Move; in the settings menu, select (`↑ ↓`) and change a value (`← →`). The menu also takes `hjkl` |
 | `Enter` | Start game / confirm |
 | `Esc` / `p` | Pause (resume or quit to menu) |
-| `d` | Reset settings to defaults (in the menu) |
+| `r` `r` | Reset all settings to defaults (in the menu; press `r` twice) |
 | `r` | Play again with the same settings (after game over) |
-| `q` | Quit |
+| `q` | Quit (from the pause menu: back to the settings) |
+| `Ctrl+C` | Quit right away, from any screen |
+
+Letter keys work the same with Shift or Caps Lock on.
 
 ### Config options
 
@@ -100,6 +107,6 @@ Colors are cosmetic and don't affect which record a game counts toward.
 ## Development
 
 ```sh
-cargo test    # wall generation invariants (mirroring, connectivity, no dead ends)
+cargo test    # wall generation invariants (mirroring, connectivity, no bottleneck cells)
 cargo build --release
 ```
