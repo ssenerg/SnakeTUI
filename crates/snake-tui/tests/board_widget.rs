@@ -103,11 +103,7 @@ fn board_widget_draws_exactly_what_the_old_code_did() {
         let mut old = Buffer::empty(Rect::new(0, 0, 70, 24));
         let mut new = old.clone();
         Paragraph::new(old_board_lines(&view, &theme)).render(area, &mut old);
-        BoardWidget {
-            view: &view,
-            theme: &theme,
-        }
-        .render(area, &mut new);
+        BoardWidget::new(&view, &theme).render(area, &mut new);
         assert_eq!(old, new);
     }
 }

@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
@@ -11,16 +12,20 @@ use ratatui::layout::{Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use russh::ChannelId;
 use russh::server::Handle;
-use snake_core::config::GameConfig;
+use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
+use snake_core::round::{Entrant, JoinError, PhaseView, PlayerId};
 use snake_tui::{App, Effect, Key, Screen, ui};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::Shared;
 use crate::backend::SshBackend;
-use crate::identity::Player;
+use crate::identity::{Player, nickname};
 use crate::input::KeyParser;
+use crate::lobby::{CreateError, CreateRoom, FindRoom};
+use crate::matchmaker::{Dequeue, Enqueue, Matched};
+use crate::room::{Join, Leave, Ready, RoomActor, Steer, ViewRx};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
 /// make the server allocate huge screens.
@@ -32,6 +37,8 @@ const OUT_QUEUE: usize = 4;
 const ESC_WAIT: Duration = Duration::from_millis(50);
 /// While a game runs, wake at least this often for the clock and food.
 const MAX_WAKE: Duration = Duration::from_millis(100);
+/// How often the queue screen updates its clock.
+const QUEUE_WAKE: Duration = Duration::from_secs(1);
 /// How soon to retry drawing for a client that's behind.
 const RETRY_DRAW: Duration = Duration::from_millis(50);
 const IDLE_CHECK: Duration = Duration::from_secs(15);
@@ -39,6 +46,12 @@ const IDLE_CHECK: Duration = Duration::from_secs(15);
 const HANG_UP_AFTER: Duration = Duration::from_secs(2);
 /// Keys and window changes waiting in the mailbox; more are dropped.
 const MAILBOX: usize = 64;
+/// Wrong room codes a connection may try. After that it can't join by code.
+const MAX_WRONG_CODES: u8 = 5;
+/// Everyone's rating until accounts have real ones.
+const UNRATED: f64 = 1000.0;
+/// The only region until there are several servers.
+const LOCAL_REGION: &str = "local";
 
 /// Switch to the alternate screen and hide the cursor; and undo both.
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H";
@@ -124,9 +137,49 @@ pub struct Resized {
 #[rtype(result = "()")]
 pub struct Disconnected;
 
+/// The room a session's player is in.
+struct RoomLink {
+    addr: Addr<RoomActor>,
+    /// The future waiting for the room's next view.
+    watch: SpawnHandle,
+    /// Tells apart this stay from an earlier one in the same room.
+    stay: u64,
+}
+
+/// Why a private room couldn't be made or joined.
+enum JoinFail {
+    NoSuchCode,
+    TooManyCodes,
+    BoardTooSmall,
+    Full,
+    Closed,
+}
+
+impl JoinFail {
+    fn message(&self) -> &'static str {
+        match self {
+            JoinFail::NoSuchCode => "No room has that code.",
+            JoinFail::TooManyCodes => "Too many wrong codes. Reconnect to try again.",
+            JoinFail::BoardTooSmall => {
+                "Your board is too small for two snakes. Make it bigger in Single player."
+            }
+            JoinFail::Full => "That room is full.",
+            JoinFail::Closed => "That room has closed.",
+        }
+    }
+}
+
 pub struct SessionActor {
     shared: Arc<Shared>,
     peer: SocketAddr,
+    id: PlayerId,
+    /// Rooms and the queue hold a weak reference, to notice the session
+    /// is gone even if it never said goodbye.
+    presence: Arc<()>,
+    room: Option<RoomLink>,
+    stays: u64,
+    queued: bool,
+    wrong_codes: u8,
     hangup: Option<Hangup>,
     out: Option<mpsc::Sender<Out>>,
     player: Option<Player>,
@@ -166,15 +219,28 @@ impl Actor for SessionActor {
 
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(peer = %self.peer, "session ended");
+        if let Some(room) = self.room.take() {
+            room.addr.do_send(Leave(self.id));
+        }
+        if self.queued {
+            self.shared.matchmaker.do_send(Dequeue(self.id));
+        }
     }
 }
 
 impl SessionActor {
     pub fn new(shared: Arc<Shared>, peer: SocketAddr) -> Self {
         let now = Instant::now();
+        let id = shared.next_player.fetch_add(1, Ordering::Relaxed);
         Self {
             shared,
             peer,
+            id,
+            presence: Arc::new(()),
+            room: None,
+            stays: 0,
+            queued: false,
+            wrong_codes: 0,
             hangup: None,
             out: None,
             player: None,
@@ -222,17 +288,20 @@ impl SessionActor {
             match player {
                 Some(p) if p.fingerprint().is_some() => {
                     let saved = store.visit(p.fingerprint().unwrap(), &p.nick).await?;
-                    Ok((saved.cfg, saved.records))
+                    Ok((Some(saved.nick), saved.cfg, saved.records))
                 }
-                _ => anyhow::Ok((GameConfig::default(), Records::default())),
+                _ => anyhow::Ok((None, GameConfig::default(), Records::default())),
             }
         };
         // Keys that arrive meanwhile wait in the mailbox.
         ctx.wait(load.into_actor(self).map(|loaded, act, ctx| {
-            let (cfg, records) = loaded.unwrap_or_else(|e| {
+            let (nick, cfg, records) = loaded.unwrap_or_else(|e| {
                 warn!(peer = %act.peer, error = %e, "couldn't load the player; starting fresh");
-                (GameConfig::default(), Records::default())
+                (None, GameConfig::default(), Records::default())
             });
+            if let (Some(nick), Some(player)) = (nick, act.player.as_mut()) {
+                player.nick = nick;
+            }
             act.open_screen(cfg, records, ctx);
         }));
     }
@@ -249,7 +318,11 @@ impl SessionActor {
                 return self.close(1, None, ctx);
             }
         };
-        let mut app = App::new(cfg, records);
+        let name = self
+            .player
+            .as_ref()
+            .map_or_else(|| "~player".to_string(), Player::display_name);
+        let mut app = App::online(cfg, records, name);
         app.resize(self.size);
         self.app = Some(app);
         self.terminal = Some(terminal);
@@ -260,7 +333,7 @@ impl SessionActor {
 
     fn on_keys(&mut self, keys: Vec<Key>, ctx: &mut Context<Self>) {
         let Some(app) = self.app.as_mut() else { return };
-        let was_playing = app.screen == Screen::Playing;
+        let was_playing = matches!(app.screen, Screen::Playing | Screen::Finding);
         let mut effects = Vec::new();
         for key in keys {
             let fx = app.handle(key);
@@ -304,8 +377,192 @@ impl SessionActor {
                     }
                 }
                 Effect::Quit => self.close(0, None, ctx),
+                Effect::QuickPlay => self.enqueue(ctx),
+                Effect::LeaveQueue => {
+                    self.queued = false;
+                    self.shared.matchmaker.do_send(Dequeue(self.id));
+                }
+                Effect::CreateRoom(rules) => self.join_private(Some(rules), None, ctx),
+                Effect::JoinRoom(code) => self.join_private(None, Some(code), ctx),
+                Effect::Steer(dir) => {
+                    if let Some(room) = &self.room {
+                        let _ = room.addr.try_send(Steer { id: self.id, dir });
+                    }
+                }
+                Effect::ToggleReady => {
+                    if let Some(room) = &self.room {
+                        let _ = room.addr.try_send(Ready(self.id));
+                    }
+                }
+                Effect::LeaveRoom => self.leave_room(ctx),
+                Effect::SetNickname(name) => self.rename(&name, ctx),
             }
         }
+    }
+
+    fn entrant(&self) -> Entrant {
+        Entrant {
+            id: self.id,
+            name: self
+                .player
+                .as_ref()
+                .map_or_else(|| "~player".to_string(), Player::display_name),
+        }
+    }
+
+    fn enqueue(&mut self, ctx: &mut Context<Self>) {
+        if self.room.is_some() {
+            return;
+        }
+        self.queued = true;
+        self.shared.matchmaker.do_send(Enqueue {
+            who: self.entrant(),
+            rating: UNRATED,
+            region: LOCAL_REGION.to_string(),
+            presence: Arc::downgrade(&self.presence),
+            reply: ctx.address().recipient(),
+        });
+    }
+
+    /// Makes a private room with `rules`, or finds the one with `code`, and
+    /// takes a seat in it.
+    fn join_private(
+        &mut self,
+        rules: Option<Rules>,
+        code: Option<String>,
+        ctx: &mut Context<Self>,
+    ) {
+        if code.is_some() && self.wrong_codes >= MAX_WRONG_CODES {
+            return self.join_failed(JoinFail::TooManyCodes, ctx);
+        }
+        let lobby = self.shared.lobby.clone();
+        let seed = self.shared.cfg.room_seed;
+        let who = self.entrant();
+        let presence = Arc::downgrade(&self.presence);
+        let join = async move {
+            let room = match (rules, code) {
+                (Some(rules), _) => match lobby.send(CreateRoom { rules, seed }).await {
+                    Ok(Ok((_, room))) => room,
+                    Ok(Err(CreateError::BoardTooSmall)) => return Err(JoinFail::BoardTooSmall),
+                    Err(_) => return Err(JoinFail::Closed),
+                },
+                (None, Some(code)) => match lobby.send(FindRoom(code)).await {
+                    Ok(Some(room)) => room,
+                    Ok(None) => return Err(JoinFail::NoSuchCode),
+                    Err(_) => return Err(JoinFail::Closed),
+                },
+                (None, None) => return Err(JoinFail::Closed),
+            };
+            match room.send(Join { who, presence }).await {
+                Ok(Ok(view)) => Ok((room, view)),
+                Ok(Err(JoinError::Full)) => Err(JoinFail::Full),
+                Ok(Err(JoinError::Closed)) | Err(_) => Err(JoinFail::Closed),
+            }
+        };
+        ctx.spawn(join.into_actor(self).map(|joined, act, ctx| match joined {
+            Ok((room, view)) => act.entered(room, view, ctx),
+            Err(fail) => act.join_failed(fail, ctx),
+        }));
+    }
+
+    fn join_failed(&mut self, fail: JoinFail, ctx: &mut Context<Self>) {
+        if matches!(fail, JoinFail::NoSuchCode) {
+            self.wrong_codes += 1;
+            debug!(peer = %self.peer, tries = self.wrong_codes, "wrong room code");
+        }
+        if let Some(app) = self.app.as_mut() {
+            app.join_failed(fail.message().to_string());
+        }
+        self.render(ctx);
+    }
+
+    /// The player now has a seat in `room`. If they've stopped wanting one
+    /// meanwhile, they give it straight back.
+    fn entered(&mut self, room: Addr<RoomActor>, view: ViewRx, ctx: &mut Context<Self>) {
+        let wanted = self.app.as_ref().is_some_and(|a| {
+            matches!(a.screen, Screen::Finding | Screen::Joining { .. }) && !a.in_room()
+        });
+        if self.closing || !wanted || self.room.is_some() {
+            room.do_send(Leave(self.id));
+            return;
+        }
+        let current = view.borrow().clone();
+        if let Some(app) = self.app.as_mut() {
+            app.enter_room(self.id, current);
+        }
+        self.stays += 1;
+        let stay = self.stays;
+        let watch = self.watch_room(view, stay, ctx);
+        self.room = Some(RoomLink {
+            addr: room,
+            watch,
+            stay,
+        });
+        self.render(ctx);
+    }
+
+    /// Waits for the room's next view; each one re-arms the wait.
+    fn watch_room(&mut self, mut view: ViewRx, stay: u64, ctx: &mut Context<Self>) -> SpawnHandle {
+        let next = async move {
+            let open = view.changed().await.is_ok();
+            (open, view)
+        };
+        ctx.spawn(
+            next.into_actor(self)
+                .map(move |(open, mut view), act, ctx| {
+                    if act.room.as_ref().is_none_or(|r| r.stay != stay) {
+                        return;
+                    }
+                    let latest = view.borrow_and_update().clone();
+                    let Some(app) = act.app.as_mut() else { return };
+                    if open {
+                        app.update_room(latest);
+                    } else {
+                        // The room is gone. Its last view may say why.
+                        let reason = match &latest.phase {
+                            PhaseView::Closed { reason } => Some(reason.clone()),
+                            _ => None,
+                        };
+                        app.room_closed(reason);
+                    }
+                    if open && app.in_room() {
+                        let watch = act.watch_room(view, stay, ctx);
+                        if let Some(room) = act.room.as_mut() {
+                            room.watch = watch;
+                        }
+                    } else {
+                        act.room = None;
+                    }
+                    act.render(ctx);
+                }),
+        )
+    }
+
+    fn leave_room(&mut self, ctx: &mut Context<Self>) {
+        if let Some(room) = self.room.take() {
+            ctx.cancel_future(room.watch);
+            room.addr.do_send(Leave(self.id));
+        }
+    }
+
+    fn rename(&mut self, name: &str, ctx: &mut Context<Self>) {
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        player.nick = nickname(name, &player.tag);
+        let display = player.display_name();
+        if let Some(fp) = player.fingerprint().map(str::to_string) {
+            let (store, nick) = (self.shared.store.clone(), player.nick.clone());
+            actix::spawn(async move {
+                if let Err(e) = store.set_nick(&fp, &nick).await {
+                    warn!(error = %e, "couldn't save a nickname");
+                }
+            });
+        }
+        if let Some(app) = self.app.as_mut() {
+            app.set_name(display);
+        }
+        self.render(ctx);
     }
 
     /// Draws the current screen and queues it for the client.
@@ -364,16 +621,20 @@ impl SessionActor {
             ctx.cancel_future(wake);
         }
         let Some(app) = &self.app else { return };
-        if self.closing || app.screen != Screen::Playing {
+        if self.closing {
             return;
         }
-        let delay = match &app.game {
+        let delay = match (app.screen, &app.game) {
+            // The queue's clock and size on screen.
+            (Screen::Finding, _) => QUEUE_WAKE,
             // Frozen until the first key; nothing to wake for.
-            Some(game) if !game.started => return,
-            Some(game) => game.until_next_step().unwrap_or_default(),
-            None => return,
+            (Screen::Playing, Some(game)) if !game.started => return,
+            (Screen::Playing, Some(game)) => game
+                .until_next_step()
+                .unwrap_or_default()
+                .clamp(Duration::from_millis(1), MAX_WAKE),
+            _ => return,
         };
-        let delay = delay.clamp(Duration::from_millis(1), MAX_WAKE);
         self.wake = Some(ctx.run_later(delay, |act, ctx| {
             act.wake = None;
             act.on_wake(ctx);
@@ -384,6 +645,7 @@ impl SessionActor {
         let Some(app) = self.app.as_mut() else { return };
         let now = Instant::now();
         let effects = app.tick(now - self.last_tick);
+        app.set_queue_len(*self.shared.queue_len.borrow());
         self.last_tick = now;
         self.apply(effects, ctx);
         self.render(ctx);
@@ -392,10 +654,14 @@ impl SessionActor {
 
     fn check_idle(&mut self, ctx: &mut Context<Self>) {
         let idle = self.shared.cfg.idle_timeout();
-        let playing = self
-            .app
-            .as_ref()
-            .is_some_and(|a| a.screen == Screen::Playing);
+        // Waiting for a match or watching a round isn't idling.
+        let playing = self.app.as_ref().is_some_and(|a| {
+            matches!(a.screen, Screen::Playing | Screen::Finding)
+                || a.online
+                    .as_ref()
+                    .and_then(|o| o.room.as_ref())
+                    .is_some_and(|r| !matches!(r.view.phase, PhaseView::Waiting { .. }))
+        });
         if self.app.is_some() && !playing && self.last_input.elapsed() > idle {
             info!(peer = %self.peer, "idle; logging out");
             self.close(0, Some("Logged out after being idle.\r\n"), ctx);
@@ -576,6 +842,15 @@ impl Handler<Resized> for SessionActor {
         }
         self.render(ctx);
         self.schedule_wake(ctx);
+    }
+}
+
+impl Handler<Matched> for SessionActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: Matched, ctx: &mut Self::Context) {
+        self.queued = false;
+        self.entered(msg.room, msg.view, ctx);
     }
 }
 

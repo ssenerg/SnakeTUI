@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -33,14 +33,7 @@ fn rows() -> Vec<Row> {
     rows
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let [logo_area, list_area, footer_area] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(3),
-        Constraint::Length(3),
-    ])
-    .areas(frame.area());
-
+pub(super) fn draw_logo(frame: &mut Frame, area: Rect) {
     let logo: Vec<Line> = LOGO
         .iter()
         .map(|l| {
@@ -51,7 +44,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
             )
         })
         .collect();
-    frame.render_widget(Paragraph::new(logo).alignment(Alignment::Center), logo_area);
+    frame.render_widget(Paragraph::new(logo).alignment(Alignment::Center), area);
+}
+
+pub fn draw(frame: &mut Frame, app: &App) {
+    let [logo_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(3),
+        Constraint::Length(3),
+    ])
+    .areas(frame.area());
+
+    draw_logo(frame, logo_area);
 
     let rect = centered_rect(list_area, 58.min(list_area.width), list_area.height);
     let block = Block::bordered()
@@ -152,8 +156,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        Line::from("↑↓ select · ←→ adjust · Enter play · r reset · q quit")
-            .style(Style::default().fg(Color::DarkGray))
+        let back = if app.online.is_some() { "back" } else { "quit" };
+        Line::from(format!(
+            "↑↓ select · ←→ adjust · Enter play · r reset · q {back}"
+        ))
+        .style(Style::default().fg(Color::DarkGray))
     };
     let footer = vec![
         Line::from(format!("★ best for this setup: {record}"))

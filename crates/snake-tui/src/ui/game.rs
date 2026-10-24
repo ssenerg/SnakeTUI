@@ -59,13 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let view = game.world.view();
-    frame.render_widget(
-        BoardWidget {
-            view: &view,
-            theme: &app.cfg.theme,
-        },
-        inner,
-    );
+    frame.render_widget(BoardWidget::new(&view, &app.cfg.theme), inner);
 }
 
 fn title_line() -> Line<'static> {

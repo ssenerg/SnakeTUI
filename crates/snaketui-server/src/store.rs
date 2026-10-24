@@ -98,6 +98,15 @@ impl Store {
         })
     }
 
+    pub async fn set_nick(&self, fingerprint: &str, nick: &str) -> Result<()> {
+        sqlx::query("UPDATE players SET nick = ?2 WHERE fingerprint = ?1")
+            .bind(fingerprint)
+            .bind(nick)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn save_config(&self, fingerprint: &str, cfg: &GameConfig) -> Result<()> {
         sqlx::query("UPDATE players SET config = ?2 WHERE fingerprint = ?1")
             .bind(fingerprint)
@@ -148,6 +157,8 @@ mod tests {
 
         let again = store.visit("SHA256:abc", "renamed").await.unwrap();
         assert_eq!(again.nick, "alice", "the first name sticks");
+        store.set_nick("SHA256:abc", "alicia").await.unwrap();
+        assert_eq!(store.visit("SHA256:abc", "x").await.unwrap().nick, "alicia");
         assert_eq!(again.cfg, cfg);
         assert_eq!(again.records.get("size:30x20"), 12, "records only go up");
         let other = store.visit("SHA256:xyz", "bob").await.unwrap();

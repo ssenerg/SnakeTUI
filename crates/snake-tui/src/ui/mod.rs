@@ -1,20 +1,48 @@
 mod board;
 mod dialogs;
 mod game;
+mod home;
 mod menu;
+mod room;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, BorderType, Clear};
 
-use crate::app::{App, Screen};
+use crate::app::{App, Field, HOME, HomeItem, Screen};
 
-pub use board::BoardWidget;
+pub use board::{BoardWidget, SnakeLook};
 pub use game::board_fits;
+pub use room::{room_fits, room_size};
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // The home menu behind dialogs, with the entry that opened them.
+    let home = |item: HomeItem| HOME.iter().position(|i| *i == item).unwrap_or(0);
     match app.screen {
+        Screen::Home { selected } => home::draw(frame, app, selected),
+        Screen::Input(field) => {
+            let item = match field {
+                Field::Code => HomeItem::JoinCode,
+                Field::Nickname => HomeItem::Nickname,
+            };
+            home::draw(frame, app, home(item));
+            dialogs::draw_input(frame, app, field);
+        }
+        Screen::Finding => {
+            home::draw(frame, app, home(HomeItem::QuickPlay));
+            dialogs::draw_finding(frame, app);
+        }
+        Screen::Joining { by_code } => {
+            let item = if by_code {
+                HomeItem::JoinCode
+            } else {
+                HomeItem::CreateRoom
+            };
+            home::draw(frame, app, home(item));
+            dialogs::draw_joining(frame);
+        }
+        Screen::Room => room::draw(frame, app),
         Screen::Menu => menu::draw(frame, app),
         Screen::Playing => game::draw(frame, app),
         Screen::Paused { selected } => {

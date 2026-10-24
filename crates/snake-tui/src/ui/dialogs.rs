@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 use snake_core::solo::GameOverReason;
 
 use super::dialog;
-use crate::app::App;
+use crate::app::{App, Field};
 
 pub fn draw_pause(frame: &mut Frame, selected: usize) {
     let inner = dialog(frame, " PAUSED ", Color::Yellow, 36, 8);
@@ -73,5 +73,54 @@ pub fn draw_game_over(frame: &mut Frame, app: &App, new_record: bool) {
     }
     lines.push(Line::default());
     lines.push(Line::from("r play again · Enter menu · q quit").style(dim));
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+pub fn draw_input(frame: &mut Frame, app: &App, field: Field) {
+    let (title, prompt) = match field {
+        Field::Code => (" Join with a code ", "Type the room's 6-character code"),
+        Field::Nickname => (" Nickname ", "Letters, digits, _ and -, up to 16"),
+    };
+    let inner = dialog(frame, title, Color::Cyan, 44, 9);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::default(),
+        Line::from(prompt).style(dim),
+        Line::default(),
+        Line::from(format!("{}▏", app.input.text)).style(
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    lines.push(match &app.input.error {
+        Some(error) => Line::from(error.as_str()).style(Style::default().fg(Color::LightRed)),
+        None => Line::default(),
+    });
+    lines.push(Line::from("Enter ok · Esc cancel").style(dim));
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+pub fn draw_finding(frame: &mut Frame, app: &App) {
+    let Some(online) = &app.online else { return };
+    let inner = dialog(frame, " Finding a match ", Color::Cyan, 36, 7);
+    let secs = online.waited.as_secs();
+    let lines = vec![
+        Line::default(),
+        Line::from(format!(
+            "{}:{:02} · {} in queue",
+            secs / 60,
+            secs % 60,
+            online.queue_len.max(1)
+        )),
+        Line::default(),
+        Line::from("Esc cancel").style(Style::default().fg(Color::DarkGray)),
+    ];
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+pub fn draw_joining(frame: &mut Frame) {
+    let inner = dialog(frame, " Joining ", Color::Cyan, 30, 5);
+    let lines = vec![Line::default(), Line::from("One moment…")];
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }

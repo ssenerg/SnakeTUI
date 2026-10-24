@@ -31,6 +31,9 @@ pub struct ServerConfig {
     /// Seconds a client may go without taking any screen updates before it's
     /// disconnected.
     pub stall_timeout_secs: u64,
+    /// Tests only: every room's seed, so its boards are known in advance.
+    #[serde(skip)]
+    pub room_seed: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -45,6 +48,7 @@ impl Default for ServerConfig {
             login_timeout_secs: 30,
             idle_timeout_secs: 600,
             stall_timeout_secs: 20,
+            room_seed: None,
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod board;
 pub mod config;
 pub mod geom;
 pub mod records;
+pub mod round;
 pub mod settings;
 pub mod snake;
 pub mod solo;

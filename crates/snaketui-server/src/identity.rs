@@ -38,6 +38,8 @@ pub enum Identity {
 pub struct Player {
     pub identity: Identity,
     pub nick: String,
+    /// Four hex characters, for names that would otherwise say nothing.
+    pub tag: String,
 }
 
 impl Player {
@@ -47,6 +49,7 @@ impl Player {
         Self {
             nick: nickname(ssh_user, &tag),
             identity: Identity::Key(fingerprint),
+            tag,
         }
     }
 
@@ -55,7 +58,14 @@ impl Player {
         Self {
             nick: nickname(ssh_user, &tag),
             identity: Identity::Guest,
+            tag,
         }
+    }
+
+    /// How other players see this one. Guests' names start with `~`, which
+    /// no account name will be able to.
+    pub fn display_name(&self) -> String {
+        format!("~{}", self.nick)
     }
 
     pub fn fingerprint(&self) -> Option<&str> {

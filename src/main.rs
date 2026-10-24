@@ -33,6 +33,8 @@ fn apply(app: &App, effects: Vec<Effect>) -> bool {
             Effect::SaveConfig => persist::save_config(&app.cfg),
             Effect::RecordSet { .. } => persist::save_records(&app.records),
             Effect::Quit => return false,
+            // Multiplayer: the local game never shows those screens.
+            _ => {}
         }
     }
     true

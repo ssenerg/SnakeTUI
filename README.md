@@ -66,7 +66,30 @@ no account on the machine, and quitting the game ends their connection at once.
 - **Limits.** Connections are capped in total and per IP address. Logins time
   out, idle players are logged out, and clients that stop reading are
   disconnected.
-- Single player only for now.
+
+### Multiplayer
+
+Rooms hold 2 to 8 players on one board. Every snake moves on the same tick,
+so in multiplayer turns are always queued for the next tick.
+
+- **Quick play** puts you in a queue. A match starts as soon as 8 players
+  are waiting, or after 10 seconds with at least 2. It plays one round on a
+  30×18 board, which fits an 80×23 terminal.
+- **Private rooms** use your single-player settings and get a 6-character
+  code to share. Anyone with the code can join. A round starts 15 seconds
+  after the second player arrives, or as soon as everyone presses Enter.
+  Rounds keep going until everyone leaves.
+- **Winning.** The last snake alive wins. If all the snakes still in play
+  crash on the same tick, it's a draw. After 3 minutes, the longest snake
+  still alive wins.
+- **Dead snakes turn into food.** Their players watch the rest of the round.
+- **Leaving.** Esc asks before you leave a round you're still playing. The
+  others play on.
+- **Telling snakes apart.** Your snake keeps your colors. Other players'
+  snakes get colors that don't clash with your food or walls, and every head
+  shows its player's number.
+- **Small terminals.** If the board doesn't fit, you see the part around
+  your snake, with a warning.
 
 To host it on Ubuntu 24.04, follow [deploy/INSTALL.md](deploy/INSTALL.md).
 Prebuilt Linux servers are on the [releases page](../../releases) next to the
@@ -152,7 +175,7 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), settings, records. No terminal or file access |
 | `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
-| `crates/snaketui-server` | The SSH server: sign-in, one actor per player session (actix), the SQLite store, `server.toml` |
+| `crates/snaketui-server` | The SSH server: sign-in, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the SQLite store, `server.toml` |
 | `deploy/` | systemd unit, example `server.toml`, and the Ubuntu install guide |
 
 ```sh

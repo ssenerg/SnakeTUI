@@ -80,6 +80,9 @@ pub struct World {
     /// Whether dead snakes turn into food. Otherwise they stay where they
     /// died, as the single-player game-over screen shows.
     pub corpses_to_food: bool,
+    /// Whether each food spawn drops one item per two living snakes, rather
+    /// than one.
+    pub scale_food: bool,
     rng: Xoshiro256PlusPlus,
     /// Scratch space for [`Self::step`]: snake segments per cell.
     occupancy: Vec<u16>,
@@ -95,7 +98,7 @@ impl World {
     }
 
     /// A board with `players` snakes spread apart, for multiplayer. Snakes
-    /// that die turn into food.
+    /// that die turn into food, and food comes faster with more players.
     pub fn with_players(rules: Rules, seed: u64, players: usize) -> Result<Self> {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
         let walls = board::generate_walls(&rules, &mut rng);
@@ -106,6 +109,7 @@ impl World {
             .collect();
         let mut world = Self::new(rules, walls, snakes, rng);
         world.corpses_to_food = true;
+        world.scale_food = true;
         Ok(world)
     }
 
@@ -132,6 +136,7 @@ impl World {
             next_spawn,
             free_cells,
             corpses_to_food: false,
+            scale_food: false,
             rng,
         }
     }
@@ -167,16 +172,41 @@ impl World {
         self.foods
             .retain(|f| f.expires_at.is_none_or(|e| e > clock));
 
+        let alive = self.snakes.iter().filter(|s| s.alive()).count();
         for (i, kind) in FoodKind::ALL.into_iter().enumerate() {
             let interval = spawn_interval_s(&self.rules, kind);
+            let count = if self.scale_food && kind == FoodKind::Normal {
+                alive.div_ceil(2).max(1)
+            } else {
+                1
+            };
             while let Some(t) = self.next_spawn[i] {
                 if clock < t {
                     break;
                 }
-                self.spawn_food(kind);
+                for _ in 0..count {
+                    self.spawn_food(kind);
+                }
                 self.next_spawn[i] = Some(t + Duration::from_secs(interval));
             }
         }
+    }
+
+    /// Takes snake `id` out of the game, as if it had died, because its
+    /// player left. Returns whether it was still alive.
+    pub fn remove(&mut self, id: u8) -> bool {
+        let Some(i) = self.snakes.iter().position(|s| s.id == id && s.alive()) else {
+            return false;
+        };
+        self.snakes[i].death = Some(DeathCause::Left);
+        if self.corpses_to_food {
+            self.turn_into_food(i);
+        }
+        true
+    }
+
+    pub fn alive(&self) -> usize {
+        self.snakes.iter().filter(|s| s.alive()).count()
     }
 
     /// Moves every living snake one cell, all at once.
@@ -576,6 +606,44 @@ mod tests {
         let mut food: Vec<(u16, u16)> = w.foods.iter().map(|f| (f.pos.x, f.pos.y)).collect();
         food.sort();
         assert_eq!(food, [(3, 5), (4, 5), (5, 5)]);
+    }
+
+    #[test]
+    fn a_snake_whose_player_left_turns_into_food() {
+        let mut w = world(
+            rules(WallMode::Open),
+            &[(&[(5, 5), (4, 5)], Right), (&[(5, 8), (4, 8)], Right)],
+        );
+        w.corpses_to_food = true;
+        assert!(w.remove(1));
+        assert!(!w.remove(1), "already gone");
+        assert_eq!(w.snakes[1].death, Some(DeathCause::Left));
+        assert_eq!(w.alive(), 1);
+        assert_eq!(w.foods.len(), 2);
+        assert_eq!(deaths(&mut w), [], "a removed snake doesn't move");
+    }
+
+    #[test]
+    fn food_comes_faster_with_more_players() {
+        let rules = Rules {
+            food_ttl_s: 0,
+            super_interval_s: 0,
+            poison_interval_s: 0,
+            ..Rules::default()
+        };
+        let mut many = World::with_players(rules.clone(), 1, 6).unwrap();
+        many.advance_clock(Duration::from_secs(1));
+        assert_eq!(many.foods.len(), 3, "one per two snakes");
+        many.remove(0);
+        many.remove(1);
+        many.remove(2);
+        let before = many.foods.len();
+        many.advance_clock(Duration::from_secs(3));
+        assert_eq!(many.foods.len() - before, 2, "three left: two items");
+
+        let mut solo = World::solo(rules, 1).unwrap();
+        solo.advance_clock(Duration::from_secs(1));
+        assert_eq!(solo.foods.len(), 1);
     }
 
     /// Runs a multiplayer world with scripted turns: `(tick, snake, dir)`.

@@ -13,6 +13,8 @@ pub enum DeathCause {
     /// Another snake's head or body, including head-on crashes.
     OtherSnake,
     Poison,
+    /// The player left the match.
+    Left,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
