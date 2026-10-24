@@ -248,7 +248,7 @@ If the release changes `snaketui.service`, install it again too, and run
 | `ssh play.example.com` hangs, then times out | Port 22 is closed in ufw or in the cloud firewall (steps 2 and 6). |
 | Players get "REMOTE HOST IDENTIFICATION HAS CHANGED" | The host key was replaced. Restore it from your backup and restart. |
 | A player forgot their password | They can set a new one under Account → Change password from any machine that still signs them in. Otherwise the account can't be recovered, because the game has no email addresses. |
-| A player sees "Too many wrong tries for that name" | 5 wrong passwords within 15 minutes lock a username for 15 minutes. An IP address gets 20 wrong tries an hour. Both clear by themselves, and restarting the game clears them too. |
+| A player sees "Too many wrong tries for that name" | 5 wrong passwords within 15 minutes lock a username for 15 minutes. An IP address gets 20 wrong tries an hour. Both clear by themselves. To unlock a name at once, run `sudo sqlite3 /var/lib/snaketui/snaketui.db "DELETE FROM name_locks WHERE name = 'alice'"` with the name in lowercase. |
 | You can't reach port 2222 | Log in from your cloud provider's web console. Stop the game (`sudo systemctl stop snaketui`), delete `/etc/ssh/sshd_config.d/admin-port.conf`, then run `sudo systemctl daemon-reload` and `sudo systemctl restart ssh.socket`. sshd is back on port 22. |
 
 For more detail in the log, run `sudo systemctl edit snaketui`, add the lines

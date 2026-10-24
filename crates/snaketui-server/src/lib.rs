@@ -32,10 +32,10 @@ use actix_rt::Arbiter;
 use anyhow::Result;
 use russh::keys::PrivateKey;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::accept::{Limits, Worker};
-use crate::auth::{Attempts, Hasher};
+use crate::auth::{GuessLimits, Hasher};
 use crate::config::ServerConfig;
 use crate::lobby::LobbyActor;
 use crate::matchmaker::MatchmakerActor;
@@ -59,7 +59,7 @@ pub struct Shared {
     pub presence: Addr<PresenceActor>,
     pub hasher: Hasher,
     /// Wrong passwords and new accounts, for the guessing limits.
-    pub attempts: std::sync::Mutex<Attempts>,
+    pub guesses: GuessLimits,
     /// How many players are waiting in the quick-play queue.
     pub queue_len: watch::Receiver<usize>,
     /// Hands out each session's player id.
@@ -103,6 +103,7 @@ pub async fn serve(
             sessions: Arc::new(AtomicUsize::new(0)),
         })
         .collect();
+    let guesses = GuessLimits::new(store.clone());
     let shared = Arc::new(Shared {
         ssh: Arc::new(ssh::config(host_key)),
         cfg,
@@ -112,18 +113,20 @@ pub async fn serve(
         matchmaker,
         presence,
         hasher: Hasher::new()?,
-        attempts: std::sync::Mutex::new(Attempts::default()),
+        guesses,
         queue_len,
         next_player: AtomicU64::new(1),
     });
-    // Forget old wrong guesses now and then, so the limits' memory stays
+    // Forget old wrong guesses now and then, so the limits' tables stay
     // small.
     let tidying = actix_rt::spawn({
-        let shared = Arc::clone(&shared);
+        let guesses = shared.guesses.clone();
         async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(600)).await;
-                shared.attempts.lock().unwrap().tidy(Instant::now());
+                if let Err(e) = guesses.tidy(store::now()).await {
+                    warn!(error = %e, "couldn't tidy the guessing limits");
+                }
             }
         }
     });

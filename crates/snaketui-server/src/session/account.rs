@@ -1,7 +1,7 @@
 //! A session's account: signing up, in and out, remembered keys, its
 //! rating, friends, and invites.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use actix::prelude::*;
 use snake_core::config::GameConfig;
@@ -24,6 +24,18 @@ const MAX_SIGN_IN_TRIES: u8 = 5;
 const INVITE_LIFETIME: Duration = Duration::from_secs(120);
 const TRY_AGAIN: &str = "Something went wrong. Try again.";
 const TOO_MANY_TRIES: &str = "Too many wrong sign-ins. Goodbye.\r\n";
+
+enum SignedUp {
+    Made(Account),
+    Taken,
+    Refused(auth::Refused),
+}
+
+enum SignedIn {
+    Yes(Box<AccountData>),
+    Wrong,
+    Refused(auth::Refused),
+}
 
 /// An invite this player hasn't answered yet.
 pub(super) struct PendingInvite {
@@ -129,34 +141,29 @@ impl SessionActor {
         if let Err(why) = checked {
             return self.form_failed(why, ctx);
         }
-        let ip = self.peer.ip();
-        let allowed = self
-            .shared
-            .attempts
-            .lock()
-            .unwrap()
-            .may_sign_up(ip, Instant::now());
-        if let Err(refused) = allowed {
-            return self.form_failed(refused.message(), ctx);
-        }
         let Some(app) = self.app.as_ref() else { return };
         let (cfg, records) = (app.cfg.clone(), app.records.clone());
         let (store, hasher) = (self.shared.store.clone(), self.shared.hasher.clone());
+        let guesses = self.shared.guesses.clone();
         let key = self.fingerprint();
+        let ip = self.peer.ip();
         let made = async move {
+            if let Err(refused) = guesses.may_sign_up(ip, now()).await? {
+                return anyhow::Ok(SignedUp::Refused(refused));
+            }
             let hash = hasher.hash(password.into_inner()).await?;
-            store
+            let made = store
                 .create_account(&username, &hash, key.as_deref(), &cfg, &records)
-                .await
+                .await?;
+            let Some(account) = made else {
+                return Ok(SignedUp::Taken);
+            };
+            guesses.signed_up(ip, now()).await?;
+            Ok(SignedUp::Made(account))
         };
         ctx.spawn(made.into_actor(self).map(move |made, act, ctx| {
             match made {
-                Ok(Some(account)) => {
-                    act.shared
-                        .attempts
-                        .lock()
-                        .unwrap()
-                        .signed_up(ip, Instant::now());
+                Ok(SignedUp::Made(account)) => {
                     debug!(peer = %act.peer, user = %account.username, "signed up");
                     let shown = profile(&account);
                     act.became(account, ctx);
@@ -165,7 +172,8 @@ impl SessionActor {
                     }
                     act.report_status();
                 }
-                Ok(None) => return act.form_failed("That username is taken.", ctx),
+                Ok(SignedUp::Taken) => return act.form_failed("That username is taken.", ctx),
+                Ok(SignedUp::Refused(refused)) => return act.form_failed(refused.message(), ctx),
                 Err(e) => {
                     warn!(error = %e, "couldn't make an account");
                     return act.form_failed(TRY_AGAIN, ctx);
@@ -182,41 +190,37 @@ impl SessionActor {
         remember: bool,
         ctx: &mut Context<Self>,
     ) {
-        let ip = self.peer.ip();
-        let allowed =
-            self.shared
-                .attempts
-                .lock()
-                .unwrap()
-                .may_sign_in(&username, ip, Instant::now());
-        if let Err(refused) = allowed {
-            return self.form_failed(refused.message(), ctx);
-        }
         let (store, hasher) = (self.shared.store.clone(), self.shared.hasher.clone());
+        let guesses = self.shared.guesses.clone();
         let key = self.fingerprint().filter(|_| remember);
-        let name = username.clone();
+        let ip = self.peer.ip();
         let checked = async move {
-            let found = store.find_account(&name).await?;
-            let (account, hash) = found.map_or((None, None), |(a, h)| (Some(a), Some(h)));
-            if !hasher.verify(password.into_inner(), hash).await {
-                return anyhow::Ok(None);
+            if let Err(refused) = guesses.may_sign_in(&username, ip, now()).await? {
+                return anyhow::Ok(SignedIn::Refused(refused));
             }
-            let Some(account) = account else {
-                return Ok(None);
+            let found = store.find_account(&username).await?;
+            let (account, hash) = found.map_or((None, None), |(a, h)| (Some(a), Some(h)));
+            let right = hasher.verify(password.into_inner(), hash).await;
+            let Some(account) = account.filter(|_| right) else {
+                guesses.failed(&username, ip, now()).await?;
+                return Ok(SignedIn::Wrong);
             };
+            guesses.succeeded(&username).await?;
             if let Some(key) = key {
                 store.remember_key(account.id, &key).await?;
             }
-            store.load_account(account.id).await.map(Some)
+            Ok(SignedIn::Yes(Box::new(
+                store.load_account(account.id).await?,
+            )))
         };
         ctx.spawn(checked.into_actor(self).map(move |checked, act, ctx| {
             match checked {
-                Ok(Some(AccountData {
-                    account,
-                    cfg,
-                    records,
-                })) => {
-                    act.shared.attempts.lock().unwrap().succeeded(&username);
+                Ok(SignedIn::Yes(data)) => {
+                    let AccountData {
+                        account,
+                        cfg,
+                        records,
+                    } = *data;
                     debug!(peer = %act.peer, user = %account.username, "signed in");
                     let shown = profile(&account);
                     act.became(account, ctx);
@@ -225,12 +229,7 @@ impl SessionActor {
                     }
                     act.report_status();
                 }
-                Ok(None) => {
-                    act.shared
-                        .attempts
-                        .lock()
-                        .unwrap()
-                        .failed(&username, ip, Instant::now());
+                Ok(SignedIn::Wrong) => {
                     act.sign_in_failures += 1;
                     debug!(peer = %act.peer, tries = act.sign_in_failures, "wrong sign-in");
                     if act.sign_in_failures >= MAX_SIGN_IN_TRIES {
@@ -238,6 +237,7 @@ impl SessionActor {
                     }
                     return act.form_failed("Wrong username or password.", ctx);
                 }
+                Ok(SignedIn::Refused(refused)) => return act.form_failed(refused.message(), ctx),
                 Err(e) => {
                     warn!(error = %e, "couldn't check a sign-in");
                     return act.form_failed(TRY_AGAIN, ctx);

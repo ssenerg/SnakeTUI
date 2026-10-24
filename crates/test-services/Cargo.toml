@@ -1,0 +1,13 @@
+[package]
+name = "snaketui-test-services"
+description = "Postgres and NATS for SnakeTUI's tests, in throwaway Docker containers"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

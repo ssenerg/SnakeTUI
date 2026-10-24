@@ -1,10 +1,9 @@
 //! Signing up and signing in: what usernames and passwords may be, hashing
 //! passwords, and how many wrong guesses anyone gets.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use argon2::Argon2;
@@ -14,6 +13,7 @@ use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 use crate::identity::GENERIC_USERS;
+use crate::store::{Counted, Store};
 
 pub const MIN_USERNAME: usize = 3;
 pub const MAX_USERNAME: usize = 16;
@@ -156,75 +156,102 @@ impl Refused {
     }
 }
 
-/// Who has guessed wrong, and who has made accounts, recently. Times are
-/// passed in, so tests drive the clock.
-#[derive(Default)]
-pub struct Attempts {
-    /// By lowercase username.
-    name_failures: HashMap<String, Vec<Instant>>,
-    locked_until: HashMap<String, Instant>,
-    address_failures: HashMap<IpAddr, Vec<Instant>>,
-    signups: HashMap<IpAddr, Vec<Instant>>,
+/// Who has guessed wrong, and who has made accounts, recently. The counts
+/// live in the store, so every server sharing a database sees the same
+/// ones. Times are seconds since the epoch, passed in so tests can drive
+/// the clock.
+#[derive(Clone)]
+pub struct GuessLimits {
+    store: Store,
 }
 
-fn recent(times: &mut Vec<Instant>, window: Duration, now: Instant) -> usize {
-    times.retain(|t| now.saturating_duration_since(*t) < window);
-    times.len()
+fn secs(d: Duration) -> i64 {
+    d.as_secs() as i64
 }
 
-impl Attempts {
-    pub fn may_sign_in(&mut self, name: &str, from: IpAddr, now: Instant) -> Result<(), Refused> {
+impl GuessLimits {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    pub async fn may_sign_in(
+        &self,
+        name: &str,
+        from: IpAddr,
+        now: i64,
+    ) -> Result<Result<(), Refused>> {
         let name = name.to_ascii_lowercase();
         if self
-            .locked_until
-            .get(&name)
-            .is_some_and(|until| now < *until)
+            .store
+            .name_locked_until(&name)
+            .await?
+            .is_some_and(|until| now < until)
         {
-            return Err(Refused::NameLocked);
+            return Ok(Err(Refused::NameLocked));
         }
-        let tries = self.address_failures.entry(from).or_default();
-        if recent(tries, IP_WINDOW, now) >= IP_TRIES {
-            return Err(Refused::TooManyFromAddress);
+        let tries = self
+            .store
+            .count(
+                Counted::WrongFromAddress,
+                &from.to_string(),
+                now - secs(IP_WINDOW),
+            )
+            .await?;
+        if tries >= IP_TRIES as i64 {
+            return Ok(Err(Refused::TooManyFromAddress));
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
-    pub fn failed(&mut self, name: &str, from: IpAddr, now: Instant) {
+    pub async fn failed(&self, name: &str, from: IpAddr, now: i64) -> Result<()> {
         let name = name.to_ascii_lowercase();
-        let tries = self.name_failures.entry(name.clone()).or_default();
-        tries.push(now);
-        if recent(tries, NAME_WINDOW, now) >= NAME_TRIES {
-            tries.clear();
-            self.locked_until.insert(name, now + NAME_LOCK);
-        }
-        self.address_failures.entry(from).or_default().push(now);
-    }
-
-    pub fn succeeded(&mut self, name: &str) {
-        self.name_failures.remove(&name.to_ascii_lowercase());
-    }
-
-    pub fn may_sign_up(&mut self, from: IpAddr, now: Instant) -> Result<(), Refused> {
-        let made = self.signups.entry(from).or_default();
-        if recent(made, SIGNUP_WINDOW, now) >= SIGNUPS {
-            return Err(Refused::TooManySignUps);
+        let store = &self.store;
+        store
+            .note(Counted::WrongFromAddress, &from.to_string(), now)
+            .await?;
+        store.note(Counted::WrongForName, &name, now).await?;
+        let tries = store
+            .count(Counted::WrongForName, &name, now - secs(NAME_WINDOW))
+            .await?;
+        if tries >= NAME_TRIES as i64 {
+            store.forget(Counted::WrongForName, &name).await?;
+            store.lock_name(&name, now + secs(NAME_LOCK)).await?;
         }
         Ok(())
     }
 
-    pub fn signed_up(&mut self, from: IpAddr, now: Instant) {
-        self.signups.entry(from).or_default().push(now);
+    pub async fn succeeded(&self, name: &str) -> Result<()> {
+        self.store
+            .forget(Counted::WrongForName, &name.to_ascii_lowercase())
+            .await
     }
 
-    /// Drops what no longer matters, so the maps don't grow forever.
-    pub fn tidy(&mut self, now: Instant) {
-        self.name_failures
-            .retain(|_, t| recent(t, NAME_WINDOW, now) > 0);
-        self.locked_until.retain(|_, until| now < *until);
-        self.address_failures
-            .retain(|_, t| recent(t, IP_WINDOW, now) > 0);
-        self.signups
-            .retain(|_, t| recent(t, SIGNUP_WINDOW, now) > 0);
+    pub async fn may_sign_up(&self, from: IpAddr, now: i64) -> Result<Result<(), Refused>> {
+        let made = self
+            .store
+            .count(
+                Counted::SignUp,
+                &from.to_string(),
+                now - secs(SIGNUP_WINDOW),
+            )
+            .await?;
+        Ok(if made >= SIGNUPS as i64 {
+            Err(Refused::TooManySignUps)
+        } else {
+            Ok(())
+        })
+    }
+
+    pub async fn signed_up(&self, from: IpAddr, now: i64) -> Result<()> {
+        self.store
+            .note(Counted::SignUp, &from.to_string(), now)
+            .await
+    }
+
+    /// Forgets what no longer counts, so the tables stay small.
+    pub async fn tidy(&self, now: i64) -> Result<()> {
+        let longest = NAME_WINDOW.max(IP_WINDOW).max(SIGNUP_WINDOW);
+        self.store.tidy_limits(now - secs(longest), now).await
     }
 }
 
@@ -273,73 +300,99 @@ mod tests {
         IpAddr::from([10, 0, 0, last])
     }
 
-    #[test]
-    fn five_wrong_guesses_lock_a_name_for_a_while() {
-        let mut attempts = Attempts::default();
-        let start = Instant::now();
+    async fn limits() -> GuessLimits {
+        GuessLimits::new(Store::open("sqlite::memory:").await.unwrap())
+    }
+
+    const START: i64 = 1_000_000;
+
+    #[actix_rt::test]
+    async fn five_wrong_guesses_lock_a_name_for_a_while() {
+        let limits = limits().await;
         for i in 0..NAME_TRIES {
-            assert!(attempts.may_sign_in("Alice", ip(i as u8), start).is_ok());
-            attempts.failed("Alice", ip(i as u8), start);
+            let from = ip(i as u8);
+            assert_eq!(
+                limits.may_sign_in("Alice", from, START).await.unwrap(),
+                Ok(())
+            );
+            limits.failed("Alice", from, START).await.unwrap();
         }
         assert_eq!(
-            attempts.may_sign_in("alice", ip(99), start),
+            limits.may_sign_in("alice", ip(99), START).await.unwrap(),
             Err(Refused::NameLocked),
             "from anywhere, in any case"
         );
-        assert!(attempts.may_sign_in("bob", ip(99), start).is_ok());
-        let later = start + NAME_LOCK;
-        assert!(attempts.may_sign_in("alice", ip(99), later).is_ok());
+        assert_eq!(
+            limits.may_sign_in("bob", ip(99), START).await.unwrap(),
+            Ok(())
+        );
+        let later = START + secs(NAME_LOCK);
+        assert_eq!(
+            limits.may_sign_in("alice", ip(99), later).await.unwrap(),
+            Ok(())
+        );
     }
 
-    #[test]
-    fn guesses_spread_out_in_time_never_lock() {
-        let mut attempts = Attempts::default();
-        let mut now = Instant::now();
+    #[actix_rt::test]
+    async fn guesses_spread_out_in_time_never_lock() {
+        let limits = limits().await;
+        let mut now = START;
         for _ in 0..20 {
-            attempts.failed("alice", ip(1), now);
-            attempts.succeeded("alice");
-            now += Duration::from_secs(60);
-        }
-        assert!(attempts.may_sign_in("alice", ip(2), now).is_ok());
-        for _ in 0..NAME_TRIES - 1 {
-            attempts.failed("alice", ip(2), now);
-            now += NAME_WINDOW / 4;
-        }
-        assert!(attempts.may_sign_in("alice", ip(2), now).is_ok());
-    }
-
-    #[test]
-    fn one_address_gets_twenty_wrong_guesses_an_hour() {
-        let mut attempts = Attempts::default();
-        let now = Instant::now();
-        for i in 0..IP_TRIES {
-            attempts.failed(&format!("user{i}"), ip(1), now);
+            limits.failed("alice", ip(1), now).await.unwrap();
+            limits.succeeded("alice").await.unwrap();
+            now += 60;
         }
         assert_eq!(
-            attempts.may_sign_in("someone", ip(1), now),
+            limits.may_sign_in("alice", ip(2), now).await.unwrap(),
+            Ok(())
+        );
+        for _ in 0..NAME_TRIES - 1 {
+            limits.failed("alice", ip(2), now).await.unwrap();
+            now += secs(NAME_WINDOW) / 4;
+        }
+        assert_eq!(
+            limits.may_sign_in("alice", ip(2), now).await.unwrap(),
+            Ok(())
+        );
+    }
+
+    #[actix_rt::test]
+    async fn one_address_gets_twenty_wrong_guesses_an_hour() {
+        let limits = limits().await;
+        for i in 0..IP_TRIES {
+            limits
+                .failed(&format!("user{i}"), ip(1), START)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            limits.may_sign_in("someone", ip(1), START).await.unwrap(),
             Err(Refused::TooManyFromAddress)
         );
-        assert!(attempts.may_sign_in("someone", ip(2), now).is_ok());
-        assert!(
-            attempts
-                .may_sign_in("someone", ip(1), now + IP_WINDOW)
-                .is_ok()
+        assert_eq!(
+            limits.may_sign_in("someone", ip(2), START).await.unwrap(),
+            Ok(())
+        );
+        let later = START + secs(IP_WINDOW);
+        assert_eq!(
+            limits.may_sign_in("someone", ip(1), later).await.unwrap(),
+            Ok(())
         );
     }
 
-    #[test]
-    fn one_address_makes_five_accounts_a_day() {
-        let mut attempts = Attempts::default();
-        let now = Instant::now();
+    #[actix_rt::test]
+    async fn one_address_makes_five_accounts_a_day() {
+        let limits = limits().await;
         for _ in 0..SIGNUPS {
-            assert!(attempts.may_sign_up(ip(1), now).is_ok());
-            attempts.signed_up(ip(1), now);
+            assert_eq!(limits.may_sign_up(ip(1), START).await.unwrap(), Ok(()));
+            limits.signed_up(ip(1), START).await.unwrap();
         }
         assert_eq!(
-            attempts.may_sign_up(ip(1), now),
+            limits.may_sign_up(ip(1), START).await.unwrap(),
             Err(Refused::TooManySignUps)
         );
-        attempts.tidy(now + SIGNUP_WINDOW);
-        assert!(attempts.may_sign_up(ip(1), now + SIGNUP_WINDOW).is_ok());
+        let tomorrow = START + secs(SIGNUP_WINDOW);
+        limits.tidy(tomorrow).await.unwrap();
+        assert_eq!(limits.may_sign_up(ip(1), tomorrow).await.unwrap(), Ok(()));
     }
 }

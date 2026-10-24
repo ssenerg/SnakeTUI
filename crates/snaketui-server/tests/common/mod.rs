@@ -5,6 +5,8 @@
 // Each test file uses its own subset of these helpers.
 #![allow(dead_code)]
 
+pub mod accounts;
+
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::path::PathBuf;

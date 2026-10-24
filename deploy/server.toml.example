@@ -11,7 +11,11 @@ listen = "[::]:22"
 # reinstalls, or every player sees a "host key changed" warning.
 host_key = "/var/lib/snaketui/host_ed25519_key"
 
-# Saved nicknames, settings and records of players who connect with a key.
+# Accounts, friends and ratings, plus the nicknames, settings and records of
+# guests who connect with a key. One server keeps them in SQLite. Several
+# servers share one Postgres database instead, for example
+# "postgres://snaketui:PASSWORD@db.internal/snaketui"; add ?sslmode=require
+# if Postgres isn't on a private network.
 database = "sqlite:///var/lib/snaketui/snaketui.db"
 
 # Threads serving sessions; 0 means one per CPU core.

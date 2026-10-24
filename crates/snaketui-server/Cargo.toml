@@ -19,7 +19,13 @@ serde = { version = "1", features = ["derive"] }
 skillratings = "0.29.2"
 snake-core.workspace = true
 snake-tui.workspace = true
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = [
+    "any",
+    "postgres",
+    "runtime-tokio",
+    "sqlite",
+    "tls-rustls-aws-lc-rs",
+] }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros", "signal"] }
 toml = "0.9"
 tracing = "0.1"
@@ -27,4 +33,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9.1"
 
 [dev-dependencies]
+snaketui-test-services = { path = "../test-services" }
 vt100 = "0.18.1"

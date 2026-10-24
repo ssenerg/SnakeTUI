@@ -16,7 +16,8 @@ pub struct ServerConfig {
     /// The game's own SSH host key; created on first start. Never the
     /// machine's OpenSSH host key.
     pub host_key: PathBuf,
-    /// `sqlite:///path/to/file.db`.
+    /// `sqlite:///path/to/file.db` for one server, or
+    /// `postgres://user:password@host/database` for several sharing one.
     pub database: String,
     /// Threads serving sessions; 0 means one per CPU core.
     pub workers: usize,
