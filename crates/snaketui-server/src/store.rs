@@ -1,5 +1,11 @@
-//! What's kept for players who connect with a key: their nickname, settings
-//! and single-player records. Guests aren't stored.
+//! What's kept between visits.
+//!
+//! - Accounts: username, password hash, the SSH keys they're remembered by,
+//!   settings, single-player records, quick-play rating, and friends.
+//! - Guests who connect with a key: their nickname, settings and
+//!   single-player records, until they sign up.
+//!
+//! Guests without a key aren't stored.
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,8 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use snake_core::config::GameConfig;
 use snake_core::records::Records;
-use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::{Row, SqliteConnection};
+
+use crate::rating::Rating;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS players (
@@ -24,18 +32,138 @@ CREATE TABLE IF NOT EXISTS solo_records (
     best        INTEGER NOT NULL,
     PRIMARY KEY (fingerprint, record_key)
 );
+CREATE TABLE IF NOT EXISTS accounts (
+    id            INTEGER PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    -- Argon2id, as a PHC string
+    password_hash TEXT NOT NULL,
+    config        TEXT NOT NULL DEFAULT '',
+    rating_mu     REAL NOT NULL,
+    rating_sigma  REAL NOT NULL,
+    games         INTEGER NOT NULL DEFAULT 0,
+    wins          INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    last_seen     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_keys (
+    fingerprint TEXT PRIMARY KEY,
+    account_id  INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    added_at    INTEGER NOT NULL,
+    last_used   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_records (
+    account_id INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    record_key TEXT NOT NULL,
+    best       INTEGER NOT NULL,
+    PRIMARY KEY (account_id, record_key)
+);
+CREATE TABLE IF NOT EXISTS friend_requests (
+    from_id    INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    to_id      INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (from_id, to_id)
+);
+CREATE INDEX IF NOT EXISTS friend_requests_to ON friend_requests (to_id);
+-- Each friendship once, as (lower id, higher id).
+CREATE TABLE IF NOT EXISTS friends (
+    a     INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    b     INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    since INTEGER NOT NULL,
+    PRIMARY KEY (a, b),
+    CHECK (a < b)
+);
+CREATE INDEX IF NOT EXISTS friends_b ON friends (b);
 ";
+
+/// Keys an account can be remembered by; using one more forgets the one
+/// used longest ago.
+pub const MAX_KEYS: i64 = 10;
+pub const MAX_FRIENDS: i64 = 200;
+/// Friend requests waiting for an answer, from one account.
+pub const MAX_PENDING: i64 = 20;
+
+pub type AccountId = i64;
+
+/// The columns [`account_from`] reads, in order. A macro, so queries using
+/// it are still fixed strings.
+macro_rules! account_columns {
+    () => {
+        "id, username, rating_mu, rating_sigma, games, wins"
+    };
+}
 
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
 }
 
-/// What's saved for a returning player.
+/// What's saved for a returning guest with a key.
 pub struct Saved {
     pub nick: String,
     pub cfg: GameConfig,
     pub records: Records,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Account {
+    pub id: AccountId,
+    pub username: String,
+    pub rating: Rating,
+    pub games: u32,
+    pub wins: u32,
+}
+
+/// An account with its settings and records, as a session needs it.
+pub struct AccountData {
+    pub account: Account,
+    pub cfg: GameConfig,
+    pub records: Records,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub fingerprint: String,
+    pub added_at: i64,
+    pub last_used: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Friend {
+    pub id: AccountId,
+    pub username: String,
+    pub last_seen: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FriendLists {
+    pub friends: Vec<Friend>,
+    /// They asked; waiting for this account's answer.
+    pub incoming: Vec<Friend>,
+    /// This account asked; waiting for theirs.
+    pub outgoing: Vec<Friend>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Requested {
+    Sent,
+    /// They had already asked, so now you're friends.
+    NowFriends,
+    AlreadyFriends,
+    AlreadyAsked,
+    TooMany,
+}
+
+/// One account's result in a rated round.
+pub struct RatedResult {
+    pub account: AccountId,
+    pub rating: Rating,
+    pub won: bool,
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 impl Store {
@@ -61,19 +189,18 @@ impl Store {
         self.pool.close().await;
     }
 
+    // Guests with a key.
+
     /// Notes a visit by this key and returns what's saved for it. A first
     /// visit saves `nick` as the player's name.
     pub async fn visit(&self, fingerprint: &str, nick: &str) -> Result<Saved> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
         sqlx::query(
             "INSERT INTO players (fingerprint, nick, last_seen) VALUES (?1, ?2, ?3)
              ON CONFLICT (fingerprint) DO UPDATE SET last_seen = excluded.last_seen",
         )
         .bind(fingerprint)
         .bind(nick)
-        .bind(now)
+        .bind(now())
         .execute(&self.pool)
         .await?;
 
@@ -81,20 +208,14 @@ impl Store {
             .bind(fingerprint)
             .fetch_one(&self.pool)
             .await?;
-        let mut records = Records::default();
         let rows = sqlx::query("SELECT record_key, best FROM solo_records WHERE fingerprint = ?1")
             .bind(fingerprint)
             .fetch_all(&self.pool)
             .await?;
-        for row in rows {
-            let key: String = row.try_get(0)?;
-            let best: i64 = row.try_get(1)?;
-            records.update(&key, best as u32);
-        }
         Ok(Saved {
             nick: player.try_get(0)?,
             cfg: GameConfig::from_saved_text(&player.try_get::<String, _>(1)?),
-            records,
+            records: records_from(rows)?,
         })
     }
 
@@ -130,15 +251,447 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    // Accounts.
+
+    /// Makes an account, remembered by `key` if there is one; `cfg` and
+    /// `records` are what the guest had. `Ok(None)` if the username is
+    /// taken, ignoring case.
+    pub async fn create_account(
+        &self,
+        username: &str,
+        password_hash: &str,
+        key: Option<&str>,
+        cfg: &GameConfig,
+        records: &Records,
+    ) -> Result<Option<Account>> {
+        let mut tx = self.pool.begin().await?;
+        let start = Rating::default();
+        let created = sqlx::query(
+            "INSERT INTO accounts
+                 (username, password_hash, config, rating_mu, rating_sigma, created_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(cfg.to_saved_text())
+        .bind(start.mu)
+        .bind(start.sigma)
+        .bind(now())
+        .execute(&mut *tx)
+        .await;
+        let id = match created {
+            Ok(done) => done.last_insert_rowid(),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        for (record_key, best) in records.iter() {
+            sqlx::query(
+                "INSERT INTO account_records (account_id, record_key, best) VALUES (?1, ?2, ?3)",
+            )
+            .bind(id)
+            .bind(record_key)
+            .bind(i64::from(best))
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(key) = key {
+            link_key(&mut tx, id, key).await?;
+            // The key's guest profile now lives in the account.
+            sqlx::query("DELETE FROM solo_records WHERE fingerprint = ?1")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM players WHERE fingerprint = ?1")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(Account {
+            id,
+            username: username.to_string(),
+            rating: start,
+            games: 0,
+            wins: 0,
+        }))
+    }
+
+    /// The account `key` is remembered by, if any, noting that it was used.
+    pub async fn account_for_key(&self, key: &str) -> Result<Option<AccountData>> {
+        let row = sqlx::query("SELECT account_id FROM account_keys WHERE fingerprint = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let id: AccountId = row.try_get(0)?;
+        sqlx::query("UPDATE account_keys SET last_used = ?2 WHERE fingerprint = ?1")
+            .bind(key)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        self.load_account(id).await.map(Some)
+    }
+
+    /// The account named `username` (ignoring case) and its password hash.
+    pub async fn find_account(&self, username: &str) -> Result<Option<(Account, String)>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            account_columns!(),
+            ", password_hash FROM accounts WHERE username = ?1"
+        ))
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| Ok((account_from(&row)?, row.try_get(6)?)))
+            .transpose()
+    }
+
+    /// An account's settings and records, noting the visit.
+    pub async fn load_account(&self, id: AccountId) -> Result<AccountData> {
+        sqlx::query("UPDATE accounts SET last_seen = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            account_columns!(),
+            ", config FROM accounts WHERE id = ?1"
+        ))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows =
+            sqlx::query("SELECT record_key, best FROM account_records WHERE account_id = ?1")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(AccountData {
+            account: account_from(&row)?,
+            cfg: GameConfig::from_saved_text(&row.try_get::<String, _>(6)?),
+            records: records_from(rows)?,
+        })
+    }
+
+    /// Notes that the account was just around, for friends' lists.
+    pub async fn touch(&self, id: AccountId) -> Result<()> {
+        sqlx::query("UPDATE accounts SET last_seen = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Remembers the account by `key`, taking it from any other account.
+    pub async fn remember_key(&self, id: AccountId, key: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        link_key(&mut tx, id, key).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Forgets `key` if it belongs to this account; returns whether it did.
+    pub async fn forget_key(&self, id: AccountId, key: &str) -> Result<bool> {
+        let done =
+            sqlx::query("DELETE FROM account_keys WHERE fingerprint = ?1 AND account_id = ?2")
+                .bind(key)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The keys an account is remembered by, most recently used first.
+    pub async fn keys(&self, id: AccountId) -> Result<Vec<KeyInfo>> {
+        let rows = sqlx::query(
+            "SELECT fingerprint, added_at, last_used FROM account_keys
+             WHERE account_id = ?1 ORDER BY last_used DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(KeyInfo {
+                    fingerprint: row.try_get(0)?,
+                    added_at: row.try_get(1)?,
+                    last_used: row.try_get(2)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_password(&self, id: AccountId, password_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE accounts SET password_hash = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_account_config(&self, id: AccountId, cfg: &GameConfig) -> Result<()> {
+        sqlx::query("UPDATE accounts SET config = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(cfg.to_saved_text())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Like [`Self::save_record`], for an account.
+    pub async fn save_account_record(&self, id: AccountId, key: &str, best: u32) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO account_records (account_id, record_key, best) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account_id, record_key) DO UPDATE SET best = MAX(best, excluded.best)",
+        )
+        .bind(id)
+        .bind(key)
+        .bind(i64::from(best))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Saves everyone's new rating after a quick-play round, and counts the
+    /// game and any win.
+    pub async fn save_rated_round(&self, results: &[RatedResult]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for r in results {
+            sqlx::query(
+                "UPDATE accounts SET rating_mu = ?2, rating_sigma = ?3,
+                     games = games + 1, wins = wins + ?4
+                 WHERE id = ?1",
+            )
+            .bind(r.account)
+            .bind(r.rating.mu)
+            .bind(r.rating.sigma)
+            .bind(i64::from(r.won))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // Friends.
+
+    pub async fn are_friends(&self, a: AccountId, b: AccountId) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM friends WHERE a = ?1 AND b = ?2")
+            .bind(a.min(b))
+            .bind(a.max(b))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Asks `to` to be friends with `from`. If `to` had already asked
+    /// `from`, they're friends at once.
+    pub async fn request_friend(&self, from: AccountId, to: AccountId) -> Result<Requested> {
+        if self.are_friends(from, to).await? {
+            return Ok(Requested::AlreadyFriends);
+        }
+        let mut tx = self.pool.begin().await?;
+        let theirs = sqlx::query("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2")
+            .bind(to)
+            .bind(from)
+            .execute(&mut *tx)
+            .await?;
+        if theirs.rows_affected() > 0 {
+            make_friends(&mut tx, from, to).await?;
+            tx.commit().await?;
+            return Ok(Requested::NowFriends);
+        }
+        let mine = sqlx::query("SELECT 1 FROM friend_requests WHERE from_id = ?1 AND to_id = ?2")
+            .bind(from)
+            .bind(to)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if mine.is_some() {
+            return Ok(Requested::AlreadyAsked);
+        }
+        let pending: i64 = sqlx::query("SELECT COUNT(*) FROM friend_requests WHERE from_id = ?1")
+            .bind(from)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+        if pending >= MAX_PENDING || friend_count(&mut tx, from).await? >= MAX_FRIENDS {
+            return Ok(Requested::TooMany);
+        }
+        sqlx::query("INSERT INTO friend_requests (from_id, to_id, created_at) VALUES (?1, ?2, ?3)")
+            .bind(from)
+            .bind(to)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Requested::Sent)
+    }
+
+    /// Accepts `from`'s request; returns whether there was one, and room for
+    /// another friend on both sides.
+    pub async fn accept_friend(&self, me: AccountId, from: AccountId) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let asked = sqlx::query("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2")
+            .bind(from)
+            .bind(me)
+            .execute(&mut *tx)
+            .await?;
+        if asked.rows_affected() == 0
+            || friend_count(&mut tx, me).await? >= MAX_FRIENDS
+            || friend_count(&mut tx, from).await? >= MAX_FRIENDS
+        {
+            return Ok(false);
+        }
+        make_friends(&mut tx, me, from).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Ends a friendship, or drops a request either way.
+    pub async fn unfriend(&self, me: AccountId, other: AccountId) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM friends WHERE a = ?1 AND b = ?2")
+            .bind(me.min(other))
+            .bind(me.max(other))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM friend_requests
+             WHERE (from_id = ?1 AND to_id = ?2) OR (from_id = ?2 AND to_id = ?1)",
+        )
+        .bind(me)
+        .bind(other)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Friends, and requests both ways, in username order.
+    pub async fn friend_lists(&self, me: AccountId) -> Result<FriendLists> {
+        let list = |sql: &'static str| {
+            let pool = self.pool.clone();
+            async move {
+                let rows = sqlx::query(sql).bind(me).fetch_all(&pool).await?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(Friend {
+                            id: row.try_get(0)?,
+                            username: row.try_get(1)?,
+                            last_seen: row.try_get(2)?,
+                        })
+                    })
+                    .collect::<Result<Vec<Friend>>>()
+            }
+        };
+        Ok(FriendLists {
+            friends: list(
+                "SELECT id, username, last_seen FROM accounts
+                 WHERE id IN (SELECT b FROM friends WHERE a = ?1
+                              UNION SELECT a FROM friends WHERE b = ?1)
+                 ORDER BY username",
+            )
+            .await?,
+            incoming: list(
+                "SELECT id, username, last_seen FROM accounts
+                 WHERE id IN (SELECT from_id FROM friend_requests WHERE to_id = ?1)
+                 ORDER BY username",
+            )
+            .await?,
+            outgoing: list(
+                "SELECT id, username, last_seen FROM accounts
+                 WHERE id IN (SELECT to_id FROM friend_requests WHERE from_id = ?1)
+                 ORDER BY username",
+            )
+            .await?,
+        })
+    }
+}
+
+fn account_from(row: &sqlx::sqlite::SqliteRow) -> Result<Account> {
+    Ok(Account {
+        id: row.try_get(0)?,
+        username: row.try_get(1)?,
+        rating: Rating {
+            mu: row.try_get(2)?,
+            sigma: row.try_get(3)?,
+        },
+        games: row.try_get::<i64, _>(4)? as u32,
+        wins: row.try_get::<i64, _>(5)? as u32,
+    })
+}
+
+fn records_from(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Records> {
+    let mut records = Records::default();
+    for row in rows {
+        let key: String = row.try_get(0)?;
+        let best: i64 = row.try_get(1)?;
+        records.update(&key, best as u32);
+    }
+    Ok(records)
+}
+
+/// Remembers `id` by `key`, moving the key from another account if need be,
+/// then forgets the account's least recently used keys beyond [`MAX_KEYS`].
+async fn link_key(tx: &mut SqliteConnection, id: AccountId, key: &str) -> Result<()> {
+    let at = now();
+    sqlx::query(
+        "INSERT INTO account_keys (fingerprint, account_id, added_at, last_used)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT (fingerprint) DO UPDATE SET
+             account_id = excluded.account_id, added_at = excluded.added_at,
+             last_used = excluded.last_used",
+    )
+    .bind(key)
+    .bind(id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM account_keys WHERE account_id = ?1 AND fingerprint NOT IN (
+             SELECT fingerprint FROM account_keys WHERE account_id = ?1
+             ORDER BY last_used DESC, fingerprint = ?2 DESC LIMIT ?3)",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(MAX_KEYS)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+async fn make_friends(tx: &mut SqliteConnection, a: AccountId, b: AccountId) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO friends (a, b, since) VALUES (?1, ?2, ?3)")
+        .bind(a.min(b))
+        .bind(a.max(b))
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+async fn friend_count(tx: &mut SqliteConnection, id: AccountId) -> Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) FROM friends WHERE a = ?1 OR b = ?1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    Ok(row.try_get(0)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    async fn store() -> Store {
+        Store::open("sqlite::memory:").await.unwrap()
+    }
+
     #[actix_rt::test]
     async fn settings_and_records_survive_a_reconnect() {
-        let store = Store::open("sqlite::memory:").await.unwrap();
+        let store = store().await;
         let first = store.visit("SHA256:abc", "alice").await.unwrap();
         assert_eq!(first.nick, "alice");
         assert_eq!(first.cfg, GameConfig::default());
@@ -163,5 +716,181 @@ mod tests {
         assert_eq!(again.records.get("size:30x20"), 12, "records only go up");
         let other = store.visit("SHA256:xyz", "bob").await.unwrap();
         assert_eq!(other.records.get("size:30x20"), 0);
+    }
+
+    async fn account(store: &Store, name: &str, key: Option<&str>) -> Account {
+        store
+            .create_account(
+                name,
+                "hash",
+                key,
+                &GameConfig::default(),
+                &Records::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[actix_rt::test]
+    async fn usernames_are_unique_ignoring_case() {
+        let store = store().await;
+        account(&store, "Alice", None).await;
+        let clash = store
+            .create_account(
+                "aLICE",
+                "h",
+                None,
+                &GameConfig::default(),
+                &Records::default(),
+            )
+            .await
+            .unwrap();
+        assert!(clash.is_none());
+        let (found, hash) = store.find_account("ALICE").await.unwrap().unwrap();
+        assert_eq!((found.username.as_str(), hash.as_str()), ("Alice", "hash"));
+        assert_eq!(found.rating.shown(), 1000);
+    }
+
+    #[actix_rt::test]
+    async fn signing_up_with_a_key_brings_the_guest_profile_along() {
+        let store = store().await;
+        store.visit("SHA256:k1", "alice").await.unwrap();
+        let mut cfg = GameConfig::default();
+        cfg.adjust(0, 2);
+        let mut records = Records::default();
+        records.update("size:30x20", 9);
+        let made = store
+            .create_account("alice", "h", Some("SHA256:k1"), &cfg, &records)
+            .await
+            .unwrap()
+            .unwrap();
+        let data = store.account_for_key("SHA256:k1").await.unwrap().unwrap();
+        assert_eq!(data.account.id, made.id);
+        assert_eq!(data.cfg, cfg);
+        assert_eq!(data.records.get("size:30x20"), 9);
+        let guest = store.visit("SHA256:k1", "x").await.unwrap();
+        assert_eq!(
+            guest.records.get("size:30x20"),
+            0,
+            "no longer a guest profile"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn keys_move_between_accounts_and_only_the_latest_ten_are_kept() {
+        let store = store().await;
+        let a = account(&store, "alice", Some("SHA256:shared")).await;
+        let b = account(&store, "bob", None).await;
+        store.remember_key(b.id, "SHA256:shared").await.unwrap();
+        let owner = store
+            .account_for_key("SHA256:shared")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.account.id, b.id, "the latest sign-in wins the key");
+        assert!(store.keys(a.id).await.unwrap().is_empty());
+
+        for i in 0..12 {
+            store
+                .remember_key(a.id, &format!("SHA256:{i}"))
+                .await
+                .unwrap();
+        }
+        let keys = store.keys(a.id).await.unwrap();
+        assert_eq!(keys.len(), MAX_KEYS as usize);
+        assert!(keys.iter().any(|k| k.fingerprint == "SHA256:11"));
+        assert!(store.forget_key(a.id, "SHA256:11").await.unwrap());
+        assert!(
+            !store.forget_key(b.id, "SHA256:10").await.unwrap(),
+            "not bob's"
+        );
+        assert!(store.account_for_key("SHA256:11").await.unwrap().is_none());
+    }
+
+    #[actix_rt::test]
+    async fn rated_rounds_count_games_wins_and_new_ratings() {
+        let store = store().await;
+        let a = account(&store, "alice", None).await;
+        let better = Rating {
+            mu: 27.0,
+            sigma: 7.0,
+        };
+        store
+            .save_rated_round(&[RatedResult {
+                account: a.id,
+                rating: better,
+                won: true,
+            }])
+            .await
+            .unwrap();
+        let after = store.load_account(a.id).await.unwrap().account;
+        assert_eq!((after.games, after.wins, after.rating), (1, 1, better));
+    }
+
+    #[actix_rt::test]
+    async fn friendship_needs_both_sides() {
+        let store = store().await;
+        let a = account(&store, "alice", None).await;
+        let b = account(&store, "bob", None).await;
+        let c = account(&store, "cat", None).await;
+        assert_eq!(
+            store.request_friend(a.id, b.id).await.unwrap(),
+            Requested::Sent
+        );
+        assert_eq!(
+            store.request_friend(a.id, b.id).await.unwrap(),
+            Requested::AlreadyAsked
+        );
+        assert!(!store.are_friends(a.id, b.id).await.unwrap());
+        let lists = store.friend_lists(b.id).await.unwrap();
+        assert_eq!(lists.incoming[0].username, "alice");
+        assert!(store.accept_friend(b.id, a.id).await.unwrap());
+        assert!(store.are_friends(a.id, b.id).await.unwrap());
+        assert!(
+            !store.accept_friend(b.id, a.id).await.unwrap(),
+            "no request left"
+        );
+        assert_eq!(
+            store.request_friend(b.id, a.id).await.unwrap(),
+            Requested::AlreadyFriends
+        );
+
+        // Asking someone who already asked you makes you friends.
+        store.request_friend(c.id, a.id).await.unwrap();
+        assert_eq!(
+            store.request_friend(a.id, c.id).await.unwrap(),
+            Requested::NowFriends
+        );
+        let names: Vec<String> = store
+            .friend_lists(a.id)
+            .await
+            .unwrap()
+            .friends
+            .into_iter()
+            .map(|f| f.username)
+            .collect();
+        assert_eq!(names, ["bob", "cat"]);
+
+        store.unfriend(a.id, b.id).await.unwrap();
+        assert!(!store.are_friends(b.id, a.id).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn requests_waiting_for_an_answer_are_limited() {
+        let store = store().await;
+        let a = account(&store, "alice", None).await;
+        for i in 0..MAX_PENDING {
+            let other = account(&store, &format!("p{i}"), None).await;
+            assert_eq!(
+                store.request_friend(a.id, other.id).await.unwrap(),
+                Requested::Sent
+            );
+        }
+        let one_more = account(&store, "late", None).await;
+        assert_eq!(
+            store.request_friend(a.id, one_more.id).await.unwrap(),
+            Requested::TooMany
+        );
     }
 }

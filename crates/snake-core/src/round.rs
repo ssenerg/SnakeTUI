@@ -587,6 +587,7 @@ impl Round {
             seats,
             board: self.world.as_ref().map(World::view),
             placements: self.placements.clone(),
+            ratings: Vec::new(),
         }
     }
 }
@@ -606,6 +607,16 @@ pub struct RoomView {
     pub board: Option<MatchView>,
     /// The last round's results, including players who have left.
     pub placements: Vec<Placement>,
+    /// Rated rooms: how the last round moved players' ratings.
+    pub ratings: Vec<RatingChange>,
+}
+
+/// A player's shown rating before and after a rated round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RatingChange {
+    pub id: PlayerId,
+    pub before: u32,
+    pub after: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

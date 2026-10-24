@@ -2142,6 +2142,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
+ "getrandom 0.4.3",
  "phc",
 ]
 
@@ -2220,6 +2221,7 @@ checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
 dependencies = [
  "base64ct",
  "ctutils",
+ "getrandom 0.4.3",
 ]
 
 [[package]]
@@ -3045,6 +3047,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
+name = "skillratings"
+version = "0.29.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e948550eed18870bdcb199bfb98b0b7252c3af7bfe1c23f12d0f47b1841fbdc5"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,6 +3079,7 @@ version = "0.1.2"
 dependencies = [
  "ratatui",
  "snake-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -3090,12 +3099,14 @@ dependencies = [
  "actix",
  "actix-rt",
  "anyhow",
+ "argon2",
  "bytes",
  "clap",
  "rand 0.10.2",
  "ratatui",
  "russh",
  "serde",
+ "skillratings",
  "snake-core",
  "snake-tui",
  "sqlx",
@@ -3104,6 +3115,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vt100",
+ "zeroize",
 ]
 
 [[package]]

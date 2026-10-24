@@ -84,6 +84,7 @@ impl Handler<CreateRoom> for LobbyActor {
             Some(code.clone()),
             Some(ctx.address()),
             HashMap::new(),
+            None,
         );
         let addr = self.host.start(room);
         self.rooms.insert(code.clone(), addr.clone());

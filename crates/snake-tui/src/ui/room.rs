@@ -15,7 +15,8 @@ use snake_core::view::MatchView;
 
 use super::board::{BoardWidget, SnakeLook};
 use super::dialog;
-use crate::app::{App, InRoom};
+use crate::app::App;
+use crate::online::InRoom;
 use crate::palette::{opponent_colors, theme_color};
 
 /// Columns the scoreboard takes beside the board.
@@ -37,7 +38,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     };
     match (&room.view.phase, &room.view.board) {
-        (PhaseView::Waiting { starts_in }, _) => draw_lobby(frame, room, *starts_in),
+        (PhaseView::Waiting { starts_in }, _) => draw_lobby(frame, app, room, *starts_in),
         (_, Some(board)) => draw_match(frame, app, room, board),
         _ => {}
     }
@@ -51,9 +52,10 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn draw_lobby(frame: &mut Frame, room: &InRoom, starts_in: Option<Duration>) {
+fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
     let view = &room.view;
-    let height = 11 + view.seats.len() as u16;
+    let online = app.online.as_ref();
+    let height = 12 + view.seats.len() as u16;
     let inner = dialog(frame, " Private room ", Color::Cyan, 52, height);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::default()];
@@ -104,8 +106,16 @@ fn draw_lobby(frame: &mut Frame, room: &InRoom, starts_in: Option<Duration>) {
         None if view.seats.len() < 2 => Line::from("Waiting for another player…"),
         None => Line::default(),
     });
-    lines.push(Line::default());
-    lines.push(Line::from("Enter ready · Esc leave").style(dim()));
+    lines.push(match online.and_then(|o| o.notice.as_ref()) {
+        Some(notice) => Line::styled(notice.clone(), Style::default().fg(Color::LightYellow)),
+        None => Line::default(),
+    });
+    let hint = if online.is_some_and(|o| o.account.is_some()) {
+        "Enter ready · i invite friends · Esc leave"
+    } else {
+        "Enter ready · Esc leave"
+    };
+    lines.push(Line::from(hint).style(dim()));
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
@@ -355,7 +365,7 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
         Outcome::Won { winner, .. } => (format!("{} wins!", winner.name), Color::LightCyan),
         Outcome::Draw { .. } => ("Draw!".to_string(), Color::LightYellow),
     };
-    let inner = dialog(frame, " RESULTS ", color, 42, height);
+    let inner = dialog(frame, " RESULTS ", color, 48, height);
     let time_up = matches!(
         outcome,
         Outcome::Won { time_up: true, .. } | Outcome::Draw { time_up: true }
@@ -381,10 +391,23 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
             Style::default()
         };
         let name: String = p.who.name.chars().take(18).collect();
-        lines.push(Line::styled(
+        let mut spans = vec![Span::styled(
             format!("{:>2}. {name:<18} {:>4}", p.place, p.length),
             style,
-        ));
+        )];
+        // Rated matches: how the round moved each account's rating.
+        match view.ratings.iter().find(|r| r.id == p.who.id) {
+            Some(r) if r.after >= r.before => spans.push(Span::styled(
+                format!("  +{:<3}", r.after - r.before),
+                Style::default().fg(Color::LightGreen),
+            )),
+            Some(r) => spans.push(Span::styled(
+                format!("  −{:<3}", r.before - r.after),
+                Style::default().fg(Color::LightRed),
+            )),
+            None => spans.push(Span::raw("      ")),
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::default());
     lines.push(match (view.kind, next_in) {

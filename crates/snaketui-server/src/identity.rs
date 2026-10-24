@@ -7,7 +7,7 @@ pub const MAX_NICK: usize = 16;
 
 /// User names that say nothing about the person: whoever typed
 /// `ssh root@…` or kept their machine's login is given a generated name.
-const GENERIC_USERS: &[&str] = &[
+pub const GENERIC_USERS: &[&str] = &[
     "root",
     "admin",
     "administrator",

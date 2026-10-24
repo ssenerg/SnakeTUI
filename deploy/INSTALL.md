@@ -133,8 +133,9 @@ everything the game keeps:
 
 - `host_ed25519_key`: the game's own SSH host key, created on first start. It
   is separate from the machine's OpenSSH host key.
-- `snaketui.db`: nicknames, settings and records of players who connect with a
-  key.
+- `snaketui.db`: the accounts (usernames, password hashes, ratings and
+  friends), and the nicknames, settings and records of guests who connect with
+  a key.
 
 If it doesn't start, see the log: `journalctl -u snaketui -e`.
 
@@ -189,7 +190,18 @@ sudo ssh-keygen -lf /var/lib/snaketui/host_ed25519_key
 - **Back up the host key.** Copy `/var/lib/snaketui/host_ed25519_key`
   somewhere safe. If you rebuild the server, put it back before the first
   start; otherwise every returning player gets a "REMOTE HOST IDENTIFICATION
-  HAS CHANGED" warning. Back up `snaketui.db` too if you want to keep records.
+  HAS CHANGED" warning.
+- **Back up the database.** `snaketui.db` holds every account; without it,
+  players lose their accounts, ratings and friends. To copy it while the game
+  is running, install `sqlite3` and use its backup command:
+
+  ```bash
+  sudo apt install sqlite3
+  sudo sqlite3 /var/lib/snaketui/snaketui.db ".backup /root/snaketui-backup.db"
+  ```
+
+  Don't copy the file with `cp` while the game runs: the newest changes may
+  still be in `snaketui.db-wal` next to it.
 - **fail2ban.** It isn't installed on Ubuntu by default. If you installed it,
   its `sshd` jail still watches port 22. Point it at your admin port by putting
   this in `/etc/fail2ban/jail.d/sshd-port.local`, then run
@@ -235,6 +247,8 @@ If the release changes `snaketui.service`, install it again too, and run
 | The log says it can't listen on `[::]:22` because the address family isn't supported | The machine has IPv6 turned off. Set `listen = "0.0.0.0:22"` in `/etc/snaketui/server.toml` and restart. |
 | `ssh play.example.com` hangs, then times out | Port 22 is closed in ufw or in the cloud firewall (steps 2 and 6). |
 | Players get "REMOTE HOST IDENTIFICATION HAS CHANGED" | The host key was replaced. Restore it from your backup and restart. |
+| A player forgot their password | They can set a new one under Account → Change password from any machine that still signs them in. Otherwise the account can't be recovered, because the game has no email addresses. |
+| A player sees "Too many wrong tries for that name" | 5 wrong passwords within 15 minutes lock a username for 15 minutes. An IP address gets 20 wrong tries an hour. Both clear by themselves, and restarting the game clears them too. |
 | You can't reach port 2222 | Log in from your cloud provider's web console. Stop the game (`sudo systemctl stop snaketui`), delete `/etc/ssh/sshd_config.d/admin-port.conf`, then run `sudo systemctl daemon-reload` and `sudo systemctl restart ssh.socket`. sshd is back on port 22. |
 
 For more detail in the log, run `sudo systemctl edit snaketui`, add the lines

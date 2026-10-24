@@ -11,7 +11,9 @@ use tokio::sync::watch;
 use tracing::debug;
 
 use crate::matcher::{Matcher, Ticket};
-use crate::room::{Presence, RoomActor, RoomHost, ViewRx};
+use crate::rating::Rating;
+use crate::room::{Presence, Rated, RatedMember, Ratings, RoomActor, RoomHost, ViewRx};
+use crate::store::{AccountId, Store};
 
 const RUN_EVERY: Duration = Duration::from_secs(1);
 
@@ -20,10 +22,12 @@ const RUN_EVERY: Duration = Duration::from_secs(1);
 #[rtype(result = "()")]
 pub struct Enqueue {
     pub who: Entrant,
-    pub rating: f64,
+    pub account: Option<AccountId>,
+    pub rating: Rating,
     pub region: String,
     pub presence: Presence,
     pub reply: Recipient<Matched>,
+    pub on_rated: Recipient<Rated>,
 }
 
 #[derive(Message)]
@@ -40,8 +44,11 @@ pub struct Matched {
 
 struct Waiter {
     who: Entrant,
+    account: Option<AccountId>,
+    rating: Rating,
     presence: Presence,
     reply: Recipient<Matched>,
+    on_rated: Recipient<Rated>,
 }
 
 pub struct MatchmakerActor {
@@ -49,6 +56,7 @@ pub struct MatchmakerActor {
     waiting: HashMap<PlayerId, Waiter>,
     epoch: Instant,
     host: Arc<RoomHost>,
+    store: Store,
     settings: RoundSettings,
     seed: Option<u64>,
     queue_len: watch::Sender<usize>,
@@ -57,12 +65,18 @@ pub struct MatchmakerActor {
 impl MatchmakerActor {
     /// `queue_len` is kept up to date with how many are waiting. `seed`
     /// fixes every match's seed, for tests.
-    pub fn new(host: Arc<RoomHost>, queue_len: watch::Sender<usize>, seed: Option<u64>) -> Self {
+    pub fn new(
+        host: Arc<RoomHost>,
+        store: Store,
+        queue_len: watch::Sender<usize>,
+        seed: Option<u64>,
+    ) -> Self {
         Self {
             matcher: Matcher::default(),
             waiting: HashMap::new(),
             epoch: Instant::now(),
             host,
+            store,
             settings: RoundSettings::new(quick_rules(), RoomKind::Match)
                 .expect("the quick-play board fits a full room"),
             seed,
@@ -92,9 +106,24 @@ impl MatchmakerActor {
                 .iter()
                 .map(|w| (w.who.id, w.presence.clone()))
                 .collect();
+            let members = waiters
+                .iter()
+                .map(|w| {
+                    let member = RatedMember {
+                        account: w.account,
+                        rating: w.rating,
+                        notify: w.on_rated.clone(),
+                    };
+                    (w.who.id, member)
+                })
+                .collect();
+            let ratings = Ratings {
+                store: self.store.clone(),
+                members,
+            };
             let seed = self.seed.unwrap_or_else(rand::random);
             let round = Round::new_match(self.settings.clone(), seed, entrants);
-            let (room, view) = RoomActor::new(round, None, None, present);
+            let (room, view) = RoomActor::new(round, None, None, present, Some(ratings));
             let room = self.host.start(room);
             debug!(players = waiters.len(), region = %group.region, "match formed");
             for w in waiters {
@@ -122,7 +151,7 @@ impl Handler<Enqueue> for MatchmakerActor {
     fn handle(&mut self, msg: Enqueue, _: &mut Self::Context) {
         self.matcher.add(Ticket {
             player: msg.who.id,
-            rating: msg.rating,
+            rating: f64::from(msg.rating.shown()),
             region: msg.region,
             since: self.epoch.elapsed(),
         });
@@ -130,8 +159,11 @@ impl Handler<Enqueue> for MatchmakerActor {
             msg.who.id,
             Waiter {
                 who: msg.who,
+                account: msg.account,
+                rating: msg.rating,
                 presence: msg.presence,
                 reply: msg.reply,
+                on_rated: msg.on_rated,
             },
         );
         self.queue_len.send_replace(self.matcher.len());

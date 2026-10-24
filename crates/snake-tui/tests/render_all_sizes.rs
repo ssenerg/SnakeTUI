@@ -9,11 +9,12 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Size;
 use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
+use snake_core::round::RatingChange;
 use snake_core::round::{
     Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
-use snake_tui::app::{Field, HOME};
+use snake_tui::online::{Field, FormKind, FriendRow, FriendsView, KeyRow, Profile};
 use snake_tui::{App, Screen, ui};
 
 /// One app per screen worth drawing, on a board of `rules`.
@@ -142,13 +143,83 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         ..GameConfig::default()
     };
     let new_app = |screen: Screen| {
-        let mut app = App::online(cfg.clone(), Records::default(), "~player-0123456789".into());
+        let mut app = App::online(
+            cfg.clone(),
+            Records::default(),
+            "~player-0123456789".into(),
+            true,
+        );
         app.screen = screen;
         app
     };
-    let mut apps: Vec<App> = (0..HOME.len())
+    // Signed in, with friends, requests and remembered machines.
+    let account = |screen: Screen| {
+        let mut app = new_app(screen);
+        app.set_profile(Some(Profile {
+            username: "player0123456789".into(),
+            rating: 1043,
+            games: 12,
+            wins: 4,
+        }));
+        let online = app.online.as_mut().unwrap();
+        online.requests = 2;
+        online.keys = (0..10)
+            .map(|i| KeyRow {
+                fingerprint: format!("SHA256:{i}abcdefghijklmnopqrstuvwxyz0123456789"),
+                last_used: "used 3 days ago".into(),
+                this_machine: i == 0,
+            })
+            .collect();
+        online.friends = FriendsView {
+            friends: (0..20)
+                .map(|i| FriendRow {
+                    name: format!("friend-number-{i:02}"),
+                    status: if i % 2 == 0 {
+                        "in a private room".into()
+                    } else {
+                        "last seen 12 days ago".into()
+                    },
+                    online: i % 2 == 0,
+                })
+                .collect(),
+            incoming: vec!["someone-asking".into(), "another".into()],
+            outgoing: vec!["waiting-on-them".into()],
+        };
+        app
+    };
+    let guest_items = new_app(Screen::Home { selected: 0 }).home_items().len();
+    let mut apps: Vec<App> = (0..guest_items)
         .map(|selected| new_app(Screen::Home { selected }))
         .collect();
+    let account_items = account(Screen::Home { selected: 0 }).home_items().len();
+    apps.extend((0..account_items).map(|selected| account(Screen::Home { selected })));
+    for selected in [0, 3, 10, 12] {
+        apps.push(account(Screen::Account { selected }));
+    }
+    for selected in [0, 2, 5, 23] {
+        apps.push(account(Screen::Friends { selected }));
+    }
+    for kind in [FormKind::SignUp, FormKind::SignIn, FormKind::ChangePassword] {
+        let mut app = if kind == FormKind::ChangePassword {
+            account(Screen::Form(kind))
+        } else {
+            new_app(Screen::Form(kind))
+        };
+        apps.push(new_app(Screen::Form(kind)));
+        app.form.username = "a-sixteen-letter".into();
+        app.form.focus = 1;
+        app.form.error = Some("That username is reserved. Pick another.".into());
+        apps.push(app);
+    }
+    let mut busy = new_app(Screen::Form(FormKind::SignIn));
+    busy.form.busy = true;
+    apps.push(busy);
+    let mut invited = account(Screen::Home { selected: 0 });
+    invited.invited("someone-with-a-long-name".into());
+    apps.push(invited);
+    let mut adding = account(Screen::Input(Field::FriendName));
+    adding.input.text = "bob".into();
+    apps.push(adding);
     let mut notice = new_app(Screen::Home { selected: 1 });
     notice.online.as_mut().unwrap().notice = Some(
         "Your terminal is 60×20; matches need 80×21 to show the whole board. \
@@ -170,6 +241,35 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         app.enter_room(2, Arc::new(view.clone()));
         apps.push(app);
     }
+    // Results of a rated match, with ratings up and down.
+    let mut rated = views
+        .iter()
+        .rfind(|v| matches!(v.phase, PhaseView::Results { .. }))
+        .expect("results")
+        .clone();
+    rated.ratings = rated
+        .placements
+        .iter()
+        .enumerate()
+        .map(|(i, p)| RatingChange {
+            id: p.who.id,
+            before: 1000,
+            after: if i == 0 { 1031 } else { 988 },
+        })
+        .collect();
+    let mut app = account(Screen::Room);
+    app.enter_room(2, Arc::new(rated));
+    apps.push(app);
+    // A private lobby, signed in, with a notice.
+    let lobby = views
+        .iter()
+        .find(|v| v.code.is_some())
+        .expect("a private lobby")
+        .clone();
+    let mut app = account(Screen::Room);
+    app.enter_room(1, Arc::new(lobby));
+    app.notify("Invited friend-number-00.".into());
+    apps.push(app);
     // While a round runs: as one who left, as someone watching, and asking
     // to leave.
     let running = views

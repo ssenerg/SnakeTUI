@@ -6,6 +6,7 @@
 //! threads (actix arbiters); its SSH I/O runs on the same thread.
 
 pub mod accept;
+pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod identity;
@@ -14,6 +15,8 @@ pub mod lobby;
 pub mod matcher;
 pub mod matchmaker;
 pub mod metrics;
+pub mod presence;
+pub mod rating;
 pub mod room;
 pub mod session;
 pub mod ssh;
@@ -32,10 +35,12 @@ use tokio::sync::watch;
 use tracing::info;
 
 use crate::accept::{Limits, Worker};
+use crate::auth::{Attempts, Hasher};
 use crate::config::ServerConfig;
 use crate::lobby::LobbyActor;
 use crate::matchmaker::MatchmakerActor;
 use crate::metrics::TICK_LAG;
+use crate::presence::PresenceActor;
 use crate::room::RoomHost;
 use crate::store::Store;
 
@@ -51,6 +56,10 @@ pub struct Shared {
     pub shutdown: watch::Sender<bool>,
     pub lobby: Addr<LobbyActor>,
     pub matchmaker: Addr<MatchmakerActor>,
+    pub presence: Addr<PresenceActor>,
+    pub hasher: Hasher,
+    /// Wrong passwords and new accounts, for the guessing limits.
+    pub attempts: std::sync::Mutex<Attempts>,
     /// How many players are waiting in the quick-play queue.
     pub queue_len: watch::Receiver<usize>,
     /// Hands out each session's player id.
@@ -78,10 +87,13 @@ pub async fn serve(
         let host = Arc::clone(&host);
         move |_| LobbyActor::new(host)
     });
+    let presence =
+        PresenceActor::start_in_arbiter(&room_arbiters[0].handle(), |_| PresenceActor::default());
     let (queue_tx, queue_len) = watch::channel(0);
     let seed = cfg.room_seed;
-    let matchmaker = MatchmakerActor::start_in_arbiter(&room_arbiters[0].handle(), move |_| {
-        MatchmakerActor::new(host, queue_tx, seed)
+    let matchmaker = MatchmakerActor::start_in_arbiter(&room_arbiters[0].handle(), {
+        let store = store.clone();
+        move |_| MatchmakerActor::new(host, store, queue_tx, seed)
     });
     let arbiters: Vec<Arbiter> = (0..cfg.workers()).map(|_| Arbiter::new()).collect();
     let workers = arbiters
@@ -98,8 +110,22 @@ pub async fn serve(
         shutdown: watch::channel(false).0,
         lobby,
         matchmaker,
+        presence,
+        hasher: Hasher::new()?,
+        attempts: std::sync::Mutex::new(Attempts::default()),
         queue_len,
         next_player: AtomicU64::new(1),
+    });
+    // Forget old wrong guesses now and then, so the limits' memory stays
+    // small.
+    let tidying = actix_rt::spawn({
+        let shared = Arc::clone(&shared);
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                shared.attempts.lock().unwrap().tidy(Instant::now());
+            }
+        }
     });
 
     listener.set_nonblocking(true)?;
@@ -119,6 +145,7 @@ pub async fn serve(
     stop.await;
     info!(players = limits.open(), "shutting down");
     accepting.abort();
+    tidying.abort();
     shared.shutdown.send_replace(true);
     let deadline = Instant::now() + GOODBYE;
     while limits.open() > 0 && Instant::now() < deadline {

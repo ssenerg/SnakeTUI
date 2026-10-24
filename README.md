@@ -58,9 +58,10 @@ cargo run --release
 `ssh play.example.com`. The game is the SSH server: players get no shell and
 no account on the machine, and quitting the game ends their connection at once.
 
-- **Identity.** A player's SSH key identifies them, so their nickname,
-  settings and records follow the key between visits. Players without a key
-  play as guests. Passwords are never asked for.
+- **Guests and accounts.** Anyone can play as a guest. Signing up in the
+  game adds a username, a rating and friends (see below). Even as a guest, a
+  player who connects with an SSH key keeps their nickname, settings and
+  records between visits.
 - **Only the game.** Commands (`ssh host ls`), file transfer and port
   forwarding are refused with a message.
 - **Limits.** Connections are capped in total and per IP address. Logins time
@@ -74,7 +75,7 @@ so in multiplayer turns are always queued for the next tick.
 
 - **Quick play** puts you in a queue. A match starts as soon as 8 players
   are waiting, or after 10 seconds with at least 2. It plays one round on a
-  30×18 board, which fits an 80×23 terminal.
+  30×18 board, which fits an 80×23 terminal. Matches are rated.
 - **Private rooms** use your single-player settings and get a 6-character
   code to share. Anyone with the code can join. A round starts 15 seconds
   after the second player arrives, or as soon as everyone presses Enter.
@@ -90,6 +91,40 @@ so in multiplayer turns are always queued for the next tick.
   shows its player's number.
 - **Small terminals.** If the board doesn't fit, you see the part around
   your snake, with a warning.
+
+### Accounts, friends and ratings
+
+Guests can play everything except friends and ratings. To get those, pick
+**Sign up** on the home screen and choose a username and a password.
+
+- **Signing in.** The SSH key you signed up with signs you in by itself on
+  later visits. On another machine, pick **Sign in** and type your password.
+  Leave "remember this machine" ticked to skip that next time. An account
+  remembers up to 10 machines.
+- **Your settings and records come along.** If you played as a guest with a
+  key before signing up, your single-player settings and records move into
+  the new account.
+- **Account** shows your rating, games and wins, and the machines that sign
+  you in, each of which you can remove. You can change your password there,
+  or sign out, which also forgets this machine.
+- **Friends.** Add a friend by username. They accept in their own Friends
+  screen, and if they're online they hear about it at once. Your list shows
+  which friends are online and what they're doing.
+- **Playing with a friend.** Pick an online friend to invite them. You're put
+  in a new private room, or press `i` in a room you're already in. Your
+  friend sees the invite on whatever screen they're on: Enter joins, Esc
+  dismisses it. Invites last 2 minutes.
+- **Ratings.** Every account starts at 1000. Only quick play is rated: each
+  match moves your rating by where you placed and whom you beat, and the
+  results show by how much. Quick play looks for players of a close rating
+  first, and widens the range the longer you wait. Guests can join rated
+  matches; they count as 1000, and nothing is saved for them.
+- **Passwords** are typed into the game's own masked form, never into ssh's
+  password prompt, which stays off. The server keeps only an Argon2id hash.
+  A connection closes after 5 wrong tries, and 5 wrong tries for one username
+  within 15 minutes lock it for 15 minutes. There's no email, so a forgotten
+  password can only be replaced from a machine that still signs you in, under
+  **Account → Change password**.
 
 To host it on Ubuntu 24.04, follow [deploy/INSTALL.md](deploy/INSTALL.md).
 Prebuilt Linux servers are on the [releases page](../../releases) next to the

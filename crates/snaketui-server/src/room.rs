@@ -13,13 +13,16 @@ use actix::prelude::*;
 use actix_rt::ArbiterHandle;
 use snake_core::geom::Direction;
 use snake_core::round::{
-    Entrant, JoinError, PhaseView, PlayerId, RoomKind, RoomView, Round, RoundEvent,
+    Entrant, JoinError, Outcome, PhaseView, Placement, PlayerId, RatingChange, RoomKind, RoomView,
+    Round, RoundEvent,
 };
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
+use crate::rating::{self, Rating};
+use crate::store::{AccountId, RatedResult, Store};
 
 pub type ViewRx = watch::Receiver<Arc<RoomView>>;
 
@@ -57,6 +60,28 @@ impl RoomHost {
     }
 }
 
+/// A player's new rating after a rated round, for their session.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct Rated {
+    pub rating: Rating,
+    pub won: bool,
+}
+
+/// A player in a rated room.
+pub struct RatedMember {
+    /// Guests play at the starting rating, and nothing is saved for them.
+    pub account: Option<AccountId>,
+    pub rating: Rating,
+    pub notify: Recipient<Rated>,
+}
+
+/// What a rated room needs: everyone's rating, and where to save new ones.
+pub struct Ratings {
+    pub store: Store,
+    pub members: HashMap<PlayerId, RatedMember>,
+}
+
 #[derive(Message)]
 #[rtype(result = "Result<ViewRx, JoinError>")]
 pub struct Join {
@@ -85,6 +110,9 @@ pub struct RoomActor {
     view: watch::Sender<Arc<RoomView>>,
     lobby: Option<Addr<LobbyActor>>,
     present: HashMap<PlayerId, Presence>,
+    ratings: Option<Ratings>,
+    /// The last rated round's changes, shown with its results.
+    changes: Vec<RatingChange>,
     last: Instant,
     /// When the timer was meant to fire.
     due: Instant,
@@ -110,14 +138,16 @@ impl Actor for RoomActor {
 
 impl RoomActor {
     /// A room for `round`, with the receiver for its view. `present` lists
-    /// the players already seated, as a matched room has.
+    /// the players already seated, as a matched room has; with `ratings`,
+    /// its rounds are rated.
     pub fn new(
         round: Round,
         code: Option<String>,
         lobby: Option<Addr<LobbyActor>>,
         present: HashMap<PlayerId, Presence>,
+        ratings: Option<Ratings>,
     ) -> (Self, ViewRx) {
-        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code)));
+        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[])));
         let now = Instant::now();
         let room = Self {
             round,
@@ -125,6 +155,8 @@ impl RoomActor {
             view,
             lobby,
             present,
+            ratings,
+            changes: Vec::new(),
             last: now,
             due: now,
             over_since: None,
@@ -188,9 +220,57 @@ impl RoomActor {
 
     fn on_events(&mut self, events: Vec<RoundEvent>) {
         for event in events {
-            let RoundEvent::Ended { outcome, .. } = event;
+            let RoundEvent::Ended {
+                outcome,
+                placements,
+            } = event;
             debug!(code = ?self.code, ?outcome, "round over");
+            self.rate(&outcome, &placements);
         }
+    }
+
+    /// Works out everyone's new rating, saves the accounts' ones, tells each
+    /// player, and shows the changes with the results.
+    fn rate(&mut self, outcome: &Outcome, placements: &[Placement]) {
+        let Some(ratings) = &self.ratings else {
+            return;
+        };
+        let players: Vec<(&Placement, &RatedMember)> = placements
+            .iter()
+            .filter_map(|p| ratings.members.get(&p.who.id).map(|m| (p, m)))
+            .collect();
+        let before: Vec<(Rating, usize)> =
+            players.iter().map(|(p, m)| (m.rating, p.place)).collect();
+        let after = rating::after_round(&before);
+        let winner = match outcome {
+            Outcome::Won { winner, .. } => Some(winner.id),
+            Outcome::Draw { .. } => None,
+        };
+        let mut saved = Vec::new();
+        self.changes.clear();
+        for ((placement, member), rating) in players.into_iter().zip(after) {
+            let won = winner == Some(placement.who.id);
+            member.notify.do_send(Rated { rating, won });
+            if let Some(account) = member.account {
+                saved.push(RatedResult {
+                    account,
+                    rating,
+                    won,
+                });
+                self.changes.push(RatingChange {
+                    id: placement.who.id,
+                    before: member.rating.shown(),
+                    after: rating.shown(),
+                });
+            }
+        }
+        let store = ratings.store.clone();
+        actix::spawn(async move {
+            if let Err(e) = store.save_rated_round(&saved).await {
+                warn!(error = %e, "couldn't save ratings");
+            }
+        });
+        self.publish_now();
     }
 
     /// Runs `f` on the round; a panic closes the room with a message for its
@@ -212,9 +292,13 @@ impl RoomActor {
 
     fn publish(&mut self) {
         if self.round.take_changed() {
-            self.view
-                .send_replace(Arc::new(view_of(&self.round, &self.code)));
+            self.publish_now();
         }
+    }
+
+    fn publish_now(&mut self) {
+        self.view
+            .send_replace(Arc::new(view_of(&self.round, &self.code, &self.changes)));
     }
 
     fn close(&mut self, reason: &str, ctx: &mut Context<Self>) {
@@ -227,9 +311,12 @@ impl RoomActor {
     }
 }
 
-fn view_of(round: &Round, code: &Option<String>) -> RoomView {
+fn view_of(round: &Round, code: &Option<String>, changes: &[RatingChange]) -> RoomView {
     let mut view = round.view();
     view.code.clone_from(code);
+    if !view.placements.is_empty() {
+        view.ratings = changes.to_vec();
+    }
     view
 }
 

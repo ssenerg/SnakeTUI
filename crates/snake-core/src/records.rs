@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// Best length per record key (see [`crate::config::Rules::record_key`]).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Records {
     map: HashMap<String, u32>,
 }
@@ -24,6 +24,11 @@ impl Records {
         let mut lines: Vec<String> = self.map.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
         lines.sort();
         lines.join("\n") + "\n"
+    }
+
+    /// Every record, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.map.iter().map(|(k, v)| (k.as_str(), *v))
     }
 
     pub fn get(&self, key: &str) -> u32 {

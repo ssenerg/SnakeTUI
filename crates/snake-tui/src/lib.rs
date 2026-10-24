@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod key;
+pub mod online;
 pub mod palette;
 pub mod ui;
 

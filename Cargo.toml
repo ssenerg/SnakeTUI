@@ -24,3 +24,10 @@ anyhow.workspace = true
 ratatui.workspace = true
 snake-core.workspace = true
 snake-tui.workspace = true
+
+# Password hashing is very slow unoptimized, and the tests sign in a lot.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

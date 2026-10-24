@@ -6,7 +6,8 @@ use ratatui::widgets::Paragraph;
 use snake_core::solo::GameOverReason;
 
 use super::dialog;
-use crate::app::{App, Field};
+use crate::app::App;
+use crate::online::Field;
 
 pub fn draw_pause(frame: &mut Frame, selected: usize) {
     let inner = dialog(frame, " PAUSED ", Color::Yellow, 36, 8);
@@ -80,6 +81,7 @@ pub fn draw_input(frame: &mut Frame, app: &App, field: Field) {
     let (title, prompt) = match field {
         Field::Code => (" Join with a code ", "Type the room's 6-character code"),
         Field::Nickname => (" Nickname ", "Letters, digits, _ and -, up to 16"),
+        Field::FriendName => (" Add a friend ", "Their username"),
     };
     let inner = dialog(frame, title, Color::Cyan, 44, 9);
     let dim = Style::default().fg(Color::DarkGray);

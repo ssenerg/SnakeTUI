@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 ratatui.workspace = true
 snake-core.workspace = true
+zeroize = "1.9.1"

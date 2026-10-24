@@ -1,5 +1,7 @@
 //! One player's connection: their screen, their keys and their game.
 
+mod account;
+
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -19,13 +21,16 @@ use snake_tui::{App, Effect, Key, Screen, ui};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use self::account::{JoinedRoom, PendingInvite};
 use crate::Shared;
 use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
 use crate::input::KeyParser;
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matchmaker::{Dequeue, Enqueue, Matched};
+use crate::presence::Status;
 use crate::room::{Join, Leave, Ready, RoomActor, Steer, ViewRx};
+use crate::store::{Account, AccountData};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
 /// make the server allocate huge screens.
@@ -48,8 +53,6 @@ const HANG_UP_AFTER: Duration = Duration::from_secs(2);
 const MAILBOX: usize = 64;
 /// Wrong room codes a connection may try. After that it can't join by code.
 const MAX_WRONG_CODES: u8 = 5;
-/// Everyone's rating until accounts have real ones.
-const UNRATED: f64 = 1000.0;
 /// The only region until there are several servers.
 const LOCAL_REGION: &str = "local";
 
@@ -180,6 +183,12 @@ pub struct SessionActor {
     stays: u64,
     queued: bool,
     wrong_codes: u8,
+    /// Signed in to this account.
+    account: Option<Account>,
+    sign_in_failures: u8,
+    invite: Option<PendingInvite>,
+    /// What friends were last told this player is doing.
+    status: Option<Status>,
     hangup: Option<Hangup>,
     out: Option<mpsc::Sender<Out>>,
     player: Option<Player>,
@@ -219,6 +228,7 @@ impl Actor for SessionActor {
 
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(peer = %self.peer, "session ended");
+        self.sign_off();
         if let Some(room) = self.room.take() {
             room.addr.do_send(Leave(self.id));
         }
@@ -241,6 +251,10 @@ impl SessionActor {
             stays: 0,
             queued: false,
             wrong_codes: 0,
+            account: None,
+            sign_in_failures: 0,
+            invite: None,
+            status: None,
             hangup: None,
             out: None,
             player: None,
@@ -280,32 +294,53 @@ impl SessionActor {
         self.player.as_ref()?.fingerprint().map(str::to_string)
     }
 
-    /// Loads a returning player's settings and records, then opens the game.
+    /// Loads a returning player's account, or their settings and records as
+    /// a guest, then opens the game.
     fn start(&mut self, ctx: &mut Context<Self>) {
         let store = self.shared.store.clone();
         let player = self.player.clone();
         let load = async move {
-            match player {
-                Some(p) if p.fingerprint().is_some() => {
-                    let saved = store.visit(p.fingerprint().unwrap(), &p.nick).await?;
-                    Ok((Some(saved.nick), saved.cfg, saved.records))
-                }
-                _ => anyhow::Ok((None, GameConfig::default(), Records::default())),
+            let Some((fp, p)) = player.as_ref().and_then(|p| Some((p.fingerprint()?, p))) else {
+                return anyhow::Ok(Loaded::Guest(
+                    None,
+                    GameConfig::default(),
+                    Records::default(),
+                ));
+            };
+            if let Some(data) = store.account_for_key(fp).await? {
+                return Ok(Loaded::Account(data));
             }
+            let saved = store.visit(fp, &p.nick).await?;
+            Ok(Loaded::Guest(Some(saved.nick), saved.cfg, saved.records))
         };
         // Keys that arrive meanwhile wait in the mailbox.
         ctx.wait(load.into_actor(self).map(|loaded, act, ctx| {
-            let (nick, cfg, records) = loaded.unwrap_or_else(|e| {
+            let loaded = loaded.unwrap_or_else(|e| {
                 warn!(peer = %act.peer, error = %e, "couldn't load the player; starting fresh");
-                (None, GameConfig::default(), Records::default())
+                Loaded::Guest(None, GameConfig::default(), Records::default())
             });
-            if let (Some(nick), Some(player)) = (nick, act.player.as_mut()) {
-                player.nick = nick;
+            match loaded {
+                Loaded::Account(AccountData {
+                    account,
+                    cfg,
+                    records,
+                }) => {
+                    debug!(peer = %act.peer, user = %account.username, "signed in by key");
+                    act.open_screen(cfg, records, ctx);
+                    act.became(account, ctx);
+                }
+                Loaded::Guest(nick, cfg, records) => {
+                    if let (Some(nick), Some(player)) = (nick, act.player.as_mut()) {
+                        player.nick = nick;
+                    }
+                    act.open_screen(cfg, records, ctx);
+                }
             }
-            act.open_screen(cfg, records, ctx);
+            act.render(ctx);
         }));
     }
 
+    /// Sets up the terminal and the game; the caller draws the first frame.
     fn open_screen(&mut self, cfg: GameConfig, records: Records, ctx: &mut Context<Self>) {
         let viewport = Viewport::Fixed(Rect::new(0, 0, self.size.width, self.size.height));
         let terminal = match Terminal::with_options(
@@ -318,17 +353,17 @@ impl SessionActor {
                 return self.close(1, None, ctx);
             }
         };
-        let name = self
-            .player
-            .as_ref()
-            .map_or_else(|| "~player".to_string(), Player::display_name);
-        let mut app = App::online(cfg, records, name);
+        let mut app = App::online(
+            cfg,
+            records,
+            self.guest_name(),
+            self.fingerprint().is_some(),
+        );
         app.resize(self.size);
         self.app = Some(app);
         self.terminal = Some(terminal);
         self.last_input = Instant::now();
         self.send(Out::Data(Bytes::from_static(ENTER_SCREEN)));
-        self.render(ctx);
     }
 
     fn on_keys(&mut self, keys: Vec<Key>, ctx: &mut Context<Self>) {
@@ -348,33 +383,45 @@ impl SessionActor {
             self.last_tick = Instant::now();
         }
         self.apply(effects, ctx);
+        self.report_status();
         self.render(ctx);
         self.schedule_wake(ctx);
     }
 
     fn apply(&mut self, effects: Vec<Effect>, ctx: &mut Context<Self>) {
         let fingerprint = self.fingerprint();
+        let account = self.account_id();
+        let store = self.shared.store.clone();
         for effect in effects {
             match effect {
                 Effect::SaveConfig => {
-                    if let (Some(fp), Some(app)) = (fingerprint.clone(), &self.app) {
-                        let (store, cfg) = (self.shared.store.clone(), app.cfg.clone());
-                        actix::spawn(async move {
-                            if let Err(e) = store.save_config(&fp, &cfg).await {
-                                warn!(error = %e, "couldn't save settings");
-                            }
-                        });
-                    }
+                    let Some(cfg) = self.app.as_ref().map(|a| a.cfg.clone()) else {
+                        continue;
+                    };
+                    let (store, fp) = (store.clone(), fingerprint.clone());
+                    actix::spawn(async move {
+                        let saved = match (account, fp) {
+                            (Some(id), _) => store.save_account_config(id, &cfg).await,
+                            (None, Some(fp)) => store.save_config(&fp, &cfg).await,
+                            (None, None) => Ok(()),
+                        };
+                        if let Err(e) = saved {
+                            warn!(error = %e, "couldn't save settings");
+                        }
+                    });
                 }
                 Effect::RecordSet { key, best } => {
-                    if let Some(fp) = fingerprint.clone() {
-                        let store = self.shared.store.clone();
-                        actix::spawn(async move {
-                            if let Err(e) = store.save_record(&fp, &key, best).await {
-                                warn!(error = %e, "couldn't save a record");
-                            }
-                        });
-                    }
+                    let (store, fp) = (store.clone(), fingerprint.clone());
+                    actix::spawn(async move {
+                        let saved = match (account, fp) {
+                            (Some(id), _) => store.save_account_record(id, &key, best).await,
+                            (None, Some(fp)) => store.save_record(&fp, &key, best).await,
+                            (None, None) => Ok(()),
+                        };
+                        if let Err(e) = saved {
+                            warn!(error = %e, "couldn't save a record");
+                        }
+                    });
                 }
                 Effect::Quit => self.close(0, None, ctx),
                 Effect::QuickPlay => self.enqueue(ctx),
@@ -396,17 +443,41 @@ impl SessionActor {
                 }
                 Effect::LeaveRoom => self.leave_room(ctx),
                 Effect::SetNickname(name) => self.rename(&name, ctx),
+                Effect::SignUp { username, password } => self.sign_up(username, password, ctx),
+                Effect::SignIn {
+                    username,
+                    password,
+                    remember,
+                } => self.sign_in(username, password, remember, ctx),
+                Effect::SignOut => self.sign_out(ctx),
+                Effect::ChangePassword(password) => self.change_password(password, ctx),
+                Effect::ForgetKey(key) => self.refresh_keys(Some(key), ctx),
+                Effect::LoadAccount => self.refresh_keys(None, ctx),
+                Effect::LoadFriends => self.refresh_friends(ctx),
+                Effect::AddFriend(name) => self.add_friend(name, ctx),
+                Effect::AnswerFriend { name, accept } => self.answer_friend(name, accept, ctx),
+                Effect::RemoveFriend(name) => self.remove_friend(name, ctx),
+                Effect::Invite(name) => self.invite(name, ctx),
+                Effect::AcceptInvite => self.accept_invite(ctx),
+                Effect::DismissInvite => self.dismiss_invite(ctx),
             }
         }
+    }
+
+    /// The guest name others see, such as `~alice`.
+    fn guest_name(&self) -> String {
+        self.player
+            .as_ref()
+            .map_or_else(|| "~player".to_string(), Player::display_name)
     }
 
     fn entrant(&self) -> Entrant {
         Entrant {
             id: self.id,
-            name: self
-                .player
-                .as_ref()
-                .map_or_else(|| "~player".to_string(), Player::display_name),
+            name: match &self.account {
+                Some(account) => account.username.clone(),
+                None => self.guest_name(),
+            },
         }
     }
 
@@ -417,11 +488,32 @@ impl SessionActor {
         self.queued = true;
         self.shared.matchmaker.do_send(Enqueue {
             who: self.entrant(),
-            rating: UNRATED,
+            account: self.account_id(),
+            rating: self.rating(),
             region: LOCAL_REGION.to_string(),
             presence: Arc::downgrade(&self.presence),
             reply: ctx.address().recipient(),
+            on_rated: ctx.address().recipient(),
         });
+    }
+
+    /// Makes a private room with `rules` and takes a seat in it.
+    fn room_maker(
+        &self,
+        rules: Rules,
+    ) -> impl std::future::Future<Output = Result<JoinedRoom, JoinFail>> + use<> {
+        let lobby = self.shared.lobby.clone();
+        let seed = self.shared.cfg.room_seed;
+        let who = self.entrant();
+        let presence = Arc::downgrade(&self.presence);
+        async move {
+            let room = match lobby.send(CreateRoom { rules, seed }).await {
+                Ok(Ok((_, room))) => room,
+                Ok(Err(CreateError::BoardTooSmall)) => return Err(JoinFail::BoardTooSmall),
+                Err(_) => return Err(JoinFail::Closed),
+            };
+            seat(room, who, presence).await
+        }
     }
 
     /// Makes a private room with `rules`, or finds the one with `code`, and
@@ -435,29 +527,21 @@ impl SessionActor {
         if code.is_some() && self.wrong_codes >= MAX_WRONG_CODES {
             return self.join_failed(JoinFail::TooManyCodes, ctx);
         }
-        let lobby = self.shared.lobby.clone();
-        let seed = self.shared.cfg.room_seed;
-        let who = self.entrant();
-        let presence = Arc::downgrade(&self.presence);
-        let join = async move {
-            let room = match (rules, code) {
-                (Some(rules), _) => match lobby.send(CreateRoom { rules, seed }).await {
-                    Ok(Ok((_, room))) => room,
-                    Ok(Err(CreateError::BoardTooSmall)) => return Err(JoinFail::BoardTooSmall),
-                    Err(_) => return Err(JoinFail::Closed),
-                },
-                (None, Some(code)) => match lobby.send(FindRoom(code)).await {
-                    Ok(Some(room)) => room,
-                    Ok(None) => return Err(JoinFail::NoSuchCode),
-                    Err(_) => return Err(JoinFail::Closed),
-                },
-                (None, None) => return Err(JoinFail::Closed),
-            };
-            match room.send(Join { who, presence }).await {
-                Ok(Ok(view)) => Ok((room, view)),
-                Ok(Err(JoinError::Full)) => Err(JoinFail::Full),
-                Ok(Err(JoinError::Closed)) | Err(_) => Err(JoinFail::Closed),
+        let join: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> = match (rules, code) {
+            (Some(rules), _) => Box::pin(self.room_maker(rules)),
+            (None, Some(code)) => {
+                let lobby = self.shared.lobby.clone();
+                let who = self.entrant();
+                let presence = Arc::downgrade(&self.presence);
+                Box::pin(async move {
+                    match lobby.send(FindRoom(code)).await {
+                        Ok(Some(room)) => seat(room, who, presence).await,
+                        Ok(None) => Err(JoinFail::NoSuchCode),
+                        Err(_) => Err(JoinFail::Closed),
+                    }
+                })
             }
+            (None, None) => return,
         };
         ctx.spawn(join.into_actor(self).map(|joined, act, ctx| match joined {
             Ok((room, view)) => act.entered(room, view, ctx),
@@ -498,6 +582,7 @@ impl SessionActor {
             watch,
             stay,
         });
+        self.report_status();
         self.render(ctx);
     }
 
@@ -533,6 +618,7 @@ impl SessionActor {
                     } else {
                         act.room = None;
                     }
+                    act.report_status();
                     act.render(ctx);
                 }),
         )
@@ -544,8 +630,34 @@ impl SessionActor {
             room.addr.do_send(Leave(self.id));
         }
     }
+}
 
+/// What's saved for whoever is connecting.
+enum Loaded {
+    /// The key is remembered by an account.
+    Account(AccountData),
+    /// A guest: the saved nickname, if the key has one, settings and records.
+    Guest(Option<String>, GameConfig, Records),
+}
+
+/// Takes a seat in `room`.
+async fn seat(
+    room: Addr<RoomActor>,
+    who: Entrant,
+    presence: std::sync::Weak<()>,
+) -> Result<JoinedRoom, JoinFail> {
+    match room.send(Join { who, presence }).await {
+        Ok(Ok(view)) => Ok((room, view)),
+        Ok(Err(JoinError::Full)) => Err(JoinFail::Full),
+        Ok(Err(JoinError::Closed)) | Err(_) => Err(JoinFail::Closed),
+    }
+}
+
+impl SessionActor {
     fn rename(&mut self, name: &str, ctx: &mut Context<Self>) {
+        if self.account.is_some() {
+            return;
+        }
         let Some(player) = self.player.as_mut() else {
             return;
         };
