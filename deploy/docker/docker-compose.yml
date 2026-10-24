@@ -1,0 +1,52 @@
+# SnakeTUI on one server, run by deploy.sh with the image CI publishes. To
+# try it from a clone instead, from the repository's root:
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d --build
+#   ssh localhost
+#
+# Its settings, both optional, go in .env next to this file:
+#
+#   SNAKETUI_PORT=22          where players connect
+#   SNAKETUI_ADMIN_PORT=9022  health and metrics, on 127.0.0.1 only
+
+name: snaketui
+
+services:
+  snaketui:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: snaketui
+    restart: unless-stopped
+    ports:
+      # Docker keeps players' own addresses, which the per-IP limits count.
+      # It also opens the port past ufw.
+      - "${SNAKETUI_PORT:-22}:2222"
+      - "127.0.0.1:${SNAKETUI_ADMIN_PORT:-9022}:9022"
+    volumes:
+      # The host key and the database.
+      - data:/var/lib/snaketui
+    tmpfs:
+      - /tmp
+    healthcheck:
+      # The image has no curl, but bash speaks enough HTTP.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/9022 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+    # Rounds in play finish before it stops (drain_timeout_secs, 200 by
+    # default).
+    stop_grace_period: 230s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  data:

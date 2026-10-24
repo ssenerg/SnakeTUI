@@ -129,7 +129,8 @@ Guests can play everything except friends and ratings. To get those, pick
 To host it on Ubuntu 24.04, follow [deploy/INSTALL.md](deploy/INSTALL.md).
 For more players, or players in several regions, run several servers as one
 with [deploy/CLUSTER.md](deploy/CLUSTER.md). Prebuilt Linux servers are on the
-[releases page](../../releases) next to the game.
+[releases page](../../releases) next to the game. To run it in Docker instead,
+deployed by CI, see [Deploying from CI](#deploying-from-ci).
 
 To try it on your own machine:
 
@@ -143,6 +144,108 @@ cargo run --release -p snaketui-server -- --config /tmp/snaketui-dev.toml
 ```
 
 Then, in another terminal, run `ssh -p 2022 localhost`.
+
+### Deploying from CI
+
+Every push to `main` that passes CI is deployed to a Linux server with
+Docker Compose. The `image` job publishes the server's image to
+`ghcr.io/ssenerg/snaketui`, for amd64, tagged `latest` and `sha-COMMIT`; the
+`deploy` job sends its digest over SSH. The key GitHub signs in with runs
+nothing but [`deploy.sh`](deploy/docker/deploy.sh) there, which pulls
+exactly that image and restarts the game with it:
+
+- The old game lets rounds in play finish first, for up to 200 seconds.
+  Until then, new players can't connect.
+- If the new game doesn't come up healthy, the script puts the image that
+  ran before back, and the job fails.
+- The game's logs name players and their addresses, so they go to the
+  server's journal (`journalctl -t snaketui-deploy`), not to the public CI
+  log.
+
+A leaked key can therefore only deploy images published to that
+repository, in the setup the server has: the script, `docker-compose.yml`
+and `.env` belong to root, and the key can't change them. When
+`deploy/docker/deploy.sh` or `deploy/docker/docker-compose.yml` change here,
+install them on the server again, as below.
+
+**On the server.** Players connect on port 22, so move the machine's own
+SSH to another port first, as in [INSTALL.md](deploy/INSTALL.md) steps 2 to
+4. Docker opens the ports it publishes ahead of ufw, so ufw needs no rule
+for the game, but a cloud provider's firewall still needs port 22 open.
+Health and metrics are on `127.0.0.1:9022`.
+
+Once, as root, in a clone of this repository: a user to deploy as (in the
+`docker` group, which is as good as root on that server), and the directory
+the game runs from, which that user may read but not change:
+
+```sh
+useradd --create-home --groups docker deploy
+install -d -o root -g deploy -m 750 /opt/apps/snaketui
+install -o root -g deploy -m 640 deploy/docker/docker-compose.yml /opt/apps/snaketui/
+install -o root -g deploy -m 750 deploy/docker/deploy.sh /opt/apps/snaketui/
+```
+
+To change the ports, put `SNAKETUI_PORT` or `SNAKETUI_ADMIN_PORT` in
+`/opt/apps/snaketui/.env`, owned the same way (see
+[`docker-compose.yml`](deploy/docker/docker-compose.yml)).
+
+**DNS.** Point the game's name, such as `play.example.com`, at the server
+with an `A` record. On Cloudflare, make it DNS only (a grey cloud).
+Cloudflare's proxy and its tunnels carry web traffic, not a player's `ssh`.
+
+**Keys.** On your computer, make a key for GitHub to sign in with, and get
+the server's key for GitHub to check it by. Check the key `ssh-keyscan`
+prints against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the
+server:
+
+```sh
+ssh-keygen -t ed25519 -N '' -C snaketui-deploy -f snaketui-deploy
+ssh-keyscan -t ed25519 -p 2222 SERVER > known_hosts   # the admin SSH's port
+```
+
+Add `snaketui-deploy.pub` to `~deploy/.ssh/authorized_keys` on the server,
+with the image it may deploy in front of it. `restrict` takes away shells,
+terminals and forwarding; `command` runs whatever GitHub asks for, with what
+it asked for as the digest:
+
+```
+restrict,command="/opt/apps/snaketui/deploy.sh ghcr.io/ssenerg/snaketui" ssh-ed25519 AAAA... snaketui-deploy
+```
+
+**GitHub.** Under Settings → Environments, create the environment
+`production`, let only `main` deploy to it (Deployment branches → Selected
+branches), and give it these secrets and variables:
+
+```sh
+gh secret set DEPLOY_HOST --env production --body SERVER
+gh secret set DEPLOY_SSH_KEY --env production < snaketui-deploy
+gh secret set DEPLOY_KNOWN_HOSTS --env production < known_hosts
+gh variable set DEPLOY_PORT --env production --body 2222
+rm snaketui-deploy   # GitHub has it now
+```
+
+The other variables are optional: `DEPLOY_USER` (`deploy`) and
+`DEPLOY_URL`, the address shown with each deploy. Until the secrets are
+set, the job skips deploying with a warning. If the package on `ghcr.io` is
+private, sign the server in to it once with a token that may read packages:
+`sudo -u deploy docker login ghcr.io`.
+
+**Keep the volume.** The Docker volume `snaketui_data` holds the game's host
+key and its database, with every account. Back it up as INSTALL.md step 8
+explains. To copy it safely, stop the game first:
+
+```sh
+cd /opt/apps/snaketui && sudo -u deploy docker compose stop
+sudo tar czf /root/snaketui-data.tgz -C /var/lib/docker/volumes/snaketui_data/_data .
+sudo -u deploy docker compose start
+```
+
+To deploy again, run the CI workflow on `main` (Actions → CI → Run
+workflow). To go back one deploy, on the server:
+
+```sh
+cd /opt/apps/snaketui && sudo -u deploy sh -c 'docker image tag snaketui:previous snaketui:latest && docker compose up -d --force-recreate snaketui'
+```
 
 ## How to play
 
@@ -214,7 +317,7 @@ The code is a Cargo workspace:
 | `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, draining on shutdown, health and metrics over HTTP, the PROXY protocol, `server.toml`; and `snaketui-matchmaker`, the quick-play queue for a cluster of servers |
 | `crates/loadbot` | `snaketui-loadbot`: thousands of bot players, to see how servers hold up |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |
-| `deploy/` | systemd units, example `server.toml`, the Ubuntu install and cluster guides, and a docker-compose cluster to try (`deploy/cluster/`) |
+| `deploy/` | systemd units, example `server.toml`, the Ubuntu install and cluster guides, the image and what CI deploys it with (`deploy/docker/`), and a docker-compose cluster to try (`deploy/cluster/`) |
 
 ```sh
 cargo test --workspace   # rules, wall invariants, key handling, every screen at

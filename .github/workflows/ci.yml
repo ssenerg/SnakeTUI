@@ -5,6 +5,16 @@ on:
     branches: [main, master]
     tags: ["v*"]
   pull_request:
+  # Run on main, it tests and deploys again.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Runs on main wait for each other instead of cutting off a deploy.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +33,128 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Builds the server's image, for amd64 only: Rust builds for another
+  # platform under emulation take too long. For pushes to main, and runs
+  # started by hand on main, it is published as ghcr.io/OWNER/REPO, tagged
+  # latest and sha-COMMIT; the deploy job deploys that image.
+  image:
+    name: Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    env:
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compose files
+        run: |
+          docker compose --file deploy/docker/docker-compose.yml config --quiet
+          docker compose --file deploy/cluster/docker-compose.yml config --quiet
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        env:
+          TOKEN: ${{ github.token }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Image
+        id: image
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+          description="Snake in the terminal, played over SSH"
+          # Its builder image is pinned: it builds and pushes what gets
+          # deployed.
+          docker buildx create --use --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea >/dev/null
+          docker buildx build --pull --platform linux/amd64 \
+            --file deploy/docker/Dockerfile \
+            --label org.opencontainers.image.title=snaketui \
+            --label "org.opencontainers.image.description=$description" \
+            --label "org.opencontainers.image.source=$source" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.description=$description" \
+            --annotation "index:org.opencontainers.image.source=$source" \
+            --tag "$image:latest" --tag "$image:sha-${GITHUB_SHA::7}" \
+            --output "type=image,push=$PUBLISH" \
+            --metadata-file "$RUNNER_TEMP/image.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image.json")" >> "$GITHUB_OUTPUT"
+      - name: Log out of ghcr.io
+        if: always() && env.PUBLISH == 'true'
+        run: docker logout ghcr.io
+
+  # Tells the server, over SSH, the digest of the image the image job
+  # published, for every push to main that passes. The server's key runs
+  # only deploy/docker/deploy.sh there, which pulls that image and starts
+  # it. See "Deploying" in the README for the settings of the production
+  # environment.
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [test, image]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_URL }}
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - name: Settings
+        id: settings
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$HOST" ] || [ -z "$KEY" ] || [ -z "$KNOWN_HOSTS" ]; then
+            echo "::warning::Not deployed: the production environment needs the secrets DEPLOY_HOST, DEPLOY_SSH_KEY and DEPLOY_KNOWN_HOSTS (see Deploying in the README)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: SSH
+        if: steps.settings.outputs.ready == 'true'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          SSH_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          SSH_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          install -d -m 700 ~/.ssh
+          (umask 077 && printf '%s\n' "$KEY" > ~/.ssh/deploy_key)
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName $HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ServerAliveInterval 15
+          EOF
+      # Whatever command is sent, the server's key runs deploy.sh, which
+      # takes the command as the digest to deploy.
+      - name: Deploy
+        if: steps.settings.outputs.ready == 'true'
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          case $DIGEST in
+            sha256:*) ;;
+            *) echo "::error::The image job published no image (digest: '$DIGEST')"; exit 1 ;;
+          esac
+          ssh server "$DIGEST" < /dev/null
+      - name: Forget the key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
 
   release:
     name: Release (${{ matrix.target }})
