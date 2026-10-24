@@ -89,6 +89,7 @@ jobs:
           name="snaketui-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/snaketui-server" \
+            "target/${{ matrix.target }}/release/snaketui-matchmaker" \
             deploy/INSTALL.md deploy/server.toml.example deploy/snaketui.service "$name/"
           tar czf "$name.tar.gz" "$name"
           echo "SERVER_ASSET=$name.tar.gz" >> "$GITHUB_ENV"

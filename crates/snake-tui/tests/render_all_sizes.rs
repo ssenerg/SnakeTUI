@@ -14,7 +14,7 @@ use snake_core::round::{
     Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
-use snake_tui::online::{Field, FormKind, FriendRow, FriendsView, KeyRow, Profile};
+use snake_tui::online::{Field, FormKind, FriendRow, FriendsView, KeyRow, Profile, QueueRegion};
 use snake_tui::{App, Screen, ui};
 
 /// One app per screen worth drawing, on a board of `rules`.
@@ -234,6 +234,17 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         apps.push(app);
     }
     apps.push(new_app(Screen::Finding));
+    // In a cluster, after the queue has opened to every region.
+    let mut regional = new_app(Screen::Finding);
+    regional.set_region(QueueRegion {
+        name: "eu-west-somewhere-long".into(),
+        widens_after: Duration::from_secs(20),
+    });
+    if let Some(online) = regional.online.as_mut() {
+        online.waited = Duration::from_secs(95);
+        online.queue_len = 1234;
+    }
+    apps.push(regional);
     apps.push(new_app(Screen::Joining { by_code: true }));
     let views = room_views(rules);
     for view in &views {

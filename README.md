@@ -210,7 +210,7 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), settings, records. No terminal or file access |
 | `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
-| `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, `server.toml` |
+| `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, `server.toml`; and `snaketui-matchmaker`, the quick-play queue for a cluster of servers |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |
 | `deploy/` | systemd unit, example `server.toml`, and the Ubuntu install guide |
 

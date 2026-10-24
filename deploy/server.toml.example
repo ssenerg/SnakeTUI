@@ -36,9 +36,10 @@ idle_timeout_secs = 600
 stall_timeout_secs = 20
 
 # Several servers working as one: players on any of them share private
-# rooms, see their friends online and invite them. Each server needs the
-# same Postgres database (above) and the same NATS, with JetStream on.
-# Leave this out on a server that plays on its own.
+# rooms, see their friends online, invite them, and wait in one quick-play
+# queue. Each server needs the same Postgres database (above) and the same
+# NATS, with JetStream on, and one snaketui-matchmaker runs the queue for
+# them all. Leave this out on a server that plays on its own.
 #
 # [cluster]
 # nats = "nats://10.0.0.5:4222"

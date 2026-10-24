@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use actix_rt::ArbiterHandle;
 use anyhow::Result;
 use async_nats::{Message, Subscriber};
 use futures::StreamExt;
@@ -27,9 +28,10 @@ use crate::room::{Join, Leave, Ready, RoomId, RoomRef, ServerId, Steer, ViewRx};
 pub const ROOM_LOST: &str = "The server running this room went away.";
 
 /// Players from other servers in a room here.
+#[derive(Default)]
 pub(super) struct Export {
     guests: HashMap<PlayerId, Guest>,
-    /// Which run of the room's sender is the live one.
+    /// Which run of the room's sender is the live one; 0 before it starts.
     sender: u64,
 }
 
@@ -98,28 +100,62 @@ impl Cluster {
         };
         let view = addr.send(join).await.unwrap_or(Err(JoinError::Closed))?;
         let now = (**view.borrow()).clone();
-        let start = {
-            let mut exports = self.exports.lock().unwrap();
-            let export = exports.entry(room).or_insert_with(|| Export {
-                guests: HashMap::new(),
-                sender: 0,
-            });
-            export.guests.insert(
+        self.exports
+            .lock()
+            .unwrap()
+            .entry(room)
+            .or_default()
+            .guests
+            .insert(
                 player,
                 Guest {
                     server: request.from,
                     _seat: seat,
                 },
             );
-            (export.sender == 0).then(|| {
-                export.sender = SENDERS.fetch_add(1, Ordering::Relaxed) + 1;
-                export.sender
-            })
-        };
-        if let Some(sender) = start {
-            thread.spawn(Arc::clone(self).send_views(room, sender, view));
-        }
+        self.start_sending(room, &thread, view);
         Ok(now)
+    }
+
+    /// Seats for players from other servers in a match about to start here,
+    /// held like those of guests who joined: they drop out if their server
+    /// goes quiet. Answers what shows each one is still there.
+    pub fn reserve_guests(
+        &self,
+        room: RoomId,
+        guests: &[(PlayerId, ServerId)],
+    ) -> HashMap<PlayerId, Weak<()>> {
+        let mut exports = self.exports.lock().unwrap();
+        let export = exports.entry(room).or_default();
+        guests
+            .iter()
+            .map(|&(player, server)| {
+                let seat = Arc::new(());
+                let presence = Arc::downgrade(&seat);
+                export.guests.insert(
+                    player,
+                    Guest {
+                        server,
+                        _seat: seat,
+                    },
+                );
+                (player, presence)
+            })
+            .collect()
+    }
+
+    /// Starts sending the room's views to its guests' servers, from the
+    /// room's own thread, unless that's already happening.
+    pub fn start_sending(self: &Arc<Self>, room: RoomId, thread: &ArbiterHandle, view: ViewRx) {
+        let sender = {
+            let mut exports = self.exports.lock().unwrap();
+            let Some(export) = exports.get_mut(&room).filter(|e| e.sender == 0) else {
+                return;
+            };
+            export.sender = SENDERS.fetch_add(1, Ordering::Relaxed) + 1;
+            export.sender
+        };
+        thread.spawn(Arc::clone(self).send_views(room, sender, view));
     }
 
     /// Sends the room's views to the servers its guests are on, until it

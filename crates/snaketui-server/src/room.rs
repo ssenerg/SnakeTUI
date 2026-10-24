@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::cluster::Cluster;
-use crate::cluster::wire::InputKind;
+use crate::cluster::wire::{InputKind, RatedAt};
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
 use crate::rating::{self, Rating};
@@ -110,6 +110,10 @@ impl RoomHost {
             arbiters,
             next: AtomicUsize::new(0),
         }
+    }
+
+    pub fn rooms(&self) -> &LocalRooms {
+        &self.rooms
     }
 
     /// An id no room here has.
@@ -231,7 +235,42 @@ pub struct RatedMember {
     /// Guests play at the starting rating, and nothing is saved for them.
     pub account: Option<AccountId>,
     pub rating: Rating,
-    pub notify: Recipient<Rated>,
+    pub notify: RatedNotify,
+}
+
+/// Where a player's new rating goes.
+pub enum RatedNotify {
+    /// Their session, on this server.
+    Here(Recipient<Rated>),
+    /// Their server, which passes it on.
+    There {
+        cluster: Arc<Cluster>,
+        server: ServerId,
+        player: PlayerId,
+    },
+    /// They left before the match started.
+    Nobody,
+}
+
+impl RatedNotify {
+    fn send(&self, rated: Rated) {
+        match self {
+            RatedNotify::Here(session) => session.do_send(rated),
+            RatedNotify::There {
+                cluster,
+                server,
+                player,
+            } => {
+                let news = RatedAt {
+                    player: *player,
+                    rating: rated.rating,
+                    won: rated.won,
+                };
+                cluster.send(cluster.server_subject(*server, "rated"), &news);
+            }
+            RatedNotify::Nobody => {}
+        }
+    }
 }
 
 /// What a rated room needs: everyone's rating, and where to save new ones.
@@ -414,7 +453,7 @@ impl RoomActor {
         self.changes.clear();
         for ((placement, member), rating) in players.into_iter().zip(after) {
             let won = winner == Some(placement.who.id);
-            member.notify.do_send(Rated { rating, won });
+            member.notify.send(Rated { rating, won });
             if let Some(account) = member.account {
                 saved.push(RatedResult {
                     account,

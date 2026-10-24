@@ -239,6 +239,14 @@ pub enum AccountRow {
     Back,
 }
 
+/// Where quick play looks for opponents first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueRegion {
+    pub name: String,
+    /// After waiting this long, players from every region are considered.
+    pub widens_after: Duration,
+}
+
 /// What an online player's app knows beyond the local game.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Online {
@@ -250,6 +258,8 @@ pub struct Online {
     /// Time spent in the queue so far.
     pub waited: Duration,
     pub queue_len: usize,
+    /// In a cluster of servers: the region this player is matched in first.
+    pub region: Option<QueueRegion>,
     pub account: Option<Profile>,
     /// Connected with an SSH key, which an account can remember.
     pub has_key: bool,
@@ -276,6 +286,7 @@ impl Online {
             room: None,
             waited: Duration::ZERO,
             queue_len: 0,
+            region: None,
             account: None,
             has_key,
             keys: Vec::new(),
@@ -815,6 +826,12 @@ impl App {
     pub fn set_queue_len(&mut self, n: usize) {
         if let Some(online) = &mut self.online {
             online.queue_len = n;
+        }
+    }
+
+    pub fn set_region(&mut self, region: QueueRegion) {
+        if let Some(online) = &mut self.online {
+            online.region = Some(region);
         }
     }
 

@@ -17,6 +17,7 @@ pub mod matcher;
 pub mod matchmaker;
 pub mod metrics;
 pub mod presence;
+pub mod queue_service;
 pub mod rating;
 pub mod room;
 pub mod session;
@@ -105,7 +106,9 @@ pub async fn serve(
     let (server, cluster) = match &cfg.cluster {
         Some(cluster) => {
             let server = rand::random::<ServerId>().max(1);
-            let joined = Cluster::connect(cluster, server, rooms.clone()).await?;
+            let open = Arc::clone(&limits);
+            let load = Box::new(move || open.open() as u32);
+            let joined = Cluster::connect(cluster, server, rooms.clone(), load).await?;
             (server, Some(joined))
         }
         None => (0, None),
@@ -128,7 +131,8 @@ pub async fn serve(
     let seed = cfg.room_seed;
     let matchmaker = MatchmakerActor::start_in_arbiter(&room_arbiters[0].handle(), {
         let store = store.clone();
-        move |_| MatchmakerActor::new(host, store, queue_tx, seed)
+        let cluster = cluster.clone();
+        move |_| MatchmakerActor::new(host, store, queue_tx, seed, cluster)
     });
     let arbiters: Vec<Arbiter> = (0..cfg.workers()).map(|_| Arbiter::new()).collect();
     let workers = arbiters

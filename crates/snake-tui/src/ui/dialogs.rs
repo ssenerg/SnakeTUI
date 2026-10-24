@@ -105,16 +105,25 @@ pub fn draw_input(frame: &mut Frame, app: &App, field: Field) {
 
 pub fn draw_finding(frame: &mut Frame, app: &App) {
     let Some(online) = &app.online else { return };
-    let inner = dialog(frame, " Finding a match ", Color::Cyan, 36, 7);
     let secs = online.waited.as_secs();
+    let mut status = format!(
+        "{}:{:02} · {} in queue",
+        secs / 60,
+        secs % 60,
+        online.queue_len.max(1)
+    );
+    if let Some(region) = &online.region {
+        let name: String = region.name.chars().take(12).collect();
+        status = format!("{name} · {status}");
+        if online.waited >= region.widens_after {
+            status.push_str(" · all regions");
+        }
+    }
+    let width = if online.region.is_some() { 50 } else { 36 };
+    let inner = dialog(frame, " Finding a match ", Color::Cyan, width, 7);
     let lines = vec![
         Line::default(),
-        Line::from(format!(
-            "{}:{:02} · {} in queue",
-            secs / 60,
-            secs % 60,
-            online.queue_len.max(1)
-        )),
+        Line::from(status),
         Line::default(),
         Line::from("Esc cancel").style(Style::default().fg(Color::DarkGray)),
     ];

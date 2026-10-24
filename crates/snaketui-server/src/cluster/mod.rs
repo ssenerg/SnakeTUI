@@ -49,9 +49,13 @@ const OUTBOX: usize = 1 << 16;
 pub const CODES_REFRESH: Duration = Duration::from_secs(10 * 60);
 const CODES_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// How many players this server has, for choosing where matches go.
+pub type Load = Box<dyn Fn() -> u32 + Send + Sync>;
+
 pub struct Cluster {
     pub server: ServerId,
     pub region: String,
+    load: Load,
     /// The start of every subject: `snaketui.<cluster name>`.
     prefix: String,
     client: Client,
@@ -67,6 +71,11 @@ pub struct Cluster {
     imports: Mutex<HashMap<RoomRef, Import>>,
 }
 
+/// The start of every subject of the cluster called `name`.
+pub fn prefix(name: &str) -> String {
+    format!("snaketui.{name}")
+}
+
 impl Cluster {
     /// Connects to NATS as `server`, and starts answering other servers
     /// about the rooms in `rooms`.
@@ -74,6 +83,7 @@ impl Cluster {
         cfg: &ClusterConfig,
         server: ServerId,
         rooms: LocalRooms,
+        load: Load,
     ) -> Result<Arc<Self>> {
         let client = ConnectOptions::new()
             .name(format!("snaketui-server {server:016x}"))
@@ -96,7 +106,8 @@ impl Cluster {
         let cluster = Arc::new(Self {
             server,
             region: cfg.region.clone(),
-            prefix: format!("snaketui.{}", cfg.name),
+            load,
+            prefix: prefix(&cfg.name),
             client,
             codes,
             peers: Mutex::default(),
@@ -121,6 +132,11 @@ impl Cluster {
 
     pub fn subject(&self, tail: &str) -> String {
         format!("{}.{tail}", self.prefix)
+    }
+
+    /// `<prefix>.server.<server>.<what>`: for one server's ears only.
+    pub fn server_subject(&self, server: ServerId, what: &str) -> String {
+        wire::server_subject(&self.prefix, server, what)
     }
 
     /// Queues `msg` for `subject`. Messages leave in the order they're
@@ -229,7 +245,7 @@ impl Cluster {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(msg) = heard.next().await {
-                if let Some(Alive { server }) = decode(&msg.payload)
+                if let Some(Alive { server, .. }) = decode(&msg.payload)
                     && server != me.server
                 {
                     let new = me
@@ -255,7 +271,14 @@ impl Cluster {
         let mut sweep = tokio::time::interval(SWEEP_EVERY);
         loop {
             tokio::select! {
-                _ = beat.tick() => self.send(alive.clone(), &Alive { server: self.server }),
+                _ = beat.tick() => {
+                    let beat = Alive {
+                        server: self.server,
+                        region: self.region.clone(),
+                        load: (self.load)(),
+                    };
+                    self.send(alive.clone(), &beat);
+                }
                 _ = sweep.tick() => {
                     let peers = self.peers();
                     let gone: Vec<ServerId> = {

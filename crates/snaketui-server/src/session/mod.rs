@@ -17,6 +17,7 @@ use russh::server::Handle;
 use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
 use snake_core::round::{Entrant, JoinError, PhaseView, PlayerId};
+use snake_tui::online::QueueRegion;
 use snake_tui::{App, Effect, Key, Screen, ui};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -27,6 +28,7 @@ use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
 use crate::input::KeyParser;
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
+use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{Dequeue, Enqueue, Matched};
 use crate::presence::Status;
 use crate::room::{RoomHandle, ViewRx};
@@ -361,6 +363,12 @@ impl SessionActor {
             self.guest_name(),
             self.fingerprint().is_some(),
         );
+        if let Some(cluster) = &self.shared.cluster {
+            app.set_region(QueueRegion {
+                name: cluster.region.clone(),
+                widens_after: REGION_WAIT,
+            });
+        }
         app.resize(self.size);
         self.app = Some(app);
         self.terminal = Some(terminal);
@@ -492,7 +500,11 @@ impl SessionActor {
             who: self.entrant(),
             account: self.account_id(),
             rating: self.rating(),
-            region: LOCAL_REGION.to_string(),
+            region: self
+                .shared
+                .cluster
+                .as_ref()
+                .map_or_else(|| LOCAL_REGION.to_string(), |c| c.region.clone()),
             presence: Arc::downgrade(&self.presence),
             reply: ctx.address().recipient(),
             on_rated: ctx.address().recipient(),

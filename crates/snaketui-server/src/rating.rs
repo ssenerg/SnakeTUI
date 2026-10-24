@@ -1,12 +1,13 @@
 //! Skill ratings for quick play: Weng-Lin, which rates free-for-all games
 //! of any size.
 
+use serde::{Deserialize, Serialize};
 use skillratings::MultiTeamOutcome;
 use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
 
 /// A player's estimated skill, `mu`, and how unsure that estimate is,
 /// `sigma`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rating {
     pub mu: f64,
     pub sigma: f64,

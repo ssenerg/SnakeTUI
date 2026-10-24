@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use common::accounts::*;
-use common::process::ServerProcess;
+use common::process::{MatchmakerProcess, ServerProcess};
 use common::rooms::*;
 use common::*;
+use tokio::time::Instant;
 
 async fn two_servers() -> (TestServer, TestServer) {
     let db = snaketui_test_services::postgres().await;
@@ -63,8 +64,10 @@ async fn a_username_locked_on_one_server_is_locked_on_all() {
     q.wait_for("Too many wrong tries for that name").await;
 }
 
-/// `n` servers in one cluster, with its own database and NATS names.
-async fn cluster(n: usize) -> Vec<ServerProcess> {
+/// Servers in one cluster, one in each of `regions`, with a database and
+/// NATS names of their own. Also gives settings a matchmaker for the
+/// cluster can use.
+async fn cluster_in(regions: &[&str]) -> (Vec<ServerProcess>, String) {
     static N: AtomicU32 = AtomicU32::new(0);
     let db = snaketui_test_services::postgres().await;
     let nats = snaketui_test_services::nats();
@@ -73,15 +76,46 @@ async fn cluster(n: usize) -> Vec<ServerProcess> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     );
-    let settings =
-        format!("database = \"{db}\"\n\n[cluster]\nnats = \"{nats}\"\nname = \"{name}\"\n");
-    let mut servers: Vec<ServerProcess> = (0..n).map(|_| ServerProcess::spawn(&settings)).collect();
+    let settings = |region: &str| {
+        format!(
+            "database = \"{db}\"\n\n[cluster]\nnats = \"{nats}\"\nname = \"{name}\"\nregion = \"{region}\"\n"
+        )
+    };
+    let mut servers: Vec<ServerProcess> = regions
+        .iter()
+        .map(|region| ServerProcess::spawn(&settings(region)))
+        .collect();
     for server in &mut servers {
         server.ready();
     }
     // Long enough for each to have heard from all the others.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    servers
+    (servers, settings("local"))
+}
+
+/// `n` servers in one cluster and one region.
+async fn cluster(n: usize) -> Vec<ServerProcess> {
+    cluster_in(&vec!["local"; n]).await.0
+}
+
+/// Queues a guest from a fresh home menu.
+async fn quick_play(p: &mut Player) {
+    p.send(DOWN).await;
+    p.send(ENTER).await;
+    p.wait_for("Finding a match").await;
+}
+
+/// Waits until `p`'s match has started its countdown.
+async fn in_a_match(p: &mut Player, limit: Duration) {
+    p.wait_until("a match", limit, |p| p.text().contains("GET READY"))
+        .await;
+}
+
+async fn results(p: &mut Player) {
+    p.wait_until("the results", Duration::from_secs(40), |p| {
+        p.text().contains("RESULTS")
+    })
+    .await;
 }
 
 /// Waits until `p` sees every one of `names`.
@@ -176,5 +210,93 @@ async fn friends_on_different_servers_see_each_other_and_play_together() {
             text.contains("ann") && text.contains("ben") && !text.contains("invites you")
         })
         .await;
+    }
+}
+
+#[tokio::test]
+async fn quick_play_matches_within_a_region_first_then_across_regions() {
+    let (servers, settings) = cluster_in(&["eu", "eu", "us"]).await;
+    // Five times faster: matches fill for 2 s, and regions open after 4 s.
+    let _queue = MatchmakerProcess::start(&settings, 5.0);
+    let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
+    let mut ben = guest(servers[2].addr, "ben", 100, 30).await;
+    let mut cat = guest(servers[1].addr, "cat", 100, 30).await;
+    for p in [&mut ann, &mut ben, &mut cat] {
+        quick_play(p).await;
+    }
+    for p in [&mut ann, &mut cat] {
+        in_a_match(p, Duration::from_secs(10)).await;
+        let text = p.text();
+        assert!(text.contains("~ann") && text.contains("~cat"), "{text}");
+    }
+    assert!(ben.text().contains("Finding a match"), "{}", ben.text());
+    assert!(
+        !servers[2].log().contains("hosting a match"),
+        "a match of eu players runs in eu"
+    );
+
+    // ben, alone in us, plays dan from eu once both have waited for it.
+    let mut dan = guest(servers[0].addr, "dan", 100, 30).await;
+    quick_play(&mut dan).await;
+    for p in [&mut ben, &mut dan] {
+        in_a_match(p, Duration::from_secs(15)).await;
+        let text = p.text();
+        assert!(text.contains("~ben") && text.contains("~dan"), "{text}");
+    }
+    // The round plays out for both, on two servers.
+    for p in [&mut ben, &mut dan] {
+        results(p).await;
+    }
+}
+
+#[tokio::test]
+async fn a_restarted_matchmaker_loses_no_waiting_players() {
+    let (servers, settings) = cluster_in(&["eu", "eu"]).await;
+    let mut queue = MatchmakerProcess::start(&settings, 1.0);
+    let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
+    let mut ben = guest(servers[1].addr, "ben", 100, 30).await;
+    quick_play(&mut ann).await;
+    quick_play(&mut ben).await;
+    let queued = Instant::now();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    queue.kill();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _queue = MatchmakerProcess::start(&settings, 1.0);
+
+    // They kept their place: matched 10 s after they queued, not 10 s
+    // after the restart.
+    for p in [&mut ann, &mut ben] {
+        in_a_match(p, Duration::from_secs(15)).await;
+    }
+    let after = queued.elapsed();
+    assert!(
+        after < Duration::from_millis(12_500),
+        "matched after {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_match_across_servers_counts_for_both_players() {
+    let (servers, settings) = cluster_in(&["eu", "eu"]).await;
+    let _queue = MatchmakerProcess::start(&settings, 5.0);
+    let (mut ann, _) = signed_up(servers[0].addr, "ann").await;
+    let (mut ben, _) = signed_up(servers[1].addr, "ben").await;
+    // Signing up leaves the cursor on Quick play.
+    for p in [&mut ann, &mut ben] {
+        p.send(ENTER).await;
+    }
+    for p in [&mut ann, &mut ben] {
+        in_a_match(p, Duration::from_secs(10)).await;
+    }
+    for p in [&mut ann, &mut ben] {
+        results(p).await;
+    }
+    // Whichever server ran it, both players' games were counted, and the
+    // one elsewhere heard about it.
+    for p in [&mut ann, &mut ben] {
+        p.send(ESC).await;
+        p.wait_for("Signed in as").await;
+        pick(p, QUICK_PLAY, ACCOUNT).await;
+        p.wait_for("1 games").await;
     }
 }
