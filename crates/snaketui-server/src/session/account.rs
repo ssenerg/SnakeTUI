@@ -15,7 +15,7 @@ use super::SessionActor;
 use crate::auth;
 use crate::presence::{Deliver, Invite, Notice, Offline, Online, SetStatus, Status, StatusOf};
 use crate::rating::Rating;
-use crate::room::{Join, Rated, RoomActor};
+use crate::room::{Rated, RoomHandle};
 use crate::store::{Account, AccountData, AccountId, Requested, now};
 
 /// Wrong passwords one connection may try before it's disconnected.
@@ -521,7 +521,7 @@ impl SessionActor {
         let room = self
             .room
             .as_ref()
-            .map(|r| r.addr.clone())
+            .map(|link| link.room.at())
             .filter(|_| in_private);
         let rules = app.cfg.rules.clone();
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
@@ -544,7 +544,7 @@ impl SessionActor {
             let (room, joined) = match room {
                 Some(room) => (room, None),
                 None => match new_room.await {
-                    Ok((room, view)) => (room.clone(), Some((room, view))),
+                    Ok((room, view)) => (room.at(), Some((room, view))),
                     Err(why) => return Ok(Err(why.message().to_string())),
                 },
             };
@@ -595,17 +595,18 @@ impl SessionActor {
             return self.render(ctx);
         };
         ctx.cancel_future(pending.expires);
-        let room = pending.invite.room;
-        let join = room.send(Join {
-            who: self.entrant(),
-            presence: std::sync::Arc::downgrade(&self.presence),
-        });
+        let Some(room) = self.shared.room(pending.invite.room) else {
+            return self.invite_failed("That room has closed.".into(), ctx);
+        };
+        let join = room.join(self.entrant(), std::sync::Arc::downgrade(&self.presence));
         ctx.spawn(
             join.into_actor(self)
                 .map(move |joined, act, ctx| match joined {
-                    Ok(Ok(view)) => act.entered(room, view, ctx),
-                    Ok(Err(JoinError::Full)) => act.invite_failed("That room is full.".into(), ctx),
-                    _ => act.invite_failed("That room has closed.".into(), ctx),
+                    Ok(view) => act.entered(room, view, ctx),
+                    Err(JoinError::Full) => act.invite_failed("That room is full.".into(), ctx),
+                    Err(JoinError::Closed) => {
+                        act.invite_failed("That room has closed.".into(), ctx)
+                    }
                 }),
         );
     }
@@ -673,4 +674,4 @@ impl Handler<Rated> for SessionActor {
 }
 
 /// Room addresses and their views, for joining.
-pub(super) type JoinedRoom = (Addr<RoomActor>, crate::room::ViewRx);
+pub(super) type JoinedRoom = (RoomHandle, crate::room::ViewRx);

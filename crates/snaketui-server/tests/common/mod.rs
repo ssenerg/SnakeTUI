@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 pub mod accounts;
+pub mod process;
+pub mod rooms;
 
 use std::net::SocketAddr;
 use std::num::NonZeroU16;

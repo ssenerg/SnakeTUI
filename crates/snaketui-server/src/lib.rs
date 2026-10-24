@@ -8,6 +8,7 @@
 pub mod accept;
 pub mod auth;
 pub mod backend;
+pub mod cluster;
 pub mod config;
 pub mod identity;
 pub mod input;
@@ -36,12 +37,13 @@ use tracing::{info, warn};
 
 use crate::accept::{Limits, Worker};
 use crate::auth::{GuessLimits, Hasher};
+use crate::cluster::Cluster;
 use crate::config::ServerConfig;
 use crate::lobby::LobbyActor;
 use crate::matchmaker::MatchmakerActor;
 use crate::metrics::TICK_LAG;
 use crate::presence::PresenceActor;
-use crate::room::RoomHost;
+use crate::room::{LocalRooms, RoomHandle, RoomHost, RoomRef, ServerId};
 use crate::store::Store;
 
 /// Threads that run rooms, the lobby and the matchmaker.
@@ -50,6 +52,10 @@ const ROOM_THREADS: usize = 2;
 /// What every session can reach.
 pub struct Shared {
     pub cfg: ServerConfig,
+    /// This server, among those sharing rooms; 0 for a server on its own.
+    pub server: ServerId,
+    pub rooms: LocalRooms,
+    pub cluster: Option<Arc<Cluster>>,
     pub ssh: Arc<russh::server::Config>,
     pub store: Store,
     /// Becomes `true` when the server is shutting down.
@@ -66,6 +72,21 @@ pub struct Shared {
     pub next_player: AtomicU64,
 }
 
+impl Shared {
+    /// The room at `at`, if it's still there.
+    pub fn room(&self, at: RoomRef) -> Option<RoomHandle> {
+        if at.server != self.server {
+            let cluster = self.cluster.as_ref().filter(|c| c.alive(at.server))?;
+            return Some(RoomHandle::Remote {
+                at,
+                cluster: Arc::clone(cluster),
+            });
+        }
+        let addr = self.rooms.get(at.room)?;
+        Some(RoomHandle::Local { at, addr })
+    }
+}
+
 /// How long sessions get to say goodbye when the server stops.
 const GOODBYE: Duration = Duration::from_secs(3);
 
@@ -80,15 +101,29 @@ pub async fn serve(
     let store = Store::open(&cfg.database).await?;
     let limits = Limits::new(cfg.max_sessions, cfg.max_sessions_per_ip);
     let room_arbiters: Vec<Arbiter> = (0..ROOM_THREADS).map(|_| Arbiter::new()).collect();
+    let rooms = LocalRooms::default();
+    let (server, cluster) = match &cfg.cluster {
+        Some(cluster) => {
+            let server = rand::random::<ServerId>().max(1);
+            let joined = Cluster::connect(cluster, server, rooms.clone()).await?;
+            (server, Some(joined))
+        }
+        None => (0, None),
+    };
     let host = Arc::new(RoomHost::new(
+        server,
+        rooms.clone(),
         room_arbiters.iter().map(Arbiter::handle).collect(),
     ));
     let lobby = LobbyActor::start_in_arbiter(&room_arbiters[0].handle(), {
         let host = Arc::clone(&host);
-        move |_| LobbyActor::new(host)
+        let cluster = cluster.clone();
+        move |_| LobbyActor::new(host, cluster)
     });
-    let presence =
-        PresenceActor::start_in_arbiter(&room_arbiters[0].handle(), |_| PresenceActor::default());
+    let presence = PresenceActor::start_in_arbiter(&room_arbiters[0].handle(), {
+        let cluster = cluster.clone();
+        move |_| PresenceActor::new(cluster)
+    });
     let (queue_tx, queue_len) = watch::channel(0);
     let seed = cfg.room_seed;
     let matchmaker = MatchmakerActor::start_in_arbiter(&room_arbiters[0].handle(), {
@@ -107,6 +142,9 @@ pub async fn serve(
     let shared = Arc::new(Shared {
         ssh: Arc::new(ssh::config(host_key)),
         cfg,
+        server,
+        rooms,
+        cluster: cluster.clone(),
         store,
         shutdown: watch::channel(false).0,
         lobby,
@@ -115,7 +153,12 @@ pub async fn serve(
         hasher: Hasher::new()?,
         guesses,
         queue_len,
-        next_player: AtomicU64::new(1),
+        // In a cluster, ids from different servers meet in rooms.
+        next_player: AtomicU64::new(if cluster.is_some() {
+            u64::from(rand::random::<u32>()) << 32 | 1
+        } else {
+            1
+        }),
     });
     // Forget old wrong guesses now and then, so the limits' tables stay
     // small.

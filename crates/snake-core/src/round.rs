@@ -33,6 +33,7 @@ pub fn quick_rules() -> Rules {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RoomKind {
     /// Formed by the matchmaker: one round with the players it picked.
     Match,
@@ -83,6 +84,7 @@ pub fn max_players_for(rules: &Rules) -> Option<usize> {
 
 /// A player as the room shows them.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Entrant {
     pub id: PlayerId,
     /// Already safe to draw: the server checked it.
@@ -90,6 +92,7 @@ pub struct Entrant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Outcome {
     /// The last snake alive, or the longest one when time ran out.
     Won { winner: Entrant, time_up: bool },
@@ -100,6 +103,7 @@ pub enum Outcome {
 
 /// Where one player finished a round.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Placement {
     pub who: Entrant,
     /// 1 is first. Players who tie share a place, and the next place is
@@ -117,6 +121,7 @@ pub enum RoundEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum JoinError {
     Full,
     /// Matched rooms only take the players they were made for.
@@ -594,6 +599,7 @@ impl Round {
 
 /// Everything a player's screen needs to draw a room.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RoomView {
     pub kind: RoomKind,
     /// Private rooms: the code others join with.
@@ -613,6 +619,7 @@ pub struct RoomView {
 
 /// A player's shown rating before and after a rated round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RatingChange {
     pub id: PlayerId,
     pub before: u32,
@@ -620,6 +627,7 @@ pub struct RatingChange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PhaseView {
     Waiting {
         starts_in: Option<Duration>,
@@ -642,6 +650,7 @@ pub enum PhaseView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SeatView {
     pub who: Entrant,
     pub ready: bool,

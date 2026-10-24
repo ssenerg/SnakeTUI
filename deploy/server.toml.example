@@ -34,3 +34,15 @@ idle_timeout_secs = 600
 # Seconds a client may go without taking any screen updates before it's
 # disconnected (it stopped reading, or its connection is stuck).
 stall_timeout_secs = 20
+
+# Several servers working as one: players on any of them share private
+# rooms, see their friends online and invite them. Each server needs the
+# same Postgres database (above) and the same NATS, with JetStream on.
+# Leave this out on a server that plays on its own.
+#
+# [cluster]
+# nats = "nats://10.0.0.5:4222"
+# # Keeps clusters sharing one NATS apart.
+# name = "snaketui"
+# # Where this server is, for matchmaking.
+# region = "local"

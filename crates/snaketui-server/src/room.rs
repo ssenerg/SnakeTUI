@@ -4,13 +4,15 @@
 //! channel, and every session reads the latest one at its own pace.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
 use actix_rt::ArbiterHandle;
+use serde::{Deserialize, Serialize};
 use snake_core::geom::Direction;
 use snake_core::round::{
     Entrant, JoinError, Outcome, PhaseView, Placement, PlayerId, RatingChange, RoomKind, RoomView,
@@ -19,6 +21,8 @@ use snake_core::round::{
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::cluster::Cluster;
+use crate::cluster::wire::InputKind;
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
 use crate::rating::{self, Rating};
@@ -38,25 +42,179 @@ const MATCH_LINGER: Duration = Duration::from_secs(60);
 const BROKEN: &str = "Something went wrong in this room, so it closed. Sorry!";
 const MATCH_OVER: &str = "The match is over.";
 
-/// The threads rooms run on, handed out in turn.
+/// A server in a cluster. A server on its own is 0.
+pub type ServerId = u64;
+/// A room, among those of the server running it.
+pub type RoomId = u64;
+
+/// Where a room runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RoomRef {
+    pub server: ServerId,
+    pub room: RoomId,
+}
+
+/// A room here, and the thread it runs on.
+type Running = (Addr<RoomActor>, ArbiterHandle);
+
+/// The rooms this server runs.
+#[derive(Clone, Default)]
+pub struct LocalRooms(Arc<Mutex<HashMap<RoomId, Running>>>);
+
+impl LocalRooms {
+    pub fn get(&self, id: RoomId) -> Option<Addr<RoomActor>> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|(addr, _)| addr.clone())
+    }
+
+    /// The room, and the thread it runs on, for work that belongs with it.
+    pub fn get_with_thread(&self, id: RoomId) -> Option<Running> {
+        self.0.lock().unwrap().get(&id).cloned()
+    }
+
+    fn insert(&self, id: RoomId, addr: Addr<RoomActor>, thread: ArbiterHandle) {
+        self.0.lock().unwrap().insert(id, (addr, thread));
+    }
+
+    fn remove(&self, id: RoomId) {
+        self.0.lock().unwrap().remove(&id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Starts rooms on the room threads, in turn, and keeps them in
+/// [`LocalRooms`] while they run.
 pub struct RoomHost {
+    server: ServerId,
+    rooms: LocalRooms,
     arbiters: Vec<ArbiterHandle>,
     next: AtomicUsize,
 }
 
 impl RoomHost {
-    pub fn new(arbiters: Vec<ArbiterHandle>) -> Self {
+    pub fn new(server: ServerId, rooms: LocalRooms, arbiters: Vec<ArbiterHandle>) -> Self {
         assert!(!arbiters.is_empty());
         Self {
+            server,
+            rooms,
             arbiters,
             next: AtomicUsize::new(0),
         }
     }
 
+    /// An id no room here has.
+    pub fn new_id(&self) -> RoomId {
+        loop {
+            let id: RoomId = rand::random();
+            if self.rooms.get(id).is_none() {
+                return id;
+            }
+        }
+    }
+
+    /// Where the room with `id` runs.
+    pub fn at(&self, id: RoomId) -> RoomRef {
+        RoomRef {
+            server: self.server,
+            room: id,
+        }
+    }
+
     /// Starts `room` on the next room thread.
-    pub fn start(&self, room: RoomActor) -> Addr<RoomActor> {
+    pub fn start(&self, room: RoomActor) -> RoomHandle {
+        self.start_as(self.new_id(), room)
+    }
+
+    /// Starts `room` as `id`, from [`Self::new_id`].
+    pub fn start_as(&self, id: RoomId, mut room: RoomActor) -> RoomHandle {
+        room.registered = Some((id, self.rooms.clone()));
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.arbiters.len();
-        RoomActor::start_in_arbiter(&self.arbiters[i], move |_| room)
+        let thread = self.arbiters[i].clone();
+        let addr = RoomActor::start_in_arbiter(&thread, move |_| room);
+        self.rooms.insert(id, addr.clone(), thread);
+        RoomHandle::Local {
+            at: self.at(id),
+            addr,
+        }
+    }
+}
+
+/// A room to join and play in, wherever it runs.
+#[derive(Clone)]
+pub enum RoomHandle {
+    Local {
+        at: RoomRef,
+        addr: Addr<RoomActor>,
+    },
+    /// On another server: keys go there through NATS, and its views come
+    /// back.
+    Remote {
+        at: RoomRef,
+        cluster: Arc<Cluster>,
+    },
+}
+
+impl RoomHandle {
+    pub fn at(&self) -> RoomRef {
+        match self {
+            RoomHandle::Local { at, .. } | RoomHandle::Remote { at, .. } => *at,
+        }
+    }
+
+    /// Takes a seat for `who`; `presence` shows the player is still there.
+    pub fn join(
+        &self,
+        who: Entrant,
+        presence: Presence,
+    ) -> impl Future<Output = Result<ViewRx, JoinError>> + use<> {
+        let room = self.clone();
+        async move {
+            match room {
+                RoomHandle::Local { addr, .. } => addr
+                    .send(Join { who, presence })
+                    .await
+                    .unwrap_or(Err(JoinError::Closed)),
+                RoomHandle::Remote { at, cluster } => cluster.join_remote(at, who, presence).await,
+            }
+        }
+    }
+
+    /// Steering waits in the room's mailbox; a full one drops it.
+    pub fn steer(&self, id: PlayerId, dir: Direction) {
+        match self {
+            RoomHandle::Local { addr, .. } => {
+                let _ = addr.try_send(Steer { id, dir });
+            }
+            RoomHandle::Remote { at, cluster } => {
+                cluster.send_input(*at, id, InputKind::Steer(dir))
+            }
+        }
+    }
+
+    pub fn ready(&self, id: PlayerId) {
+        match self {
+            RoomHandle::Local { addr, .. } => {
+                let _ = addr.try_send(Ready(id));
+            }
+            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Ready),
+        }
+    }
+
+    pub fn leave(&self, id: PlayerId) {
+        match self {
+            RoomHandle::Local { addr, .. } => addr.do_send(Leave(id)),
+            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Leave),
+        }
     }
 }
 
@@ -105,6 +263,8 @@ pub struct Steer {
 pub struct Ready(pub PlayerId);
 
 pub struct RoomActor {
+    /// Its id, and the list of this server's rooms it leaves on closing.
+    registered: Option<(RoomId, LocalRooms)>,
     round: Round,
     code: Option<String>,
     view: watch::Sender<Arc<RoomView>>,
@@ -130,6 +290,9 @@ impl Actor for RoomActor {
 
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(code = ?self.code, "room closed");
+        if let Some((id, rooms)) = self.registered.take() {
+            rooms.remove(id);
+        }
         if let (Some(lobby), Some(code)) = (&self.lobby, self.code.take()) {
             lobby.do_send(RoomClosed(code));
         }
@@ -150,6 +313,7 @@ impl RoomActor {
         let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[])));
         let now = Instant::now();
         let room = Self {
+            registered: None,
             round,
             code,
             view,

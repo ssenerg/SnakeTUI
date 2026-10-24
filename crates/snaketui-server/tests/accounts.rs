@@ -14,9 +14,9 @@ use snake_core::round::{
 #[tokio::test]
 async fn a_new_account_signs_in_by_itself_from_the_same_key() {
     let server = TestServer::start();
-    let (p, key) = signed_up(&server, "ann").await;
+    let (p, key) = signed_up(server.addr, "ann").await;
     drop(p);
-    let again = connect_as(&server, Login::Key(&key)).await;
+    let again = connect_as(server.addr, Login::Key(&key)).await;
     assert!(
         again.text().contains("Signed in as ann"),
         "{}",
@@ -25,22 +25,22 @@ async fn a_new_account_signs_in_by_itself_from_the_same_key() {
 
     // Another key is a guest until it signs in, and then it's remembered.
     let other = new_key();
-    let mut p = connect_as(&server, Login::Key(&other)).await;
+    let mut p = connect_as(server.addr, Login::Key(&other)).await;
     assert!(p.text().contains("(guest)"), "{}", p.text());
     assert!(!p.text().contains("Friends"), "guests have no friends list");
     try_sign_in(&mut p, "ANN", PASSWORD, true).await;
     p.wait_for("Signed in as ann").await;
     assert!(p.text().contains("Friends"), "{}", p.text());
     drop(p);
-    let remembered = connect_as(&server, Login::Key(&other)).await;
+    let remembered = connect_as(server.addr, Login::Key(&other)).await;
     assert!(remembered.text().contains("Signed in as ann"));
 }
 
 #[tokio::test]
 async fn usernames_are_unique_and_some_are_reserved() {
     let server = TestServer::start();
-    let _ann = signed_up(&server, "ann").await;
-    let mut p = connect_as(&server, Login::Guest).await;
+    let _ann = signed_up(server.addr, "ann").await;
+    let mut p = connect_as(server.addr, Login::Guest).await;
     pick(&p, 0, SIGN_UP).await;
     for (name, problem) in [("Ann", "That username is taken."), ("root", "reserved")] {
         p.send(name.as_bytes()).await;
@@ -59,8 +59,8 @@ async fn usernames_are_unique_and_some_are_reserved() {
 #[tokio::test]
 async fn wrong_passwords_are_refused_and_the_fifth_disconnects() {
     let server = TestServer::start();
-    let _ann = signed_up(&server, "ann").await;
-    let mut p = connect_as(&server, Login::Guest).await;
+    let _ann = signed_up(server.addr, "ann").await;
+    let mut p = connect_as(server.addr, Login::Guest).await;
     try_sign_in(&mut p, "ann", "not the password", false).await;
     p.wait_for(WRONG).await;
     // A name nobody has gets the same answer.
@@ -78,7 +78,7 @@ async fn wrong_passwords_are_refused_and_the_fifth_disconnects() {
 #[tokio::test]
 async fn signing_out_forgets_the_key() {
     let server = TestServer::start();
-    let (mut p, key) = signed_up(&server, "ann").await;
+    let (mut p, key) = signed_up(server.addr, "ann").await;
     pick(&p, QUICK_PLAY, ACCOUNT).await;
     p.wait_for("SHA256:").await;
     assert!(p.text().contains("  this machine"), "{}", p.text());
@@ -87,7 +87,7 @@ async fn signing_out_forgets_the_key() {
     p.wait_for("Signed out.").await;
     assert!(p.text().contains("Sign up"), "{}", p.text());
     drop(p);
-    let again = connect_as(&server, Login::Key(&key)).await;
+    let again = connect_as(server.addr, Login::Key(&key)).await;
     assert!(again.text().contains("(guest)"), "{}", again.text());
 }
 
@@ -95,7 +95,7 @@ async fn signing_out_forgets_the_key() {
 async fn a_guests_settings_and_records_move_into_a_new_account() {
     let server = TestServer::start();
     let key = new_key();
-    let mut p = connect_as(&server, Login::Key(&key)).await;
+    let mut p = connect_as(server.addr, Login::Key(&key)).await;
     p.single_player().await;
     p.send(b"d").await; // board width 30 -> 31
     p.wait_for("◂ 31 ▸").await;
@@ -111,7 +111,7 @@ async fn a_guests_settings_and_records_move_into_a_new_account() {
     drop(p);
 
     // Signed in without a key, it's all there.
-    let mut elsewhere = connect_as(&server, Login::Guest).await;
+    let mut elsewhere = connect_as(server.addr, Login::Guest).await;
     try_sign_in(&mut elsewhere, "ann", PASSWORD, false).await;
     elsewhere.wait_for("Signed in as ann").await;
     elsewhere.send(UP).await; // from Quick play to Single player
@@ -123,8 +123,8 @@ async fn a_guests_settings_and_records_move_into_a_new_account() {
 #[tokio::test]
 async fn friends_ask_accept_and_invite_each_other_into_a_room() {
     let server = TestServer::start();
-    let (mut ann, _) = signed_up(&server, "ann").await;
-    let (mut ben, _) = signed_up(&server, "ben").await;
+    let (mut ann, _) = signed_up(server.addr, "ann").await;
+    let (mut ben, _) = signed_up(server.addr, "ben").await;
     make_friends(&mut ann, &mut ben).await;
     // ann's list now shows ben, online.
     ann.wait_until("ben online", Duration::from_secs(5), |p| {
@@ -151,8 +151,8 @@ async fn friends_ask_accept_and_invite_each_other_into_a_room() {
 #[tokio::test]
 async fn only_friends_can_be_invited() {
     let server = TestServer::start();
-    let (mut ann, _) = signed_up(&server, "ann").await;
-    let (mut ben, _) = signed_up(&server, "ben").await;
+    let (mut ann, _) = signed_up(server.addr, "ann").await;
+    let (mut ben, _) = signed_up(server.addr, "ben").await;
     make_friends(&mut ann, &mut ben).await;
     ann.wait_until("ben online", Duration::from_secs(5), |p| {
         line_of(&p.text(), "ben").contains("online")
@@ -213,8 +213,8 @@ fn rating_on_home(text: &str) -> Option<u32> {
 async fn a_rated_match_moves_the_winners_rating_up_and_the_losers_down() {
     let seed = first_player_wins_seed();
     let server = TestServer::with(|c| c.room_seed = Some(seed));
-    let (mut ann, key) = signed_up(&server, "ann").await;
-    let (mut ben, _) = signed_up(&server, "ben").await;
+    let (mut ann, key) = signed_up(server.addr, "ann").await;
+    let (mut ben, _) = signed_up(server.addr, "ben").await;
     ann.send(ENTER).await;
     ann.wait_for("Finding a match").await;
     ben.send(ENTER).await;
@@ -245,6 +245,6 @@ async fn a_rated_match_moves_the_winners_rating_up_and_the_losers_down() {
     // It's saved.
     let rating = rating_on_home(&ann.text());
     drop(ann);
-    let again = connect_as(&server, Login::Key(&key)).await;
+    let again = connect_as(server.addr, Login::Key(&key)).await;
     assert_eq!(rating_on_home(&again.text()), rating, "{}", again.text());
 }

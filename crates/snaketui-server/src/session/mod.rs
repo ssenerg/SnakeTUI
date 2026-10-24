@@ -29,7 +29,7 @@ use crate::input::KeyParser;
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matchmaker::{Dequeue, Enqueue, Matched};
 use crate::presence::Status;
-use crate::room::{Join, Leave, Ready, RoomActor, Steer, ViewRx};
+use crate::room::{RoomHandle, ViewRx};
 use crate::store::{Account, AccountData};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
@@ -142,7 +142,7 @@ pub struct Disconnected;
 
 /// The room a session's player is in.
 struct RoomLink {
-    addr: Addr<RoomActor>,
+    room: RoomHandle,
     /// The future waiting for the room's next view.
     watch: SpawnHandle,
     /// Tells apart this stay from an earlier one in the same room.
@@ -156,6 +156,7 @@ enum JoinFail {
     BoardTooSmall,
     Full,
     Closed,
+    Unavailable,
 }
 
 impl JoinFail {
@@ -168,6 +169,7 @@ impl JoinFail {
             }
             JoinFail::Full => "That room is full.",
             JoinFail::Closed => "That room has closed.",
+            JoinFail::Unavailable => "Couldn't make a room just now. Try again.",
         }
     }
 }
@@ -229,8 +231,8 @@ impl Actor for SessionActor {
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(peer = %self.peer, "session ended");
         self.sign_off();
-        if let Some(room) = self.room.take() {
-            room.addr.do_send(Leave(self.id));
+        if let Some(link) = self.room.take() {
+            link.room.leave(self.id);
         }
         if self.queued {
             self.shared.matchmaker.do_send(Dequeue(self.id));
@@ -432,13 +434,13 @@ impl SessionActor {
                 Effect::CreateRoom(rules) => self.join_private(Some(rules), None, ctx),
                 Effect::JoinRoom(code) => self.join_private(None, Some(code), ctx),
                 Effect::Steer(dir) => {
-                    if let Some(room) = &self.room {
-                        let _ = room.addr.try_send(Steer { id: self.id, dir });
+                    if let Some(link) = &self.room {
+                        link.room.steer(self.id, dir);
                     }
                 }
                 Effect::ToggleReady => {
-                    if let Some(room) = &self.room {
-                        let _ = room.addr.try_send(Ready(self.id));
+                    if let Some(link) = &self.room {
+                        link.room.ready(self.id);
                     }
                 }
                 Effect::LeaveRoom => self.leave_room(ctx),
@@ -510,6 +512,7 @@ impl SessionActor {
             let room = match lobby.send(CreateRoom { rules, seed }).await {
                 Ok(Ok((_, room))) => room,
                 Ok(Err(CreateError::BoardTooSmall)) => return Err(JoinFail::BoardTooSmall),
+                Ok(Err(CreateError::Unavailable)) => return Err(JoinFail::Unavailable),
                 Err(_) => return Err(JoinFail::Closed),
             };
             seat(room, who, presence).await
@@ -562,12 +565,12 @@ impl SessionActor {
 
     /// The player now has a seat in `room`. If they've stopped wanting one
     /// meanwhile, they give it straight back.
-    fn entered(&mut self, room: Addr<RoomActor>, view: ViewRx, ctx: &mut Context<Self>) {
+    fn entered(&mut self, room: RoomHandle, view: ViewRx, ctx: &mut Context<Self>) {
         let wanted = self.app.as_ref().is_some_and(|a| {
             matches!(a.screen, Screen::Finding | Screen::Joining { .. }) && !a.in_room()
         });
         if self.closing || !wanted || self.room.is_some() {
-            room.do_send(Leave(self.id));
+            room.leave(self.id);
             return;
         }
         let current = view.borrow().clone();
@@ -577,11 +580,7 @@ impl SessionActor {
         self.stays += 1;
         let stay = self.stays;
         let watch = self.watch_room(view, stay, ctx);
-        self.room = Some(RoomLink {
-            addr: room,
-            watch,
-            stay,
-        });
+        self.room = Some(RoomLink { room, watch, stay });
         self.report_status();
         self.render(ctx);
     }
@@ -625,9 +624,9 @@ impl SessionActor {
     }
 
     fn leave_room(&mut self, ctx: &mut Context<Self>) {
-        if let Some(room) = self.room.take() {
-            ctx.cancel_future(room.watch);
-            room.addr.do_send(Leave(self.id));
+        if let Some(link) = self.room.take() {
+            ctx.cancel_future(link.watch);
+            link.room.leave(self.id);
         }
     }
 }
@@ -642,14 +641,14 @@ enum Loaded {
 
 /// Takes a seat in `room`.
 async fn seat(
-    room: Addr<RoomActor>,
+    room: RoomHandle,
     who: Entrant,
     presence: std::sync::Weak<()>,
 ) -> Result<JoinedRoom, JoinFail> {
-    match room.send(Join { who, presence }).await {
-        Ok(Ok(view)) => Ok((room, view)),
-        Ok(Err(JoinError::Full)) => Err(JoinFail::Full),
-        Ok(Err(JoinError::Closed)) | Err(_) => Err(JoinFail::Closed),
+    match room.join(who, presence).await {
+        Ok(view) => Ok((room, view)),
+        Err(JoinError::Full) => Err(JoinFail::Full),
+        Err(JoinError::Closed) => Err(JoinFail::Closed),
     }
 }
 

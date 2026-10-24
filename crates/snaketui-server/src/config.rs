@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -32,6 +32,9 @@ pub struct ServerConfig {
     /// Seconds a client may go without taking any screen updates before it's
     /// disconnected.
     pub stall_timeout_secs: u64,
+    /// Servers that share rooms, friends and the queue. Without it, this
+    /// server plays on its own.
+    pub cluster: Option<ClusterConfig>,
     /// Tests only: every room's seed, so its boards are known in advance.
     #[serde(skip)]
     pub room_seed: Option<u64>,
@@ -49,16 +52,71 @@ impl Default for ServerConfig {
             login_timeout_secs: 30,
             idle_timeout_secs: 600,
             stall_timeout_secs: 20,
+            cluster: None,
             room_seed: None,
         }
     }
+}
+
+/// `[cluster]`: how this server finds the others.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// The NATS server(s) every server of the cluster connects to, for
+    /// example `nats://10.0.0.5:4222`. Credentials go in the URL.
+    pub nats: String,
+    /// Keeps clusters that share one NATS apart. Letters, digits, `_`
+    /// and `-`.
+    #[serde(default = "default_cluster_name")]
+    pub name: String,
+    /// Where this server is, for matchmaking: players are matched within
+    /// their region first.
+    #[serde(default = "default_region")]
+    pub region: String,
+}
+
+fn default_cluster_name() -> String {
+    "snaketui".into()
+}
+
+fn default_region() -> String {
+    "local".into()
 }
 
 impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.check()
+            .with_context(|| format!("in {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Settings that parse but can't work together.
+    pub fn check(&self) -> Result<()> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(());
+        };
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 32
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        if !plain(&cluster.name) {
+            bail!("cluster.name may only have letters, digits, _ and -");
+        }
+        if !plain(&cluster.region) {
+            bail!("cluster.region may only have letters, digits, _ and -");
+        }
+        if !self.database.starts_with("postgres") {
+            bail!(
+                "servers in a cluster share one Postgres database; set database to a postgres:// URL"
+            );
+        }
+        Ok(())
     }
 
     pub fn workers(&self) -> usize {
@@ -92,5 +150,16 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(example).unwrap();
         assert_eq!(cfg.listen.port(), 22);
         assert!(toml::from_str::<ServerConfig>("listn = \"0.0.0.0:22\"").is_err());
+    }
+
+    #[test]
+    fn a_cluster_needs_postgres_and_plain_names() {
+        let cfg = |text: &str| toml::from_str::<ServerConfig>(text).unwrap().check();
+        let nats = "[cluster]\nnats = \"nats://n:4222\"\n";
+        assert!(cfg(nats).is_err(), "SQLite can't be shared");
+        let pg = "database = \"postgres://u@db/snaketui\"\n";
+        assert!(cfg(&format!("{pg}{nats}")).is_ok());
+        assert!(cfg(&format!("{pg}{nats}name = \"a.b\"\n")).is_err());
+        assert!(cfg(&format!("{pg}{nats}region = \"eu-west\"\n")).is_ok());
     }
 }

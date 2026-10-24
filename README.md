@@ -210,7 +210,7 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), settings, records. No terminal or file access |
 | `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
-| `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the store (SQLite, or Postgres for several servers), `server.toml` |
+| `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room (actix), the quick-play matcher, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, `server.toml` |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |
 | `deploy/` | systemd unit, example `server.toml`, and the Ubuntu install guide |
 
@@ -221,7 +221,8 @@ cargo build --release    # builds the `snaketui` binary
 cargo build --release -p snaketui-server
 ```
 
-Some server tests need Postgres. They start it in Docker on their own, and
-remove the container when they finish. To use a Postgres you already run,
-set `SNAKETUI_TEST_POSTGRES` to the URL of a database whose user may create
-databases.
+Some server tests need Postgres and NATS. They start them in Docker on their
+own, and remove the containers when they finish. To use servers you already
+run, set `SNAKETUI_TEST_POSTGRES` to the URL of a database whose user may
+create databases, and `SNAKETUI_TEST_NATS` to a NATS server with JetStream
+on.

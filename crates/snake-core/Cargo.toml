@@ -5,9 +5,14 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Rooms' views as the server sends them between machines.
+serde = ["dep:serde"]
+
 [dependencies]
 anyhow.workspace = true
 rand.workspace = true
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 
 [dev-dependencies]
 proptest = "1.12"

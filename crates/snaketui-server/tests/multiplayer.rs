@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use common::rooms::*;
 use common::*;
 use russh::ChannelMsg;
 use snake_core::config::Rules;
@@ -23,12 +24,6 @@ const BACKSPACE: &[u8] = b"\x7f";
 /// A match fills for 10 s before starting with two players.
 const MATCH_WAIT: Duration = Duration::from_secs(20);
 
-async fn guest(server: &TestServer, name: &str, cols: u32, rows: u32) -> Player {
-    let mut p = Player::join(server.addr, Login::GuestNamed(name), cols, rows).await;
-    p.wait_for("Quick play").await;
-    p
-}
-
 /// Presses Down `n` times on the home menu, then Enter.
 async fn pick(p: &Player, n: usize) {
     for _ in 0..n {
@@ -40,30 +35,6 @@ async fn pick(p: &Player, n: usize) {
 async fn quick_play(p: &mut Player) {
     pick(p, 1).await;
     p.wait_for("Finding a match").await;
-}
-
-/// Makes a private room from the home menu and returns its code.
-async fn create_room(p: &mut Player) -> String {
-    pick(p, 2).await;
-    p.wait_for("Private room").await;
-    let text = p.text();
-    let at = text.find("Code ").expect("a code on screen") + "Code ".len();
-    text[at..at + 6].to_string()
-}
-
-async fn type_code(p: &Player, code: &str) {
-    for _ in 0..6 {
-        p.send(BACKSPACE).await;
-    }
-    p.send(code.as_bytes()).await;
-}
-
-async fn join_room(p: &mut Player, code: &str) {
-    pick(p, 3).await;
-    p.wait_for("Join with a code").await;
-    type_code(p, code).await;
-    p.send(ENTER).await;
-    p.wait_for("Private room").await;
 }
 
 /// The first seed whose first round, played with nobody pressing a key,
@@ -101,8 +72,8 @@ fn seed_where(players: u64, rules: &Rules, wanted: impl Fn(&Outcome, u64) -> boo
 #[tokio::test]
 async fn two_players_are_matched_and_see_the_countdown_and_each_other() {
     let server = TestServer::start();
-    let mut ann = guest(&server, "ann", 80, 24).await;
-    let mut ben = guest(&server, "ben", 80, 24).await;
+    let mut ann = guest(server.addr, "ann", 80, 24).await;
+    let mut ben = guest(server.addr, "ben", 80, 24).await;
     quick_play(&mut ann).await;
     quick_play(&mut ben).await;
     for p in [&mut ann, &mut ben] {
@@ -122,8 +93,8 @@ async fn a_round_where_everyone_crashes_at_once_is_a_draw_and_rooms_play_on() {
         matches!(o, Outcome::Draw { .. })
     });
     let server = TestServer::with(|c| c.room_seed = Some(seed));
-    let mut ann = guest(&server, "ann", 100, 30).await;
-    let mut ben = guest(&server, "ben", 100, 30).await;
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    let mut ben = guest(server.addr, "ben", 100, 30).await;
     let code = create_room(&mut ann).await;
     join_room(&mut ben, &code).await;
     ann.wait_for("~ben").await;
@@ -157,9 +128,9 @@ async fn leaving_and_dropping_out_mid_round_leave_the_others_playing() {
     // Nobody crashes in the first two seconds without steering.
     let seed = seed_where(3, &Rules::default(), |_, step| step > 14);
     let server = TestServer::with(|c| c.room_seed = Some(seed));
-    let mut ann = guest(&server, "ann", 100, 30).await;
-    let mut ben = guest(&server, "ben", 100, 30).await;
-    let mut cat = guest(&server, "cat", 100, 30).await;
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    let mut ben = guest(server.addr, "ben", 100, 30).await;
+    let mut cat = guest(server.addr, "cat", 100, 30).await;
     let code = create_room(&mut ann).await;
     join_room(&mut ben, &code).await;
     join_room(&mut cat, &code).await;
@@ -198,7 +169,7 @@ async fn nine_players_in_the_queue_make_one_full_match_and_one_waits() {
     let server = TestServer::start();
     let mut players = Vec::new();
     for i in 0..9 {
-        players.push(guest(&server, &format!("p{i}"), 80, 24).await);
+        players.push(guest(server.addr, &format!("p{i}"), 80, 24).await);
     }
     for p in &mut players {
         quick_play(p).await;
@@ -217,7 +188,7 @@ async fn nine_players_in_the_queue_make_one_full_match_and_one_waits() {
 #[tokio::test]
 async fn wrong_codes_are_refused_and_the_sixth_try_is_blocked() {
     let server = TestServer::start();
-    let mut p = guest(&server, "ann", 80, 24).await;
+    let mut p = guest(server.addr, "ann", 80, 24).await;
     pick(&p, 3).await;
     p.wait_for("Join with a code").await;
     for i in 2..=6 {
@@ -235,8 +206,8 @@ async fn wrong_codes_are_refused_and_the_sixth_try_is_blocked() {
 #[tokio::test]
 async fn small_terminals_are_warned_and_see_part_of_the_board() {
     let server = TestServer::start();
-    let mut ann = guest(&server, "ann", 100, 30).await;
-    let mut ben = guest(&server, "ben", 50, 16).await;
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    let mut ben = guest(server.addr, "ben", 50, 16).await;
     pick(&ben, 1).await;
     ben.wait_for("Your terminal is 50×16").await;
     // Esc clears the warning; the menu is still on Quick play.
@@ -308,7 +279,7 @@ async fn two_hundred_players_keep_rooms_on_time() {
     let bytes = Arc::new(AtomicU64::new(0));
     let mut bots = Vec::new();
     for i in 0..BOTS {
-        let p = guest(&server, &format!("bot{i}"), 80, 24).await;
+        let p = guest(server.addr, &format!("bot{i}"), 80, 24).await;
         let (stop, bytes) = (Arc::clone(&stop), Arc::clone(&bytes));
         bots.push(tokio::spawn(async move {
             let (mut rx, tx) = p.channel.split();

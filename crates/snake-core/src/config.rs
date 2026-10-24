@@ -58,6 +58,7 @@ pub fn glyph_char(idx: usize) -> &'static str {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WallMode {
     Full,
     Open,
@@ -80,6 +81,7 @@ impl WallMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum InnerWalls {
     Off,
     Few,
@@ -115,6 +117,7 @@ impl InnerWalls {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GrowthMode {
     Instant,
     AtTail,
@@ -136,6 +139,7 @@ impl GrowthMode {
 
 /// When a direction key moves the snake.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MoveTiming {
     /// Right away, ahead of the tick timer.
     Instant,
@@ -189,6 +193,7 @@ impl IconSlot {
 /// Everything that changes how a game plays. Two games with equal rules
 /// count toward the same record.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rules {
     pub width: u16,
     pub height: u16,

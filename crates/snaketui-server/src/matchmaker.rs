@@ -12,7 +12,7 @@ use tracing::debug;
 
 use crate::matcher::{Matcher, Ticket};
 use crate::rating::Rating;
-use crate::room::{Presence, Rated, RatedMember, Ratings, RoomActor, RoomHost, ViewRx};
+use crate::room::{Presence, Rated, RatedMember, Ratings, RoomActor, RoomHandle, RoomHost, ViewRx};
 use crate::store::{AccountId, Store};
 
 const RUN_EVERY: Duration = Duration::from_secs(1);
@@ -38,7 +38,7 @@ pub struct Dequeue(pub PlayerId);
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Matched {
-    pub room: Addr<RoomActor>,
+    pub room: RoomHandle,
     pub view: ViewRx,
 }
 

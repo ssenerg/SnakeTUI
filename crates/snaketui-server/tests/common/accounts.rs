@@ -1,5 +1,6 @@
 //! Signing up and in through the home menu.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use russh::keys::PrivateKey;
@@ -22,8 +23,8 @@ pub const FRIENDS: usize = 4;
 pub const ACCOUNT: usize = 5;
 
 /// The home menu, guest or signed in, waiting for it to show.
-pub async fn connect_as(server: &TestServer, login: Login<'_>) -> Player {
-    let mut p = Player::join(server.addr, login, 100, 30).await;
+pub async fn connect_as(addr: SocketAddr, login: Login<'_>) -> Player {
+    let mut p = Player::join(addr, login, 100, 30).await;
     p.wait_for("Quick play").await;
     p
 }
@@ -85,9 +86,9 @@ pub async fn retry_sign_in(p: &mut Player, name: &str, password: &str) {
     p.send(ENTER).await;
 }
 
-pub async fn signed_up(server: &TestServer, name: &str) -> (Player, PrivateKey) {
+pub async fn signed_up(addr: SocketAddr, name: &str) -> (Player, PrivateKey) {
     let key = new_key();
-    let mut p = connect_as(server, Login::Key(&key)).await;
+    let mut p = connect_as(addr, Login::Key(&key)).await;
     sign_up(&mut p, name).await;
     (p, key)
 }
