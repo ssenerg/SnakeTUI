@@ -5,34 +5,10 @@ use anyhow::Result;
 use rand::RngExt;
 
 use crate::board;
-use crate::config::{GameConfig, GrowthMode};
+use crate::config::{GrowthMode, Rules};
+use crate::geom::{Direction, Point, wrap_next};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct Point {
-    pub x: u16,
-    pub y: u16,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-impl Direction {
-    pub fn opposite(self) -> Self {
-        match self {
-            Direction::Up => Direction::Down,
-            Direction::Down => Direction::Up,
-            Direction::Left => Direction::Right,
-            Direction::Right => Direction::Left,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FoodKind {
     Normal,
     Super,
@@ -43,19 +19,19 @@ impl FoodKind {
     pub const ALL: [FoodKind; 3] = [FoodKind::Normal, FoodKind::Super, FoodKind::Poison];
 }
 
-fn spawn_interval_s(cfg: &GameConfig, kind: FoodKind) -> u64 {
+fn spawn_interval_s(rules: &Rules, kind: FoodKind) -> u64 {
     match kind {
-        FoodKind::Normal => cfg.food_interval_s,
-        FoodKind::Super => cfg.super_interval_s,
-        FoodKind::Poison => cfg.poison_interval_s,
+        FoodKind::Normal => rules.food_interval_s,
+        FoodKind::Super => rules.super_interval_s,
+        FoodKind::Poison => rules.poison_interval_s,
     }
 }
 
-fn ttl_s(cfg: &GameConfig, kind: FoodKind) -> u64 {
+fn ttl_s(rules: &Rules, kind: FoodKind) -> u64 {
     match kind {
-        FoodKind::Normal => cfg.food_ttl_s,
-        FoodKind::Super => cfg.super_ttl_s,
-        FoodKind::Poison => cfg.poison_ttl_s,
+        FoodKind::Normal => rules.food_ttl_s,
+        FoodKind::Super => rules.super_ttl_s,
+        FoodKind::Poison => rules.poison_ttl_s,
     }
 }
 
@@ -65,7 +41,7 @@ pub struct Food {
     pub expires_at: Option<Duration>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GameOverReason {
     HitWall,
     HitSelf,
@@ -74,7 +50,7 @@ pub enum GameOverReason {
 }
 
 pub struct Game {
-    pub cfg: GameConfig,
+    pub rules: Rules,
     pub width: u16,
     pub height: u16,
     walls: Vec<bool>,
@@ -92,13 +68,14 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn new(cfg: GameConfig) -> Result<Self> {
-        let (width, height) = (cfg.width, cfg.height);
-        let walls = board::generate_walls(&cfg);
+    pub fn new(rules: Rules) -> Result<Self> {
+        let (width, height) = (rules.width, rules.height);
+        let mut rng = rand::rng();
+        let walls = board::generate_walls(&rules, &mut rng);
         let free_cells = walls.iter().filter(|w| !**w).count();
-        let (snake, dir) = board::place_snake(&walls, width, height)?;
+        let (snake, dir) = board::place_snake(&walls, width, height, &mut rng)?;
         let next_spawn = FoodKind::ALL.map(|kind| {
-            let interval = spawn_interval_s(&cfg, kind);
+            let interval = spawn_interval_s(&rules, kind);
             let first = if kind == FoodKind::Normal {
                 1
             } else {
@@ -107,7 +84,7 @@ impl Game {
             (interval > 0).then(|| Duration::from_secs(first))
         });
         Ok(Self {
-            cfg,
+            rules,
             width,
             height,
             walls,
@@ -133,6 +110,8 @@ impl Game {
         self.walls[y as usize * self.width as usize + x as usize]
     }
 
+    /// The snake's length.
+    #[expect(clippy::len_without_is_empty, reason = "a snake is never empty")]
     pub fn len(&self) -> usize {
         self.snake.len()
     }
@@ -142,30 +121,8 @@ impl Game {
     }
 
     pub fn tick_interval(&self) -> Duration {
-        let base = Duration::from_millis(self.cfg.tick_ms);
+        let base = Duration::from_millis(self.rules.tick_ms);
         if self.boost_active() { base / 2 } else { base }
-    }
-
-    fn wrap_next(&self, p: Point, dir: Direction) -> Point {
-        let (w, h) = (self.width, self.height);
-        match dir {
-            Direction::Up => Point {
-                x: p.x,
-                y: (p.y + h - 1) % h,
-            },
-            Direction::Down => Point {
-                x: p.x,
-                y: (p.y + 1) % h,
-            },
-            Direction::Left => Point {
-                x: (p.x + w - 1) % w,
-                y: p.y,
-            },
-            Direction::Right => Point {
-                x: (p.x + 1) % w,
-                y: p.y,
-            },
-        }
     }
 
     pub fn turn(&mut self, dir: Direction) {
@@ -193,7 +150,7 @@ impl Game {
             .retain(|f| f.expires_at.is_none_or(|e| e > clock));
 
         for (i, kind) in FoodKind::ALL.into_iter().enumerate() {
-            let interval = spawn_interval_s(&self.cfg, kind);
+            let interval = spawn_interval_s(&self.rules, kind);
             while let Some(t) = self.next_spawn[i] {
                 if clock < t {
                     break;
@@ -211,7 +168,12 @@ impl Game {
     }
 
     fn step(&mut self) {
-        let next = self.wrap_next(*self.snake.front().unwrap(), self.dir);
+        let next = wrap_next(
+            *self.snake.front().unwrap(),
+            self.dir,
+            self.width,
+            self.height,
+        );
 
         if self.walls[self.idx(next)] {
             self.over = Some(GameOverReason::HitWall);
@@ -229,7 +191,7 @@ impl Game {
             grow = true;
         }
 
-        if !self.cfg.pass_through_self && self.snake.contains(&next) {
+        if !self.rules.pass_through_self && self.snake.contains(&next) {
             let tail = *self.snake.back().unwrap();
             let tail_vacates =
                 !grow && next == tail && self.snake.iter().filter(|&&p| p == tail).count() == 1;
@@ -249,11 +211,11 @@ impl Game {
             match food.kind {
                 FoodKind::Normal => self.eat_growth(1),
                 FoodKind::Super => {
-                    let n = self.cfg.super_growth;
+                    let n = self.rules.super_growth;
                     self.eat_growth(n);
-                    if self.cfg.boost_duration_s > 0 {
+                    if self.rules.boost_duration_s > 0 {
                         self.boost_until =
-                            self.clock + Duration::from_secs(self.cfg.boost_duration_s);
+                            self.clock + Duration::from_secs(self.rules.boost_duration_s);
                     }
                 }
                 FoodKind::Poison => {
@@ -272,7 +234,7 @@ impl Game {
     }
 
     fn eat_growth(&mut self, n: u32) {
-        match self.cfg.growth_mode {
+        match self.rules.growth_mode {
             GrowthMode::Instant => {
                 let tail = *self.snake.back().unwrap();
                 for _ in 0..n {
@@ -309,7 +271,7 @@ impl Game {
         }
         let mut rng = rand::rng();
         let pos = cells[rng.random_range(0..cells.len())];
-        let ttl = ttl_s(&self.cfg, kind);
+        let ttl = ttl_s(&self.rules, kind);
         let expires_at = (ttl > 0).then(|| self.clock + Duration::from_secs(ttl));
         self.foods.push(Food {
             pos,
@@ -326,10 +288,12 @@ mod tests {
 
     #[test]
     fn snake_wraps_on_open_board() {
-        let mut cfg = GameConfig::default();
-        cfg.wall_mode = WallMode::Open;
-        cfg.inner_walls = InnerWalls::Off;
-        let mut game = Game::new(cfg).unwrap();
+        let rules = Rules {
+            wall_mode: WallMode::Open,
+            inner_walls: InnerWalls::Off,
+            ..Rules::default()
+        };
+        let mut game = Game::new(rules).unwrap();
         game.snake = VecDeque::from([Point { x: 0, y: 5 }]);
         game.dir = Direction::Left;
         game.turn(Direction::Left);

@@ -1,0 +1,10 @@
+[package]
+name = "snake-core"
+description = "SnakeTUI game rules: board generation, snakes, food, settings and records"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+rand.workspace = true

@@ -106,7 +106,15 @@ Colors are cosmetic and don't affect which record a game counts toward.
 
 ## Development
 
+The code is a Cargo workspace:
+
+| Crate | What's in it |
+| --- | --- |
+| `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
+| `crates/snake-core` | Game rules: board generation, snake, food, settings, records. No terminal or file access |
+| `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
+
 ```sh
-cargo test    # wall generation invariants (mirroring, connectivity, no bottleneck cells)
-cargo build --release
+cargo test --workspace   # rules, wall invariants, key handling, every screen at every size
+cargo build --release    # builds the `snaketui` binary
 ```

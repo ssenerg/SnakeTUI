@@ -1,0 +1,10 @@
+[package]
+name = "snake-tui"
+description = "SnakeTUI screens and app state machine, shared by the local game and the server"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ratatui.workspace = true
+snake-core.workspace = true

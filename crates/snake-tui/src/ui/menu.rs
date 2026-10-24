@@ -3,10 +3,11 @@ use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
+use snake_core::settings::{Kind, SETTINGS};
 
 use super::centered_rect;
 use crate::app::App;
-use crate::config::{SECTIONS, SETTINGS};
+use crate::palette::theme_color;
 
 const LOGO: [&str; 3] = ["┌─┐┌┐┌┌─┐┬┌─┌─┐", "└─┐│││├─┤├┴┐├┤ ", "└─┘┘└┘┴ ┴┴ ┴└─┘"];
 
@@ -18,15 +19,16 @@ enum Row {
 
 fn rows() -> Vec<Row> {
     let mut rows = Vec::new();
-    for (si, &(title, start)) in SECTIONS.iter().enumerate() {
-        if si > 0 {
-            rows.push(Row::Blank);
+    let mut section = None;
+    for (i, setting) in SETTINGS.iter().enumerate() {
+        if section != Some(setting.section) {
+            if section.is_some() {
+                rows.push(Row::Blank);
+            }
+            rows.push(Row::Header(setting.section.title()));
+            section = Some(setting.section);
         }
-        rows.push(Row::Header(title));
-        let end = SECTIONS.get(si + 1).map_or(SETTINGS.len(), |s| s.1);
-        for i in start..end {
-            rows.push(Row::Item(i));
-        }
+        rows.push(Row::Item(i));
     }
     rows
 }
@@ -111,14 +113,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     format!("{marker}{:<26}", SETTINGS[i].label),
                     label_style,
                 )];
-                if let Some(color) = app.cfg.swatch(i) {
-                    spans.push(Span::styled("██ ", Style::default().fg(color)));
-                }
-                if let Some((glyph, color)) = app.cfg.icon_preview(i) {
-                    spans.push(Span::styled(
-                        format!("{glyph}  "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ));
+                let theme = &app.cfg.theme;
+                match SETTINGS[i].kind {
+                    Kind::Color(slot) => {
+                        let color = theme_color(theme, slot);
+                        spans.push(Span::styled("██ ", Style::default().fg(color)));
+                    }
+                    // The icon as it appears in game, in its in-game color.
+                    Kind::Icon(slot) => {
+                        let color = theme_color(theme, slot.color_slot());
+                        spans.push(Span::styled(
+                            format!("{}  ", theme.icon(slot)),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    _ => {}
                 }
                 let value = app.cfg.value_str(i);
                 if selected {
@@ -135,7 +144,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
-    let record = app.records.get(&app.cfg.record_key());
+    let record = app.records.get(&app.cfg.rules.record_key());
     let hint = if app.confirm_reset {
         Line::from("press r again to reset all settings · any other key cancels").style(
             Style::default()

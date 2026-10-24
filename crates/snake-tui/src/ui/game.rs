@@ -5,11 +5,12 @@ use ratatui::layout::{Alignment, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use snake_core::config::{ColorSlot, IconSlot, Theme};
+use snake_core::game::{FoodKind, Game};
 
 use super::centered_rect;
 use crate::app::App;
-use crate::config::{ColorSlot, IconSlot};
-use crate::game::{FoodKind, Game};
+use crate::palette::theme_color;
 
 const PAD_X: u16 = 2;
 const PAD_Y: u16 = 1;
@@ -58,7 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .title_bottom(hint_line(game).centered());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(board_lines(game)), inner);
+    frame.render_widget(Paragraph::new(board_lines(game, &app.cfg.theme)), inner);
 }
 
 fn title_line() -> Line<'static> {
@@ -123,7 +124,7 @@ fn hint_line(game: &Game) -> Line<'static> {
     }
 }
 
-fn board_lines(game: &Game) -> Vec<Line<'static>> {
+fn board_lines(game: &Game, theme: &Theme) -> Vec<Line<'static>> {
     #[derive(Clone, Copy)]
     enum Cell {
         Empty,
@@ -135,7 +136,6 @@ fn board_lines(game: &Game) -> Vec<Line<'static>> {
         Head,
     }
 
-    let cfg = &game.cfg;
     let (w, h) = (game.width as usize, game.height as usize);
     let mut grid = vec![Cell::Empty; w * h];
     for y in 0..game.height {
@@ -160,29 +160,33 @@ fn board_lines(game: &Game) -> Vec<Line<'static>> {
     }
 
     // Each food cell is the user-chosen glyph padded to the 2-column cell.
-    let food_txt = format!("{} ", cfg.icon(IconSlot::Food));
-    let super_txt = format!("{} ", cfg.icon(IconSlot::SuperFood));
-    let poison_txt = format!("{} ", cfg.icon(IconSlot::Poison));
+    let food_txt = format!("{} ", theme.icon(IconSlot::Food));
+    let super_txt = format!("{} ", theme.icon(IconSlot::SuperFood));
+    let poison_txt = format!("{} ", theme.icon(IconSlot::Poison));
 
-    let bg = cfg.color(ColorSlot::Background);
+    let bg = theme_color(theme, ColorSlot::Background);
     let mut lines = Vec::with_capacity(h);
     for y in 0..h {
         let mut spans = Vec::with_capacity(w);
         for x in 0..w {
             let (text, fg, bold): (Cow<'static, str>, _, _) = match grid[y * w + x] {
                 Cell::Empty => ("  ".into(), bg, false),
-                Cell::Wall => ("██".into(), cfg.color(ColorSlot::Wall), false),
-                Cell::Head => ("██".into(), cfg.color(ColorSlot::Head), false),
-                Cell::Body => ("██".into(), cfg.color(ColorSlot::Body), false),
-                Cell::Food => (food_txt.clone().into(), cfg.color(ColorSlot::Food), true),
+                Cell::Wall => ("██".into(), theme_color(theme, ColorSlot::Wall), false),
+                Cell::Head => ("██".into(), theme_color(theme, ColorSlot::Head), false),
+                Cell::Body => ("██".into(), theme_color(theme, ColorSlot::Body), false),
+                Cell::Food => (
+                    food_txt.clone().into(),
+                    theme_color(theme, ColorSlot::Food),
+                    true,
+                ),
                 Cell::Super => (
                     super_txt.clone().into(),
-                    cfg.color(ColorSlot::SuperFood),
+                    theme_color(theme, ColorSlot::SuperFood),
                     true,
                 ),
                 Cell::Poison => (
                     poison_txt.clone().into(),
-                    cfg.color(ColorSlot::Poison),
+                    theme_color(theme, ColorSlot::Poison),
                     true,
                 ),
             };

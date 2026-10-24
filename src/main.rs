@@ -1,43 +1,59 @@
-mod app;
-mod board;
-mod config;
-mod game;
-mod records;
-mod ui;
+mod persist;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use snake_tui::{App, Effect, Key};
 
-use app::{App, Screen};
+/// The app's key for a terminal key press, or `None` for keys it ignores.
+fn to_key(key: KeyEvent) -> Option<Key> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Raw mode delivers Ctrl+C as a key press, not as a signal.
+        return matches!(key.code, KeyCode::Char('c' | 'C')).then_some(Key::CtrlC);
+    }
+    Some(match key.code {
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Char(c) => Key::Char(c),
+        _ => return None,
+    })
+}
+
+/// Carries out the app's effects; returns `false` once it should quit.
+fn apply(app: &App, effects: Vec<Effect>) -> bool {
+    for effect in effects {
+        match effect {
+            Effect::SaveConfig => persist::save_config(&app.cfg),
+            Effect::SaveRecords => persist::save_records(&app.records),
+            Effect::Quit => return false,
+        }
+    }
+    true
+}
 
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(persist::load_config(), persist::load_records());
     let mut last_frame = Instant::now();
 
     loop {
-        // The snake must never move while its board isn't on screen.
-        let size = terminal.size()?;
-        if matches!(app.screen, Screen::Playing)
-            && app.game.as_ref().is_some_and(|g| !ui::board_fits(g, size))
-        {
-            app.screen = Screen::Paused { selected: 0 };
-        }
+        app.resize(terminal.size()?);
+        terminal.draw(|frame| snake_tui::ui::draw(frame, &app))?;
 
-        terminal.draw(|frame| ui::draw(frame, &app))?;
-
-        let timeout = if matches!(app.screen, Screen::Playing) {
-            Duration::from_millis(15)
-        } else {
-            Duration::from_millis(100)
-        };
-        if event::poll(timeout)? {
+        if event::poll(app.poll_interval())? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !app.handle_key(key) {
-                        return Ok(());
+                    if let Some(key) = to_key(key) {
+                        let effects = app.handle(key);
+                        if !apply(&app, effects) {
+                            return Ok(());
+                        }
                     }
                 }
                 // Re-check the fit before the game moves at the new size.
@@ -49,15 +65,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         let now = Instant::now();
         let dt = now - last_frame;
         last_frame = now;
-
-        if matches!(app.screen, Screen::Playing) {
-            if let Some(game) = &mut app.game {
-                game.advance(dt);
-            }
-            if app.game.as_ref().is_some_and(|g| g.over.is_some()) {
-                let new_record = app.save_record();
-                app.screen = Screen::GameOver { new_record };
-            }
+        let effects = app.tick(dt);
+        if !apply(&app, effects) {
+            return Ok(());
         }
     }
 }

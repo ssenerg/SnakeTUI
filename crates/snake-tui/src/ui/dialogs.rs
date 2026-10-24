@@ -3,10 +3,10 @@ use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+use snake_core::game::GameOverReason;
 
 use super::dialog;
 use crate::app::App;
-use crate::game::GameOverReason;
 
 pub fn draw_pause(frame: &mut Frame, selected: usize) {
     let inner = dialog(frame, " PAUSED ", Color::Yellow, 36, 8);

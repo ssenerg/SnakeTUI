@@ -1,18 +1,17 @@
 use std::collections::VecDeque;
 
 use anyhow::{Result, anyhow};
-use rand::RngExt;
+use rand::{Rng, RngExt};
 
-use crate::config::{GameConfig, WallMode};
-use crate::game::{Direction, Point};
+use crate::config::{Rules, WallMode};
+use crate::geom::{Direction, Point};
 
-pub fn generate_walls(cfg: &GameConfig) -> Vec<bool> {
-    let w = cfg.width as usize;
-    let h = cfg.height as usize;
+pub fn generate_walls<R: Rng + ?Sized>(rules: &Rules, rng: &mut R) -> Vec<bool> {
+    let w = rules.width as usize;
+    let h = rules.height as usize;
     let mut walls = vec![false; w * h];
-    let mut rng = rand::rng();
 
-    match cfg.wall_mode {
+    match rules.wall_mode {
         WallMode::Full => {
             for x in 0..w {
                 walls[x] = true;
@@ -41,7 +40,7 @@ pub fn generate_walls(cfg: &GameConfig) -> Vec<bool> {
         }
     }
 
-    let density = cfg.inner_walls.density_percent();
+    let density = rules.inner_walls.density_percent();
     if density > 0 && w > 2 && h > 2 {
         let target = (w - 2) * (h - 2) * density / 100;
         let mut placed = 0;
@@ -131,7 +130,12 @@ fn no_bottlenecks(walls: &[bool], w: usize, h: usize) -> bool {
     root_children <= 1 && seen == walls.iter().filter(|x| !**x).count()
 }
 
-pub fn place_snake(walls: &[bool], w: u16, h: u16) -> Result<(VecDeque<Point>, Direction)> {
+pub fn place_snake<R: Rng + ?Sized>(
+    walls: &[bool],
+    w: u16,
+    h: u16,
+    rng: &mut R,
+) -> Result<(VecDeque<Point>, Direction)> {
     let wu = w as usize;
     let free: Vec<Point> = (0..h)
         .flat_map(|y| (0..w).map(move |x| Point { x, y }))
@@ -140,7 +144,6 @@ pub fn place_snake(walls: &[bool], w: u16, h: u16) -> Result<(VecDeque<Point>, D
     if free.is_empty() {
         return Err(anyhow!("board has no free cells"));
     }
-    let mut rng = rand::rng();
 
     for target_len in [3usize, 2, 1] {
         for _ in 0..300 {
@@ -279,12 +282,14 @@ mod tests {
 
     #[test]
     fn gap_walls_are_mirrored_and_connected() {
-        let mut cfg = GameConfig::default();
-        cfg.wall_mode = WallMode::Gaps;
-        cfg.inner_walls = InnerWalls::Many;
+        let rules = Rules {
+            wall_mode: WallMode::Gaps,
+            inner_walls: InnerWalls::Many,
+            ..Rules::default()
+        };
         for _ in 0..20 {
-            let (w, h) = (cfg.width as usize, cfg.height as usize);
-            let walls = generate_walls(&cfg);
+            let (w, h) = (rules.width as usize, rules.height as usize);
+            let walls = generate_walls(&rules, &mut rand::rng());
             for x in 0..w {
                 assert_eq!(
                     walls[x],
@@ -308,12 +313,14 @@ mod tests {
 
     #[test]
     fn full_walls_keep_interior_connected() {
-        let mut cfg = GameConfig::default();
-        cfg.wall_mode = WallMode::Full;
-        cfg.inner_walls = InnerWalls::Many;
+        let rules = Rules {
+            wall_mode: WallMode::Full,
+            inner_walls: InnerWalls::Many,
+            ..Rules::default()
+        };
         for _ in 0..20 {
-            let (w, h) = (cfg.width as usize, cfg.height as usize);
-            let walls = generate_walls(&cfg);
+            let (w, h) = (rules.width as usize, rules.height as usize);
+            let walls = generate_walls(&rules, &mut rand::rng());
             assert!(all_free_connected(&walls, w, h));
         }
     }
@@ -321,12 +328,14 @@ mod tests {
     #[test]
     fn inner_walls_never_create_dead_ends() {
         for wall_mode in [WallMode::Full, WallMode::Open, WallMode::Gaps] {
-            let mut cfg = GameConfig::default();
-            cfg.wall_mode = wall_mode;
-            cfg.inner_walls = InnerWalls::Many;
+            let rules = Rules {
+                wall_mode,
+                inner_walls: InnerWalls::Many,
+                ..Rules::default()
+            };
             for _ in 0..20 {
-                let (w, h) = (cfg.width as usize, cfg.height as usize);
-                let walls = generate_walls(&cfg);
+                let (w, h) = (rules.width as usize, rules.height as usize);
+                let walls = generate_walls(&rules, &mut rand::rng());
                 assert!(no_dead_ends(&walls, w, h), "free cell with < 2 exits");
             }
         }
@@ -335,14 +344,14 @@ mod tests {
     #[test]
     fn inner_walls_never_create_bottlenecks() {
         for wall_mode in [WallMode::Full, WallMode::Open, WallMode::Gaps] {
-            let cfg = GameConfig {
+            let rules = Rules {
                 wall_mode,
                 inner_walls: InnerWalls::Many,
-                ..GameConfig::default()
+                ..Rules::default()
             };
             for _ in 0..20 {
-                let (w, h) = (cfg.width as usize, cfg.height as usize);
-                let walls = generate_walls(&cfg);
+                let (w, h) = (rules.width as usize, rules.height as usize);
+                let walls = generate_walls(&rules, &mut rand::rng());
                 assert!(
                     !has_bottleneck(&walls, w, h),
                     "a single cell splits the free area"
@@ -353,13 +362,13 @@ mod tests {
 
     #[test]
     fn one_cell_doorway_is_a_bottleneck() {
-        let cfg = GameConfig {
+        let rules = Rules {
             width: 10,
             height: 8,
-            ..GameConfig::default()
+            ..Rules::default()
         };
         let (w, h) = (10, 8);
-        let mut walls = generate_walls(&cfg);
+        let mut walls = generate_walls(&rules, &mut rand::rng());
         assert!(no_bottlenecks(&walls, w, h));
         // Wall off the left side except for a doorway at (4, 3). Every cell
         // still has two exits, but the room behind the doorway is a trap.
