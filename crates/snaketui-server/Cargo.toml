@@ -1,0 +1,27 @@
+[package]
+name = "snaketui-server"
+description = "Serves SnakeTUI over SSH: the game is the SSH server"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+actix = "0.13.5"
+actix-rt = "2.15"
+anyhow.workspace = true
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+rand.workspace = true
+ratatui.workspace = true
+russh = "0.64.1"
+serde = { version = "1", features = ["derive"] }
+snake-core.workspace = true
+snake-tui.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+vt100 = "0.18.1"

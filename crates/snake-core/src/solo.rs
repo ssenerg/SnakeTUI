@@ -72,6 +72,13 @@ impl SoloGame {
         if self.boost_active() { base / 2 } else { base }
     }
 
+    /// How long until the next automatic step, while the game is running.
+    /// A runner can sleep until then instead of polling.
+    pub fn until_next_step(&self) -> Option<Duration> {
+        (self.started && self.over.is_none())
+            .then(|| self.tick_interval().saturating_sub(self.tick_accum))
+    }
+
     /// A direction key; the first one starts the game. With instant moves the
     /// snake steps right away, otherwise the turn waits for the next tick.
     pub fn turn(&mut self, dir: Direction) {

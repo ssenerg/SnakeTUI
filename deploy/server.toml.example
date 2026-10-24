@@ -1,0 +1,32 @@
+# snaketui-server settings. Copy to /etc/snaketui/server.toml.
+# Every setting is optional; these are the defaults.
+
+# Where players connect. Port 22 lets them type plain `ssh play.example.com`;
+# move the machine's own OpenSSH to another port first (see INSTALL.md).
+# "[::]:22" takes IPv6 and IPv4 players; use "0.0.0.0:22" on a machine
+# without IPv6.
+listen = "[::]:22"
+
+# The game's own SSH host key, created on first start. Keep it across
+# reinstalls, or every player sees a "host key changed" warning.
+host_key = "/var/lib/snaketui/host_ed25519_key"
+
+# Saved nicknames, settings and records of players who connect with a key.
+database = "sqlite:///var/lib/snaketui/snaketui.db"
+
+# Threads serving sessions; 0 means one per CPU core.
+workers = 0
+
+# Connections at once, in total and from a single IP address.
+max_sessions = 2000
+max_sessions_per_ip = 10
+
+# Seconds a connection may take to sign in and open the game.
+login_timeout_secs = 30
+
+# Seconds without a key press, outside a running game, before logging out.
+idle_timeout_secs = 600
+
+# Seconds a client may go without taking any screen updates before it's
+# disconnected (it stopped reading, or its connection is stuck).
+stall_timeout_secs = 20

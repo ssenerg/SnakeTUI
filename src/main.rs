@@ -31,7 +31,7 @@ fn apply(app: &App, effects: Vec<Effect>) -> bool {
     for effect in effects {
         match effect {
             Effect::SaveConfig => persist::save_config(&app.cfg),
-            Effect::SaveRecords => persist::save_records(&app.records),
+            Effect::RecordSet { .. } => persist::save_records(&app.records),
             Effect::Quit => return false,
         }
     }

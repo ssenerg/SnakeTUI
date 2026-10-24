@@ -52,6 +52,39 @@ cargo install --path .
 cargo run --release
 ```
 
+## Serving it over SSH
+
+`snaketui-server` lets anyone play from their own terminal with
+`ssh play.example.com`. The game is the SSH server: players get no shell and
+no account on the machine, and quitting the game ends their connection at once.
+
+- **Identity.** A player's SSH key identifies them, so their nickname,
+  settings and records follow the key between visits. Players without a key
+  play as guests. Passwords are never asked for.
+- **Only the game.** Commands (`ssh host ls`), file transfer and port
+  forwarding are refused with a message.
+- **Limits.** Connections are capped in total and per IP address. Logins time
+  out, idle players are logged out, and clients that stop reading are
+  disconnected.
+- Single player only for now.
+
+To host it on Ubuntu 24.04, follow [deploy/INSTALL.md](deploy/INSTALL.md).
+Prebuilt Linux servers are on the [releases page](../../releases) next to the
+game.
+
+To try it on your own machine:
+
+```sh
+cat > /tmp/snaketui-dev.toml <<'TOML'
+listen = "127.0.0.1:2022"
+host_key = "/tmp/snaketui-dev/host_ed25519_key"
+database = "sqlite:///tmp/snaketui-dev/snaketui.db"
+TOML
+cargo run --release -p snaketui-server -- --config /tmp/snaketui-dev.toml
+```
+
+Then, in another terminal, run `ssh -p 2022 localhost`.
+
 ## How to play
 
 1. Adjust the settings in the config menu (see below), then press **Enter**.
@@ -119,8 +152,12 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), settings, records. No terminal or file access |
 | `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
+| `crates/snaketui-server` | The SSH server: sign-in, one actor per player session (actix), the SQLite store, `server.toml` |
+| `deploy/` | systemd unit, example `server.toml`, and the Ubuntu install guide |
 
 ```sh
-cargo test --workspace   # rules, wall invariants, key handling, every screen at every size
+cargo test --workspace   # rules, wall invariants, key handling, every screen at
+                         # every size, and the SSH server end to end
 cargo build --release    # builds the `snaketui` binary
+cargo build --release -p snaketui-server
 ```

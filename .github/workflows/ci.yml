@@ -77,3 +77,24 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+
+      # The SSH server, with what deploy/INSTALL.md needs next to it.
+      - name: Build server
+        if: contains(matrix.target, 'linux')
+        run: cargo build --release --locked --target ${{ matrix.target }} -p snaketui-server
+
+      - name: Package server
+        if: contains(matrix.target, 'linux')
+        run: |
+          name="snaketui-server-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/snaketui-server" \
+            deploy/INSTALL.md deploy/server.toml.example deploy/snaketui.service "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "SERVER_ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload server to release
+        if: contains(matrix.target, 'linux')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.SERVER_ASSET }}

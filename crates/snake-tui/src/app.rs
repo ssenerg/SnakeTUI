@@ -19,12 +19,13 @@ pub enum Screen {
 }
 
 /// Work the app leaves to whoever runs it, in the order given.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
     /// Persist [`App::cfg`].
     SaveConfig,
-    /// Persist [`App::records`]: a new best was just set.
-    SaveRecords,
+    /// A new best was just set in [`App::records`]. By the time this is
+    /// handled the game may be gone, so it says which record changed.
+    RecordSet { key: String, best: u32 },
     /// Leave the app.
     Quit,
 }
@@ -110,9 +111,10 @@ impl App {
     fn save_record(&mut self, effects: &mut Vec<Effect>) -> bool {
         let Some(game) = &self.game else { return false };
         let len = game.len() as u32;
-        let new_record = self.records.update(&game.rules().record_key(), len);
+        let key = game.rules().record_key();
+        let new_record = self.records.update(&key, len);
         if new_record {
-            effects.push(Effect::SaveRecords);
+            effects.push(Effect::RecordSet { key, best: len });
         }
         self.record = self.record.max(len);
         new_record
@@ -240,7 +242,12 @@ mod tests {
         assert_eq!(effects, [Effect::SaveConfig]);
         assert_eq!(app.screen, Screen::Playing);
         // The first game on these rules is a new record, saved before quitting.
-        assert_eq!(app.handle(Key::CtrlC), [Effect::SaveRecords, Effect::Quit]);
+        let len = app.game.as_ref().unwrap().len() as u32;
+        let key = GameConfig::default().rules.record_key();
+        assert_eq!(
+            app.handle(Key::CtrlC),
+            [Effect::RecordSet { key, best: len }, Effect::Quit]
+        );
     }
 
     #[test]

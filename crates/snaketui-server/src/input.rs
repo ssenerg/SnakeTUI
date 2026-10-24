@@ -1,0 +1,217 @@
+//! Turns the bytes a player's terminal sends into [`Key`]s.
+
+use snake_tui::Key;
+
+const ESC: u8 = 0x1b;
+/// A sequence longer than this is garbage, not a key.
+const MAX_SEQUENCE: usize = 32;
+
+/// Parses terminal input. Packets can end in the middle of an escape
+/// sequence, so an unfinished one is kept until the rest arrives.
+///
+/// A lone ESC is ambiguous: the Esc key, or the start of a sequence still
+/// on its way. [`Self::pending_esc`] reports that case, and the caller
+/// calls [`Self::flush`] if nothing follows soon.
+#[derive(Default)]
+pub struct KeyParser {
+    pending: Vec<u8>,
+    /// The last byte was CR, so a following LF is part of the same Enter.
+    after_cr: bool,
+}
+
+impl KeyParser {
+    /// Parses `bytes`, appending the keys they contain to `out`.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Key>) {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(bytes);
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i] == ESC {
+                match parse_escape(&buf[i..]) {
+                    Escape::Incomplete => {
+                        self.pending = buf[i..].to_vec();
+                        return;
+                    }
+                    Escape::Key(key, len) => {
+                        out.extend(key);
+                        i += len;
+                    }
+                }
+                self.after_cr = false;
+                continue;
+            }
+            let b = buf[i];
+            match b {
+                b'\r' => out.push(Key::Enter),
+                b'\n' if !self.after_cr => out.push(Key::Enter),
+                0x03 => out.push(Key::CtrlC),
+                0x7f | 0x08 => out.push(Key::Backspace),
+                0x20..=0x7e => out.push(Key::Char(b as char)),
+                // Other control keys and non-ASCII text mean nothing here.
+                _ => {}
+            }
+            self.after_cr = b == b'\r';
+            i += 1;
+        }
+    }
+
+    /// Whether input ended on a lone ESC that may still turn out to start a
+    /// sequence.
+    pub fn pending_esc(&self) -> bool {
+        self.pending == [ESC]
+    }
+
+    /// Nothing followed a lone ESC in time: it was the Esc key.
+    pub fn flush(&mut self, out: &mut Vec<Key>) {
+        if self.pending_esc() {
+            out.push(Key::Esc);
+        }
+        self.pending.clear();
+    }
+}
+
+enum Escape {
+    /// The sequence's end hasn't arrived yet.
+    Incomplete,
+    /// A key (or nothing, for sequences the game ignores) and the bytes used.
+    Key(Option<Key>, usize),
+}
+
+/// Parses an escape sequence at the start of `buf`, which begins with ESC.
+fn parse_escape(buf: &[u8]) -> Escape {
+    let arrow = |b: u8| match b {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
+        _ => None,
+    };
+    match buf.get(1) {
+        None => Escape::Incomplete,
+        // CSI: ESC [ <parameters> <final byte>. Arrows with modifiers (they
+        // have parameters) are ignored, like other Ctrl/Alt combinations.
+        Some(b'[') => match buf[2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
+            Some(end) => {
+                let fin = buf[2 + end];
+                let key = if end == 0 { arrow(fin) } else { None };
+                Escape::Key(key, 3 + end)
+            }
+            None if buf.len() > MAX_SEQUENCE => Escape::Key(None, buf.len()),
+            None => Escape::Incomplete,
+        },
+        // SS3: ESC O <letter>, what arrows send in application cursor mode.
+        Some(b'O') => match buf.get(2) {
+            Some(&b) => Escape::Key(arrow(b), 3),
+            None => Escape::Incomplete,
+        },
+        // ESC then an ordinary byte: Esc, and the byte is parsed on its own.
+        Some(_) => Escape::Key(Some(Key::Esc), 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Key::*;
+
+    fn parse(chunks: &[&[u8]]) -> Vec<Key> {
+        let mut parser = KeyParser::default();
+        let mut keys = Vec::new();
+        for chunk in chunks {
+            parser.feed(chunk, &mut keys);
+        }
+        parser.flush(&mut keys);
+        keys
+    }
+
+    #[test]
+    fn arrows_in_both_forms() {
+        assert_eq!(
+            parse(&[b"\x1b[A\x1b[B\x1b[C\x1b[D"]),
+            [Up, Down, Right, Left]
+        );
+        assert_eq!(parse(&[b"\x1bOA\x1bOD"]), [Up, Left]);
+    }
+
+    #[test]
+    fn enter_ctrl_c_backspace_and_letters() {
+        assert_eq!(parse(&[b"\r"]), [Enter]);
+        assert_eq!(parse(&[b"\n"]), [Enter]);
+        assert_eq!(parse(&[b"\r\n"]), [Enter], "CR LF is one Enter");
+        assert_eq!(parse(&[b"\r", b"\n"]), [Enter], "even split across packets");
+        assert_eq!(parse(&[b"\r\r"]), [Enter, Enter]);
+        assert_eq!(
+            parse(&[b"\x03\x7f\x08wD q"]),
+            [
+                CtrlC,
+                Backspace,
+                Backspace,
+                Char('w'),
+                Char('D'),
+                Char(' '),
+                Char('q')
+            ]
+        );
+    }
+
+    #[test]
+    fn other_bytes_are_ignored() {
+        // Ctrl+D, a tab, UTF-8 text, Ctrl+Up, an F-key.
+        assert_eq!(parse(&[b"\x04\t\xc3\xa9\x1b[1;5A\x1b[15~"]), []);
+    }
+
+    #[test]
+    fn a_lone_esc_waits_to_see_what_follows() {
+        let mut parser = KeyParser::default();
+        let mut keys = Vec::new();
+        parser.feed(b"\x1b", &mut keys);
+        assert!(keys.is_empty() && parser.pending_esc());
+        parser.feed(b"[A", &mut keys);
+        assert_eq!(keys, [Up], "it was the start of an arrow");
+
+        keys.clear();
+        parser.feed(b"\x1b", &mut keys);
+        parser.flush(&mut keys);
+        assert_eq!(keys, [Esc], "nothing followed: the Esc key");
+        assert!(!parser.pending_esc());
+    }
+
+    #[test]
+    fn esc_before_an_ordinary_key_is_esc_then_that_key() {
+        assert_eq!(parse(&[b"\x1bq"]), [Esc, Char('q')]);
+    }
+
+    #[test]
+    fn endless_sequences_are_dropped() {
+        // Parameters that never reach a final byte.
+        let mut junk = b"\x1b[".to_vec();
+        junk.extend([b'1'; 40]);
+        assert_eq!(parse(&[&junk, b"q"]), [Char('q')]);
+    }
+
+    #[test]
+    fn any_split_gives_the_same_keys() {
+        let input: &[u8] = b"w\x1b[A\x1bOB\r\n\x03\x1b[1;2C\x7fq\x1bx";
+        let whole = parse(&[input]);
+        assert_eq!(
+            whole,
+            [
+                Char('w'),
+                Up,
+                Down,
+                Enter,
+                CtrlC,
+                Backspace,
+                Char('q'),
+                Esc,
+                Char('x')
+            ]
+        );
+        for a in 0..=input.len() {
+            for b in a..=input.len() {
+                let split = parse(&[&input[..a], &input[a..b], &input[b..]]);
+                assert_eq!(split, whole, "split at {a} and {b}");
+            }
+        }
+    }
+}
