@@ -14,7 +14,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use async_nats::{Client, ConnectOptions};
+use async_nats::Client;
 use futures::StreamExt;
 use snake_core::round::PlayerId;
 use tokio::sync::mpsc;
@@ -24,7 +24,7 @@ use crate::cluster::wire::{
     Alive, MadeMatch, MakeMatch, MatchSeat, QueueAlive, QueueLeave, QueueTicket, decode, encode,
     server_subject,
 };
-use crate::cluster::{HEARTBEAT, PEER_TIMEOUT, prefix};
+use crate::cluster::{HEARTBEAT, PEER_TIMEOUT, nats_options, prefix};
 use crate::config::ClusterConfig;
 use crate::matcher::{Matcher, Ticket};
 use crate::room::{RoomRef, ServerId};
@@ -47,6 +47,8 @@ const CLOCK_START: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct ServerSeen {
     pub region: String,
     pub load: u32,
+    /// Stopping, so it hosts no new matches.
+    pub draining: bool,
     pub seen: Instant,
 }
 
@@ -131,6 +133,7 @@ impl Queue {
         let seen = ServerSeen {
             region: alive.region,
             load: alive.load,
+            draining: alive.draining,
             seen: Instant::now(),
         };
         self.servers.insert(alive.server, seen);
@@ -178,13 +181,13 @@ impl Queue {
             for seat in &seats {
                 self.recently.insert(seat.who.id, Instant::now());
             }
-            let live: HashMap<ServerId, &ServerSeen> = self
+            let hosts: HashMap<ServerId, &ServerSeen> = self
                 .servers
                 .iter()
-                .filter(|(_, s)| s.seen.elapsed() < PEER_TIMEOUT)
+                .filter(|(_, s)| s.seen.elapsed() < PEER_TIMEOUT && !s.draining)
                 .map(|(id, s)| (*id, s))
                 .collect();
-            let hosts = choose_hosts(&group.region, &seats, &live);
+            let hosts = choose_hosts(&group.region, &seats, &hosts);
             plans.push(Plan { seats, hosts, back });
         }
         plans
@@ -223,7 +226,7 @@ pub fn choose_hosts(
 
 /// Runs the cluster's queue until `stop` completes.
 pub async fn run(cfg: &ClusterConfig, speed: f64, stop: impl Future<Output = ()>) -> Result<()> {
-    let client = ConnectOptions::new()
+    let client = nats_options(&cfg.nats)?
         .name("snaketui-matchmaker")
         .request_timeout(Some(REQUEST_TIMEOUT))
         .connect(&cfg.nats)
@@ -336,6 +339,7 @@ mod tests {
             server,
             region: region.into(),
             load,
+            draining: false,
         }
     }
 
@@ -344,6 +348,7 @@ mod tests {
         let seen = |region: &str, load| ServerSeen {
             region: region.into(),
             load,
+            draining: false,
             seen: Instant::now(),
         };
         let servers = [(1, seen("eu", 50)), (2, seen("eu", 10)), (3, seen("us", 0))];

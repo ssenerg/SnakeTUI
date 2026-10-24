@@ -1,0 +1,15 @@
+[package]
+name = "snaketui-loadbot"
+description = "Many bot players for SnakeTUI servers, to see how they hold up"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+russh = "0.64.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -14,6 +14,9 @@ You need:
 - a DNS name for it,
 - access to your cloud provider's firewall, if it has one.
 
+This sets up one server. To run several as one, set up each like this, then
+follow [CLUSTER.md](CLUSTER.md).
+
 Below, `play.example.com` is your DNS name and `you` is your admin user.
 
 ## 1. Point a DNS name at the server

@@ -13,6 +13,9 @@ pub struct ServerConfig {
     /// Address players connect to. Port 22 lets them type plain `ssh host`;
     /// `[::]` takes both IPv6 and IPv4 players.
     pub listen: SocketAddr,
+    /// Where `/healthz` and `/metrics` are answered, over HTTP; off when
+    /// unset. Keep it off the internet.
+    pub admin_listen: Option<SocketAddr>,
     /// The game's own SSH host key; created on first start. Never the
     /// machine's OpenSSH host key.
     pub host_key: PathBuf,
@@ -21,6 +24,11 @@ pub struct ServerConfig {
     pub database: String,
     /// Threads serving sessions; 0 means one per CPU core.
     pub workers: usize,
+    /// Load balancers that put a PROXY header (version 1 or 2) before each
+    /// connection, saying who the player really is: addresses, or networks
+    /// such as "10.0.0.0/8". Connections from them must have one; others
+    /// connect directly.
+    pub trusted_proxies: Vec<String>,
     /// Connections at once, in total and from one IP address.
     pub max_sessions: usize,
     pub max_sessions_per_ip: usize,
@@ -32,6 +40,9 @@ pub struct ServerConfig {
     /// Seconds a client may go without taking any screen updates before it's
     /// disconnected.
     pub stall_timeout_secs: u64,
+    /// When stopping: seconds players in a round may finish it, before
+    /// everyone is logged out. 0 logs everyone out at once.
+    pub drain_timeout_secs: u64,
     /// Servers that share rooms, friends and the queue. Without it, this
     /// server plays on its own.
     pub cluster: Option<ClusterConfig>,
@@ -44,14 +55,17 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "[::]:22".parse().unwrap(),
+            admin_listen: None,
             host_key: "/var/lib/snaketui/host_ed25519_key".into(),
             database: "sqlite:///var/lib/snaketui/snaketui.db".into(),
             workers: 0,
+            trusted_proxies: Vec::new(),
             max_sessions: 2000,
             max_sessions_per_ip: 10,
             login_timeout_secs: 30,
             idle_timeout_secs: 600,
             stall_timeout_secs: 20,
+            drain_timeout_secs: 200,
             cluster: None,
             room_seed: None,
         }
@@ -96,6 +110,7 @@ impl ServerConfig {
 
     /// Settings that parse but can't work together.
     pub fn check(&self) -> Result<()> {
+        crate::proxy::Trusted::parse(&self.trusted_proxies).context("in trusted_proxies")?;
         let Some(cluster) = &self.cluster else {
             return Ok(());
         };
@@ -137,6 +152,10 @@ impl ServerConfig {
 
     pub fn stall_timeout(&self) -> Duration {
         Duration::from_secs(self.stall_timeout_secs)
+    }
+
+    pub fn drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.drain_timeout_secs)
     }
 }
 

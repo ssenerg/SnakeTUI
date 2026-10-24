@@ -21,6 +21,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 
 use crate::rating::Rating;
+use crate::room::{RoomRef, ServerId};
 
 const SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS players (
@@ -90,6 +91,14 @@ CREATE TABLE IF NOT EXISTS name_locks (
     name  TEXT PRIMARY KEY,
     until INTEGER NOT NULL
 );
+-- In a cluster: private rooms' codes, and where each room runs.
+CREATE TABLE IF NOT EXISTS room_codes (
+    code       TEXT PRIMARY KEY,
+    server     INTEGER NOT NULL,
+    room       INTEGER NOT NULL,
+    renewed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS room_codes_server ON room_codes (server);
 ";
 
 /// The same tables as [`SQLITE_SCHEMA`], in Postgres's types.
@@ -157,6 +166,13 @@ CREATE TABLE IF NOT EXISTS name_locks (
     name  TEXT PRIMARY KEY,
     until BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS room_codes (
+    code       TEXT PRIMARY KEY,
+    server     BIGINT NOT NULL,
+    room       BIGINT NOT NULL,
+    renewed_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS room_codes_server ON room_codes (server);
 ";
 
 /// Servers starting together take turns creating the tables: this is the
@@ -293,6 +309,10 @@ async fn open_postgres(url: &str) -> Result<AnyPool> {
         .await?;
     let mut tx = pool.begin().await?;
     sqlx::query(SCHEMA_LOCK).execute(&mut *tx).await?;
+    // Not a notice for every table that's already there.
+    sqlx::query("SET LOCAL client_min_messages = warning")
+        .execute(&mut *tx)
+        .await?;
     sqlx::raw_sql(POSTGRES_SCHEMA).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(pool)
@@ -829,6 +849,73 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    // Private rooms' codes, in a cluster. Ids are stored bit for bit as
+    // signed numbers.
+
+    /// Keeps `code` for the room at `at`, unless a room renewed since
+    /// `fresh_since` has it. Answers whether it's now this room's.
+    pub async fn claim_code(
+        &self,
+        code: &str,
+        at: RoomRef,
+        now: i64,
+        fresh_since: i64,
+    ) -> Result<bool> {
+        sqlx::query("DELETE FROM room_codes WHERE code = $1 AND renewed_at <= $2")
+            .bind(code)
+            .bind(fresh_since)
+            .execute(&self.pool)
+            .await?;
+        let done = sqlx::query(
+            "INSERT INTO room_codes (code, server, room, renewed_at) VALUES ($1, $2, $3, $4)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(code)
+        .bind(at.server as i64)
+        .bind(at.room as i64)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// The room with `code`, if its server renewed it since `fresh_since`.
+    pub async fn find_code(&self, code: &str, fresh_since: i64) -> Result<Option<RoomRef>> {
+        let row =
+            sqlx::query("SELECT server, room FROM room_codes WHERE code = $1 AND renewed_at > $2")
+                .bind(code)
+                .bind(fresh_since)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|row| {
+            Ok(RoomRef {
+                server: row.try_get::<i64, _>(0)? as u64,
+                room: row.try_get::<i64, _>(1)? as u64,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn forget_code(&self, code: &str, at: RoomRef) -> Result<()> {
+        sqlx::query("DELETE FROM room_codes WHERE code = $1 AND server = $2 AND room = $3")
+            .bind(code)
+            .bind(at.server as i64)
+            .bind(at.room as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Notes that `server`'s rooms are all still open.
+    pub async fn renew_codes(&self, server: ServerId, now: i64) -> Result<()> {
+        sqlx::query("UPDATE room_codes SET renewed_at = $2 WHERE server = $1")
+            .bind(server as i64)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn account_from(row: &AnyRow) -> Result<Account> {
@@ -931,6 +1018,7 @@ mod tests {
         friendship_needs_both_sides,
         requests_waiting_for_an_answer_are_limited,
         limits_count_recent_events_and_tidy_away_old_ones,
+        room_codes_are_claimed_once_and_expire,
     );
 
     async fn sqlite() -> Store {
@@ -1132,6 +1220,32 @@ mod tests {
             store.request_friend(a.id, one_more.id).await.unwrap(),
             Requested::TooMany
         );
+    }
+
+    async fn room_codes_are_claimed_once_and_expire(store: Store) {
+        let at = |room| RoomRef {
+            server: u64::MAX - 1,
+            room,
+        };
+        assert!(store.claim_code("ABC234", at(1), 100, 0).await.unwrap());
+        assert!(
+            !store.claim_code("ABC234", at(2), 100, 0).await.unwrap(),
+            "taken"
+        );
+        assert_eq!(store.find_code("ABC234", 50).await.unwrap(), Some(at(1)));
+        // Not renewed lately: as good as gone, and free to claim.
+        assert_eq!(store.find_code("ABC234", 100).await.unwrap(), None);
+        store.renew_codes(u64::MAX - 1, 200).await.unwrap();
+        assert_eq!(store.find_code("ABC234", 150).await.unwrap(), Some(at(1)));
+        assert!(store.claim_code("ABC234", at(3), 300, 250).await.unwrap());
+        store.forget_code("ABC234", at(1)).await.unwrap();
+        assert_eq!(
+            store.find_code("ABC234", 0).await.unwrap(),
+            Some(at(3)),
+            "not room 1's any more"
+        );
+        store.forget_code("ABC234", at(3)).await.unwrap();
+        assert_eq!(store.find_code("ABC234", 0).await.unwrap(), None);
     }
 
     async fn limits_count_recent_events_and_tidy_away_old_ones(store: Store) {

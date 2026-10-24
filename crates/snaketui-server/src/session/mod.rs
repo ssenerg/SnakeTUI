@@ -23,7 +23,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use self::account::{JoinedRoom, PendingInvite};
-use crate::Shared;
 use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
 use crate::input::KeyParser;
@@ -31,8 +30,9 @@ use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{Dequeue, Enqueue, Matched};
 use crate::presence::Status;
-use crate::room::{RoomHandle, ViewRx};
+use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData};
+use crate::{Shared, Stopping};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
 /// make the server allocate huge screens.
@@ -209,6 +209,10 @@ pub struct SessionActor {
     stalled_since: Option<Instant>,
     shell_requested: bool,
     closing: bool,
+    /// The server is stopping: this player goes once they're not in a
+    /// round.
+    draining: bool,
+    leaving: Option<SpawnHandle>,
 }
 
 impl Actor for SessionActor {
@@ -217,15 +221,20 @@ impl Actor for SessionActor {
     fn started(&mut self, ctx: &mut Self::Context) {
         ctx.set_mailbox_capacity(MAILBOX);
         ctx.run_interval(IDLE_CHECK, |act, ctx| act.check_idle(ctx));
-        let mut shutdown = self.shared.shutdown.subscribe();
+        let mut stopping = self.shared.shutdown.subscribe();
         ctx.spawn(
             async move {
-                let _ = shutdown.wait_for(|stopping| *stopping).await;
+                let _ = stopping.wait_for(|s| *s >= Stopping::Draining).await;
+                stopping
             }
             .into_actor(self)
-            .map(|_, act, ctx| {
-                act.save_unfinished_game(ctx);
-                act.close(0, Some(SHUTTING_DOWN), ctx)
+            .map(|mut stopping, act, ctx| {
+                act.draining = true;
+                act.leave_if_free(ctx);
+                let now = async move {
+                    let _ = stopping.wait_for(|s| *s == Stopping::Now).await;
+                };
+                ctx.spawn(now.into_actor(act).map(|_, act, ctx| act.goodbye(ctx)));
             }),
         );
     }
@@ -274,6 +283,8 @@ impl SessionActor {
             stalled_since: None,
             shell_requested: false,
             closing: false,
+            draining: false,
+            leaving: None,
         }
     }
 
@@ -396,6 +407,7 @@ impl SessionActor {
         self.report_status();
         self.render(ctx);
         self.schedule_wake(ctx);
+        self.leave_if_free(ctx);
     }
 
     fn apply(&mut self, effects: Vec<Effect>, ctx: &mut Context<Self>) {
@@ -631,6 +643,7 @@ impl SessionActor {
                     }
                     act.report_status();
                     act.render(ctx);
+                    act.leave_if_free(ctx);
                 }),
         )
     }
@@ -814,6 +827,33 @@ impl SessionActor {
     }
 
     /// The game ends without the player quitting: keep the record it reached.
+    /// The server is stopping: keeps the game's record, and logs out.
+    fn goodbye(&mut self, ctx: &mut Context<Self>) {
+        self.save_unfinished_game(ctx);
+        self.close(0, Some(SHUTTING_DOWN), ctx);
+    }
+
+    /// While the server drains, players go as soon as they aren't in a
+    /// round, after a moment to see its results.
+    fn leave_if_free(&mut self, ctx: &mut Context<Self>) {
+        if !self.draining || self.closing || self.leaving.is_some() {
+            return;
+        }
+        let phase = self
+            .app
+            .as_ref()
+            .and_then(|a| a.online.as_ref())
+            .and_then(|o| o.room.as_ref())
+            .map(|r| &r.view.phase);
+        match phase {
+            Some(PhaseView::Countdown { .. } | PhaseView::Running { .. }) => {}
+            Some(PhaseView::Results { .. }) => {
+                self.leaving = Some(ctx.run_later(RESULTS_GRACE, |act, ctx| act.goodbye(ctx)));
+            }
+            _ => self.goodbye(ctx),
+        }
+    }
+
     fn save_unfinished_game(&mut self, ctx: &mut Context<Self>) {
         if let Some(app) = self.app.as_mut() {
             let effects: Vec<Effect> = app

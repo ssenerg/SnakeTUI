@@ -11,7 +11,11 @@ use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
 use crate::Shared;
+use crate::proxy::read_header;
 use crate::session::{Attach, Hangup, SessionActor};
+
+/// A trusted proxy has this long to send its PROXY header.
+const PROXY_HEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 use crate::ssh::ConnHandler;
 
 /// How many connections are open, in total and per IP address.
@@ -103,9 +107,16 @@ pub async fn accept_loop(
                 continue;
             }
         };
-        let Some(mut admission) = limits.admit(peer.ip()) else {
-            debug!(%peer, "too many connections; turned away");
-            continue;
+        let proxied = shared.proxies.contains(peer.ip());
+        // Through a proxy, the limits wait for the PROXY header's address.
+        let admission = if proxied {
+            None
+        } else {
+            let Some(admission) = limits.admit(peer.ip()) else {
+                debug!(%peer, "too many connections; turned away");
+                continue;
+            };
+            Some(admission)
         };
         // Moved to its worker as a plain socket, so that worker's thread
         // handles its I/O rather than this one.
@@ -118,11 +129,53 @@ pub async fn accept_loop(
             .min_by_key(|w| w.sessions.load(Ordering::Relaxed))
             .expect("at least one worker");
         worker.sessions.fetch_add(1, Ordering::Relaxed);
-        admission.worker = Some(Arc::clone(&worker.sessions));
-        worker
-            .arbiter
-            .spawn(serve(stream, peer, Arc::clone(&shared), admission));
+        let (shared, limits, sessions) = (
+            Arc::clone(&shared),
+            Arc::clone(&limits),
+            Arc::clone(&worker.sessions),
+        );
+        worker.arbiter.spawn(async move {
+            let admitted = match admission {
+                Some(admission) => Some((stream, peer, admission)),
+                None => through_proxy(stream, peer, &limits).await,
+            };
+            let Some((stream, peer, mut admission)) = admitted else {
+                sessions.fetch_sub(1, Ordering::Relaxed);
+                return;
+            };
+            admission.worker = Some(sessions);
+            serve(stream, peer, shared, admission).await;
+        });
     }
+}
+
+/// Reads the PROXY header a trusted proxy sends first, then admits the
+/// player it names. The proxy's own connections (health checks) are
+/// dropped.
+async fn through_proxy(
+    stream: std::net::TcpStream,
+    proxy: SocketAddr,
+    limits: &Arc<Limits>,
+) -> Option<(std::net::TcpStream, SocketAddr, Admission)> {
+    let mut stream = tokio::net::TcpStream::from_std(stream).ok()?;
+    let header = tokio::time::timeout(PROXY_HEADER_WAIT, read_header(&mut stream)).await;
+    let peer = match header {
+        Ok(Ok(Some(peer))) => SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) => {
+            debug!(%proxy, error = %e, "a bad PROXY header");
+            return None;
+        }
+        Err(_) => {
+            debug!(%proxy, "no PROXY header in time");
+            return None;
+        }
+    };
+    let Some(admission) = limits.admit(peer.ip()) else {
+        debug!(%peer, %proxy, "too many connections; turned away");
+        return None;
+    };
+    Some((stream.into_std().ok()?, peer, admission))
 }
 
 /// Runs one connection, on its worker's thread.

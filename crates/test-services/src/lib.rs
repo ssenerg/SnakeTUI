@@ -6,7 +6,7 @@
 //!
 //! To use servers you already run instead, set `SNAKETUI_TEST_POSTGRES` to
 //! the URL of a database whose user may create databases, and
-//! `SNAKETUI_TEST_NATS` to a NATS server with JetStream on.
+//! `SNAKETUI_TEST_NATS` to a NATS server.
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -70,16 +70,23 @@ pub async fn postgres() -> String {
     with_database(server, &name)
 }
 
-/// The URL of a NATS server with JetStream, shared by the whole test process.
+/// The URL of a NATS server, shared by the whole test process.
 /// Tests keep apart by using names of their own.
 pub fn nats() -> String {
     static SERVER: OnceLock<String> = OnceLock::new();
     SERVER
         .get_or_init(|| {
             std::env::var("SNAKETUI_TEST_NATS").unwrap_or_else(|_| {
-                let port = start(NATS_IMAGE, 4222, &[], &["-js"]);
+                // With a password, as a real cluster's NATS should have:
+                // one that needs escaping in the URL.
+                let port = start(
+                    NATS_IMAGE,
+                    4222,
+                    &[],
+                    &["--user", "snaketui", "--pass", "p@ss/w:rd"],
+                );
                 wait_for_nats(port);
-                format!("nats://127.0.0.1:{port}")
+                format!("nats://snaketui:p%40ss%2Fw%3Ard@127.0.0.1:{port}")
             })
         })
         .clone()

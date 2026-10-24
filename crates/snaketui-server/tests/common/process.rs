@@ -16,8 +16,8 @@ pub struct ServerProcess {
 
 impl ServerProcess {
     /// Starts a server whose `server.toml` is a port of its choosing, its
-    /// own host key and two workers, then `settings`. Wait for it with
-    /// [`Self::ready`], which learns the port.
+    /// own host key and two workers (unless `settings` say otherwise), then
+    /// `settings`. Wait for it with [`Self::ready`], which learns the port.
     pub fn spawn(settings: &str) -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -27,10 +27,15 @@ impl ServerProcess {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("server.toml");
+        let workers = if settings.contains("workers") {
+            ""
+        } else {
+            "workers = 2\n"
+        };
         std::fs::write(
             &config,
             format!(
-                "listen = \"127.0.0.1:0\"\nhost_key = \"{}\"\nworkers = 2\n{settings}",
+                "listen = \"127.0.0.1:0\"\nhost_key = \"{}\"\n{workers}{settings}",
                 dir.join("host_key").display()
             ),
         )
@@ -89,13 +94,20 @@ impl ServerProcess {
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.dir.join("log")).unwrap_or_default()
     }
+
+    /// Where health and metrics are, with `admin_listen` set.
+    pub fn admin(&self) -> Option<SocketAddr> {
+        address_in(&self.log(), "health and metrics over HTTP")
+    }
 }
 
 /// The address in the server's "serving SnakeTUI over SSH addr=..." line.
 fn listening_on(log: &str) -> Option<SocketAddr> {
-    let line = log
-        .lines()
-        .find(|l| l.contains("serving SnakeTUI over SSH"))?;
+    address_in(log, "serving SnakeTUI over SSH")
+}
+
+fn address_in(log: &str, line: &str) -> Option<SocketAddr> {
+    let line = log.lines().find(|l| l.contains(line))?;
     let at = line.find("addr=")? + "addr=".len();
     line[at..].split_whitespace().next()?.parse().ok()
 }

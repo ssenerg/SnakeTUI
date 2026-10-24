@@ -1,0 +1,97 @@
+# A SnakeTUI cluster on one machine, to try it out: two game servers
+# behind HAProxy, sharing Postgres, NATS and one matchmaker. From this
+# directory:
+#
+#   docker compose up --build -d
+#   ssh -p 2222 localhost
+#
+# Stop one server (docker compose stop game-a) and players move to the
+# other as they reconnect; rounds in play on it finish first.
+
+name: snaketui-cluster
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: snaketui
+      POSTGRES_PASSWORD: snaketui
+      POSTGRES_DB: snaketui
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "snaketui"]
+      interval: 2s
+      retries: 30
+
+  nats:
+    image: nats:2.12-alpine
+
+  # Makes the host key every server shares, once.
+  host-key:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: snaketui-cluster
+    command: ["--config", "/etc/snaketui/server.toml", "--make-host-key"]
+    volumes:
+      - host-key:/var/lib/snaketui/key
+      - ./server.toml:/etc/snaketui/server.toml:ro
+
+  game-a: &game
+    image: snaketui-cluster
+    command: ["--config", "/etc/snaketui/server.toml"]
+    networks:
+      - default
+      - front
+    volumes:
+      - host-key:/var/lib/snaketui/key
+      - ./server.toml:/etc/snaketui/server.toml:ro
+    depends_on:
+      host-key:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    # Rounds in play finish before a server stops (drain_timeout_secs).
+    stop_grace_period: 230s
+    restart: unless-stopped
+
+  game-b: *game
+
+  matchmaker:
+    image: snaketui-cluster
+    entrypoint: ["snaketui-matchmaker"]
+    command: ["--config", "/etc/snaketui/server.toml"]
+    volumes:
+      - ./server.toml:/etc/snaketui/server.toml:ro
+    depends_on:
+      - nats
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:3.2-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "2222:2222"
+    networks:
+      - front
+    depends_on:
+      - game-a
+      - game-b
+    restart: unless-stopped
+
+networks:
+  default:
+  # HAProxy and the game servers only. The servers trust PROXY headers from
+  # here; change the range if it clashes with a network you have.
+  front:
+    ipam:
+      config:
+        - subnet: 10.213.77.0/24
+
+volumes:
+  postgres:
+  host-key:

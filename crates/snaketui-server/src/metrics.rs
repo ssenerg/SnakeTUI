@@ -49,6 +49,26 @@ impl LagHistogram {
         None
     }
 
+    /// Samples whose bucket ends at or before `limit`.
+    pub fn at_or_under(&self, limit: Duration) -> u64 {
+        let whole = (limit.as_micros() as u64 / BUCKET_US).min(BUCKETS as u64) as usize;
+        self.buckets[..whole]
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Every sample added up, each taken as the middle of its bucket.
+    pub fn sum(&self) -> Duration {
+        let micros: u64 = self
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b.load(Ordering::Relaxed) * (i as u64 * BUCKET_US + BUCKET_US / 2))
+            .sum();
+        Duration::from_micros(micros)
+    }
+
     pub fn reset(&self) {
         for b in &self.buckets {
             b.store(0, Ordering::Relaxed);
@@ -79,6 +99,14 @@ mod tests {
         assert_eq!(lag.quantile(0.5), Some(Duration::from_micros(100)));
         assert_eq!(lag.quantile(0.99), Some(Duration::from_micros(3100)));
         assert_eq!(lag.quantile(1.0), Some(Duration::from_micros(50_100)));
+        assert_eq!(lag.at_or_under(Duration::from_millis(1)), 98);
+        assert_eq!(lag.at_or_under(Duration::from_millis(5)), 99);
+        assert_eq!(
+            lag.at_or_under(Duration::from_secs(9)),
+            99,
+            "2 s is past every bucket"
+        );
+        assert_eq!(lag.sum(), Duration::from_micros(98 * 50 + 3050 + 50_050));
         lag.reset();
         assert_eq!(lag.count(), 0);
     }

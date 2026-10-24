@@ -7,6 +7,11 @@
 # without IPv6.
 listen = "[::]:22"
 
+# Where /healthz and /metrics are answered, over plain HTTP, for a load
+# balancer's health checks and for Prometheus. Off unless set. Keep it off
+# the internet: use a private address, or 127.0.0.1.
+# admin_listen = "10.0.0.11:9022"
+
 # The game's own SSH host key, created on first start. Keep it across
 # reinstalls, or every player sees a "host key changed" warning.
 host_key = "/var/lib/snaketui/host_ed25519_key"
@@ -25,6 +30,13 @@ workers = 0
 max_sessions = 2000
 max_sessions_per_ip = 10
 
+# Load balancers, such as HAProxy, that put a PROXY header (version 1 or 2)
+# before each connection to say who the player really is, so the per-IP
+# limits count players rather than the balancer. Addresses, or networks
+# such as "10.0.0.0/24". Connections from them must send the header;
+# everyone else connects directly.
+trusted_proxies = []
+
 # Seconds a connection may take to sign in and open the game.
 login_timeout_secs = 30
 
@@ -35,11 +47,16 @@ idle_timeout_secs = 600
 # disconnected (it stopped reading, or its connection is stuck).
 stall_timeout_secs = 20
 
+# When the server stops: seconds players in a multiplayer round may finish
+# it. Everyone else is told the server is restarting, at once. Keep the
+# service's TimeoutStopSec above this. 0 logs everyone out at once.
+drain_timeout_secs = 200
+
 # Several servers working as one: players on any of them share private
 # rooms, see their friends online, invite them, and wait in one quick-play
 # queue. Each server needs the same Postgres database (above) and the same
-# NATS, with JetStream on, and one snaketui-matchmaker runs the queue for
-# them all. Leave this out on a server that plays on its own.
+# NATS, and one snaketui-matchmaker runs the queue for them all. See
+# CLUSTER.md. Leave this out on a server that plays on its own.
 #
 # [cluster]
 # nats = "nats://10.0.0.5:4222"

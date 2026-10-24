@@ -23,7 +23,8 @@ use crate::cluster::wire::{
 use crate::matcher::{Matcher, Ticket};
 use crate::rating::Rating;
 use crate::room::{
-    Presence, Rated, RatedMember, RatedNotify, Ratings, RoomActor, RoomHandle, RoomHost, ViewRx,
+    Drain, Presence, Rated, RatedMember, RatedNotify, Ratings, RoomActor, RoomHandle, RoomHost,
+    ViewRx,
 };
 use crate::store::{AccountId, Store};
 
@@ -94,6 +95,8 @@ pub struct MatchmakerActor {
     settings: RoundSettings,
     seed: Option<u64>,
     queue_len: watch::Sender<usize>,
+    /// The server is stopping: no new matches here.
+    draining: bool,
 }
 
 impl MatchmakerActor {
@@ -127,6 +130,7 @@ impl MatchmakerActor {
                 .expect("the quick-play board fits a full room"),
             seed,
             queue_len,
+            draining: false,
         }
     }
 
@@ -178,6 +182,9 @@ impl MatchmakerActor {
         let Queue::Here { matcher, epoch } = &mut self.queue else {
             return;
         };
+        if self.draining {
+            return;
+        }
         for group in matcher.run(epoch.elapsed()) {
             let waiters: Vec<Waiter> = group
                 .players
@@ -225,6 +232,9 @@ impl MatchmakerActor {
         let Queue::Cluster { cluster, .. } = &self.queue else {
             return None;
         };
+        if self.draining {
+            return None;
+        }
         let cluster = Arc::clone(cluster);
         let me = cluster.server;
         let id = self.host.new_id();
@@ -475,6 +485,14 @@ impl Handler<Enqueue> for MatchmakerActor {
             }
         }
         self.waiting.insert(waiter.who.id, waiter);
+    }
+}
+
+impl Handler<Drain> for MatchmakerActor {
+    type Result = ();
+
+    fn handle(&mut self, _: Drain, _: &mut Self::Context) {
+        self.draining = true;
     }
 }
 

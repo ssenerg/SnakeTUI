@@ -1,0 +1,18 @@
+# Settings for every server of the docker-compose cluster, and for its
+# matchmaker. See ../server.toml.example for all of them.
+
+# Inside the containers; HAProxy takes players on the host's port 2222.
+listen = "0.0.0.0:2222"
+# For HAProxy's health checks, and Prometheus.
+admin_listen = "0.0.0.0:9022"
+# One key, made once by the host-key service, for every server.
+host_key = "/var/lib/snaketui/key/host_ed25519_key"
+database = "postgres://snaketui:snaketui@postgres/snaketui"
+# The compose network HAProxy shares with the servers: it says who
+# players are.
+trusted_proxies = ["10.213.77.0/24"]
+
+[cluster]
+nats = "nats://nats:4222"
+name = "snaketui"
+region = "local"

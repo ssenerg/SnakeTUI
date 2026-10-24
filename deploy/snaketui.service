@@ -12,9 +12,11 @@ ExecStart=/usr/local/bin/snaketui-server --config /etc/snaketui/server.toml
 Environment=RUST_LOG=info
 Restart=always
 RestartSec=2
-# SIGTERM makes the server tell players it's restarting and close cleanly.
+# SIGTERM drains the server: players in a round finish it (up to
+# drain_timeout_secs, 200 by default), everyone else is told it's
+# restarting. Give it that long, and a little more.
 KillSignal=SIGTERM
-TimeoutStopSec=10
+TimeoutStopSec=230
 LimitNOFILE=65536
 
 # The only privilege it gets: listening on port 22.

@@ -1,34 +1,40 @@
 //! Private rooms: making them, and finding one by its code.
 //!
-//! In a cluster, codes are kept in NATS, so a code made on one server finds
-//! its room from any other.
+//! In a cluster, codes are kept in the shared database, so a code made on
+//! one server finds its room from any other.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use actix::prelude::*;
-use async_nats::jetstream::kv::CreateErrorKind;
+use std::time::Duration;
+
 use rand::RngExt;
 use snake_core::config::Rules;
 use snake_core::round::{RoomKind, Round, RoundSettings};
 use tracing::warn;
 
-use crate::cluster::wire::{decode, encode};
-use crate::cluster::{CODES_REFRESH, Cluster};
+use crate::cluster::Cluster;
 use crate::room::{RoomActor, RoomHandle, RoomHost, RoomRef};
+use crate::store::{Store, now};
 
 /// Codes use letters and digits that can't be mistaken for each other: no
 /// I, O, 0 or 1.
 const CODE_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 6;
-/// Codes tried before giving up, in case NATS keeps saying they're taken.
+/// Codes tried before giving up, in case they keep being taken.
 const CODE_TRIES: usize = 10;
+/// In a cluster, each server renews its codes this often. A code not
+/// renewed for [`CODES_MAX_AGE`] belongs to a server that's gone, and is
+/// free again.
+const CODES_REFRESH: Duration = Duration::from_secs(10 * 60);
+const CODES_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateError {
     /// Two snakes don't fit on a board with these rules.
     BoardTooSmall,
-    /// The cluster couldn't keep a code just now.
+    /// The cluster's database couldn't keep a code just now.
     Unavailable,
 }
 
@@ -55,15 +61,17 @@ pub struct RoomClosed(pub String);
 pub struct LobbyActor {
     host: Arc<RoomHost>,
     cluster: Option<Arc<Cluster>>,
+    store: Store,
     /// The rooms here, by code.
     rooms: HashMap<String, RoomHandle>,
 }
 
 impl LobbyActor {
-    pub fn new(host: Arc<RoomHost>, cluster: Option<Arc<Cluster>>) -> Self {
+    pub fn new(host: Arc<RoomHost>, cluster: Option<Arc<Cluster>>, store: Store) -> Self {
         Self {
             host,
             cluster,
+            store,
             rooms: HashMap::new(),
         }
     }
@@ -76,15 +84,20 @@ fn new_code() -> String {
         .collect()
 }
 
+/// Codes renewed after this are still in use.
+fn fresh_since() -> i64 {
+    now() - CODES_MAX_AGE.as_secs() as i64
+}
+
 /// A code no room in the cluster has, now kept for `at`.
-async fn claim_code(cluster: Arc<Cluster>, at: RoomRef) -> Result<String, CreateError> {
+async fn claim_code(store: Store, at: RoomRef) -> Result<String, CreateError> {
     for _ in 0..CODE_TRIES {
         let code = new_code();
-        match cluster.codes.create(&code, encode(&at)).await {
-            Ok(_) => return Ok(code),
-            Err(e) if e.kind() == CreateErrorKind::AlreadyExists => continue,
+        match store.claim_code(&code, at, now(), fresh_since()).await {
+            Ok(true) => return Ok(code),
+            Ok(false) => continue,
             Err(e) => {
-                warn!(error = %e, "couldn't keep a room code in NATS");
+                warn!(error = %e, "couldn't keep a room code");
                 return Err(CreateError::Unavailable);
             }
         }
@@ -96,23 +109,13 @@ impl Actor for LobbyActor {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        if self.cluster.is_some() {
-            // Codes of a server that died expire; live ones are written
-            // again before they would.
-            ctx.run_interval(CODES_REFRESH, |act, _| {
-                let Some(cluster) = act.cluster.clone() else {
-                    return;
-                };
-                let codes: Vec<(String, RoomRef)> = act
-                    .rooms
-                    .iter()
-                    .map(|(code, room)| (code.clone(), room.at()))
-                    .collect();
+        if let Some(cluster) = &self.cluster {
+            let server = cluster.server;
+            ctx.run_interval(CODES_REFRESH, move |act, _| {
+                let store = act.store.clone();
                 actix::spawn(async move {
-                    for (code, at) in codes {
-                        if let Err(e) = cluster.codes.put(&code, encode(&at)).await {
-                            warn!(error = %e, "couldn't renew a room code in NATS");
-                        }
+                    if let Err(e) = store.renew_codes(server, now()).await {
+                        warn!(error = %e, "couldn't renew this server's room codes");
                     }
                 });
             });
@@ -129,7 +132,7 @@ impl Handler<CreateRoom> for LobbyActor {
         };
         let id = self.host.new_id();
         let code: std::pin::Pin<Box<dyn Future<Output = _>>> = match &self.cluster {
-            Some(cluster) => Box::pin(claim_code(Arc::clone(cluster), self.host.at(id))),
+            Some(_) => Box::pin(claim_code(self.store.clone(), self.host.at(id))),
             None => {
                 let code = std::iter::repeat_with(new_code)
                     .find(|code| !self.rooms.contains_key(code))
@@ -165,9 +168,9 @@ impl Handler<FindRoom> for LobbyActor {
         let Some(cluster) = self.cluster.clone() else {
             return Box::pin(std::future::ready(None));
         };
+        let store = self.store.clone();
         Box::pin(async move {
-            let saved = cluster.codes.get(code).await.ok()??;
-            let at: RoomRef = decode(&saved)?;
+            let at = store.find_code(&code, fresh_since()).await.ok()??;
             // A room here would have been found above; one on a server
             // that has gone is gone too.
             (at.server != cluster.server && cluster.alive(at.server))
@@ -180,11 +183,14 @@ impl Handler<RoomClosed> for LobbyActor {
     type Result = ();
 
     fn handle(&mut self, RoomClosed(code): RoomClosed, _: &mut Self::Context) {
-        self.rooms.remove(&code);
-        if let Some(cluster) = self.cluster.clone() {
+        let Some(room) = self.rooms.remove(&code) else {
+            return;
+        };
+        if self.cluster.is_some() {
+            let store = self.store.clone();
             actix::spawn(async move {
-                if let Err(e) = cluster.codes.delete(&code).await {
-                    warn!(error = %e, "couldn't forget a room code in NATS");
+                if let Err(e) = store.forget_code(&code, room.at()).await {
+                    warn!(error = %e, "couldn't forget a room code");
                 }
             });
         }

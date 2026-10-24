@@ -16,7 +16,7 @@ use crate::rating::Rating;
 use crate::room::{RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -44,6 +44,8 @@ pub struct Alive {
     pub region: String,
     /// Players connected.
     pub load: u32,
+    /// Stopping: it takes no new matches.
+    pub draining: bool,
 }
 
 /// Twice a second, from the cluster's queue (`snaketui-matchmaker`). A new
@@ -169,6 +171,7 @@ mod tests {
             server: 9,
             region: "eu".into(),
             load: 3,
+            draining: false,
         };
         let mut bytes = encode(&alive()).to_vec();
         assert_eq!(decode(&bytes), Some(alive()));

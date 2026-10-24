@@ -5,8 +5,6 @@
 //!   servers, and its rooms close for players elsewhere.
 //! - A room runs on the server that made it. Players on other servers send
 //!   their keys there and get its views back (see [`rooms`]).
-//! - Private rooms' codes are kept in a NATS key-value bucket, so every
-//!   server can find them.
 //!
 //! Messages to send go through one queue, so they leave in order.
 
@@ -14,11 +12,11 @@ mod rooms;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv};
 use async_nats::{Client, ConnectOptions, Subscriber};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -44,10 +42,6 @@ const GATHER_WAIT: Duration = Duration::from_millis(500);
 const SWEEP_EVERY: Duration = Duration::from_millis(250);
 /// Messages waiting to be sent; more are dropped.
 const OUTBOX: usize = 1 << 16;
-/// Codes are written again this often, and the bucket forgets ones this
-/// much older, so codes of a server that died don't pile up.
-pub const CODES_REFRESH: Duration = Duration::from_secs(10 * 60);
-const CODES_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// How many players this server has, for choosing where matches go.
 pub type Load = Box<dyn Fn() -> u32 + Send + Sync>;
@@ -56,11 +50,12 @@ pub struct Cluster {
     pub server: ServerId,
     pub region: String,
     load: Load,
+    /// Stopping: other servers and the queue are told, so no new matches
+    /// come here.
+    draining: AtomicBool,
     /// The start of every subject: `snaketui.<cluster name>`.
     prefix: String,
     client: Client,
-    /// Private rooms' codes, each to a [`RoomRef`].
-    pub(crate) codes: kv::Store,
     /// When each other server last said it was alive.
     peers: Mutex<HashMap<ServerId, Instant>>,
     outbox: mpsc::Sender<(String, Bytes)>,
@@ -76,6 +71,26 @@ pub fn prefix(name: &str) -> String {
     format!("snaketui.{name}")
 }
 
+/// Options for connecting to the NATS at `url`, with the user and password
+/// (or token) the URL has, such as `nats://snaketui:PASSWORD@10.0.0.5`.
+/// async-nats reads the address from the URL but not those.
+pub fn nats_options(url: &str) -> Result<ConnectOptions> {
+    let addr: async_nats::ServerAddr = url.parse().context("cluster.nats isn't a NATS URL")?;
+    let decode = |part: &str| {
+        percent_encoding::percent_decode_str(part)
+            .decode_utf8()
+            .map(String::from)
+            .context("cluster.nats has a user or password that isn't UTF-8")
+    };
+    Ok(match (addr.username(), addr.password()) {
+        (Some(user), Some(pass)) => {
+            ConnectOptions::with_user_and_password(decode(user)?, decode(pass)?)
+        }
+        (Some(token), None) => ConnectOptions::with_token(decode(token)?),
+        _ => ConnectOptions::new(),
+    })
+}
+
 impl Cluster {
     /// Connects to NATS as `server`, and starts answering other servers
     /// about the rooms in `rooms`.
@@ -85,31 +100,20 @@ impl Cluster {
         rooms: LocalRooms,
         load: Load,
     ) -> Result<Arc<Self>> {
-        let client = ConnectOptions::new()
+        let client = nats_options(&cfg.nats)?
             .name(format!("snaketui-server {server:016x}"))
             .request_timeout(Some(REQUEST_TIMEOUT))
             .connect(&cfg.nats)
             .await
             .context("connecting to NATS")?;
-        let codes = jetstream::new(client.clone())
-            .create_or_update_key_value(kv::Config {
-                bucket: format!("snaketui_{}_codes", cfg.name),
-                description: "Private rooms' codes, each to the server and room".into(),
-                history: 1,
-                max_age: CODES_MAX_AGE,
-                storage: jetstream::stream::StorageType::File,
-                ..Default::default()
-            })
-            .await
-            .context("opening the room codes in NATS (is JetStream on?)")?;
         let (outbox, queued) = mpsc::channel(OUTBOX);
         let cluster = Arc::new(Self {
             server,
             region: cfg.region.clone(),
             load,
+            draining: AtomicBool::new(false),
             prefix: prefix(&cfg.name),
             client,
-            codes,
             peers: Mutex::default(),
             outbox,
             rooms,
@@ -210,6 +214,10 @@ impl Cluster {
         self.client.new_inbox()
     }
 
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
     /// Whether `server` has said it's alive lately. This server always is.
     pub fn alive(&self, server: ServerId) -> bool {
         server == self.server
@@ -276,6 +284,7 @@ impl Cluster {
                         server: self.server,
                         region: self.region.clone(),
                         load: (self.load)(),
+                        draining: self.draining.load(Ordering::Relaxed),
                     };
                     self.send(alive.clone(), &beat);
                 }

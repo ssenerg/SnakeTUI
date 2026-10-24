@@ -41,6 +41,10 @@ const MAILBOX: usize = 256;
 const MATCH_LINGER: Duration = Duration::from_secs(60);
 const BROKEN: &str = "Something went wrong in this room, so it closed. Sorry!";
 const MATCH_OVER: &str = "The match is over.";
+const DRAINED: &str = "This room's server is restarting. Reconnect to keep playing.";
+/// While the server drains: how long a finished round's results show
+/// before its players go.
+pub const RESULTS_GRACE: Duration = Duration::from_secs(5);
 
 /// A server in a cluster. A server on its own is 0.
 pub type ServerId = u64;
@@ -85,6 +89,15 @@ impl LocalRooms {
 
     pub fn len(&self) -> usize {
         self.0.lock().unwrap().len()
+    }
+
+    pub fn all(&self) -> Vec<Addr<RoomActor>> {
+        self.0
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(addr, _)| addr.clone())
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -301,6 +314,11 @@ pub struct Steer {
 #[rtype(result = "()")]
 pub struct Ready(pub PlayerId);
 
+/// The server is stopping: finish the round in play, if any, then close.
+#[derive(Clone, Copy, Message)]
+#[rtype(result = "()")]
+pub struct Drain;
+
 pub struct RoomActor {
     /// Its id, and the list of this server's rooms it leaves on closing.
     registered: Option<(RoomId, LocalRooms)>,
@@ -316,6 +334,9 @@ pub struct RoomActor {
     /// When the timer was meant to fire.
     due: Instant,
     over_since: Option<Instant>,
+    /// The server is stopping; the room closes once its round is over.
+    draining: bool,
+    closing_soon: bool,
 }
 
 impl Actor for RoomActor {
@@ -363,6 +384,8 @@ impl RoomActor {
             last: now,
             due: now,
             over_since: None,
+            draining: false,
+            closing_soon: false,
         };
         (room, rx)
     }
@@ -391,6 +414,10 @@ impl RoomActor {
         self.publish();
         if self.round.is_empty() {
             return ctx.stop();
+        }
+        if self.draining && !self.round.in_play() && !self.closing_soon {
+            self.closing_soon = true;
+            ctx.run_later(RESULTS_GRACE, |act, ctx| act.close(DRAINED, ctx));
         }
         if self.round.settings.kind == RoomKind::Match
             && matches!(self.view.borrow().phase, PhaseView::Results { .. })
@@ -555,6 +582,17 @@ impl Handler<Steer> for RoomActor {
 
     fn handle(&mut self, msg: Steer, ctx: &mut Self::Context) {
         self.guarded(ctx, |round| round.steer(msg.id, msg.dir));
+    }
+}
+
+impl Handler<Drain> for RoomActor {
+    type Result = ();
+
+    fn handle(&mut self, _: Drain, ctx: &mut Self::Context) {
+        self.draining = true;
+        if !self.round.in_play() {
+            self.close(DRAINED, ctx);
+        }
     }
 }
 

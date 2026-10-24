@@ -217,7 +217,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83a251fa1a4c9d0fe6e816b7acd60549e473e08d14f27a1d992c2675abff05f"
 dependencies = [
  "aws-lc-rs",
- "base64",
  "bytes",
  "futures-util",
  "memchr",
@@ -230,17 +229,14 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
- "serde_nanos",
  "serde_repr",
  "thiserror 2.0.18",
- "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tokio-websockets",
  "tracing",
- "tryhard",
  "url",
 ]
 
@@ -955,9 +951,6 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
-dependencies = [
- "serde_core",
-]
 
 [[package]]
 name = "derive_more"
@@ -3178,15 +3171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_nanos"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a93142f0367a4cc53ae0fead1bcda39e85beccfad3dcd717656cacab94b12985"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3390,6 +3374,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snaketui-loadbot"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "russh",
+ "tokio",
+]
+
+[[package]]
 name = "snaketui-server"
 version = "0.1.2"
 dependencies = [
@@ -3401,6 +3396,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "percent-encoding",
  "postcard",
  "rand 0.10.2",
  "ratatui",
@@ -3409,6 +3405,7 @@ dependencies = [
  "skillratings",
  "snake-core",
  "snake-tui",
+ "snaketui-loadbot",
  "snaketui-test-services",
  "sqlx",
  "tokio",
@@ -3941,7 +3938,6 @@ dependencies = [
  "powerfmt",
  "serde_core",
  "time-core",
- "time-macros",
 ]
 
 [[package]]
@@ -3949,16 +3945,6 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
-
-[[package]]
-name = "time-macros"
-version = "0.2.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
-dependencies = [
- "num-conv",
- "time-core",
-]
 
 [[package]]
 name = "tinystr"
@@ -4180,16 +4166,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tryhard"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fe58ebd5edd976e0fe0f8a14d2a04b7c81ef153ea9a54eebc42e67c2c23b4e5"
-dependencies = [
- "pin-project-lite",
- "tokio",
 ]
 
 [[package]]

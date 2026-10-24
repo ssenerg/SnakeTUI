@@ -78,7 +78,8 @@ jobs:
         with:
           files: ${{ env.ASSET }}
 
-      # The SSH server, with what deploy/INSTALL.md needs next to it.
+      # The SSH server and the matchmaker, with what deploy/INSTALL.md and
+      # deploy/CLUSTER.md need next to them.
       - name: Build server
         if: contains(matrix.target, 'linux')
         run: cargo build --release --locked --target ${{ matrix.target }} -p snaketui-server
@@ -90,7 +91,8 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/snaketui-server" \
             "target/${{ matrix.target }}/release/snaketui-matchmaker" \
-            deploy/INSTALL.md deploy/server.toml.example deploy/snaketui.service "$name/"
+            deploy/INSTALL.md deploy/CLUSTER.md deploy/server.toml.example \
+            deploy/snaketui.service deploy/snaketui-matchmaker.service "$name/"
           tar czf "$name.tar.gz" "$name"
           echo "SERVER_ASSET=$name.tar.gz" >> "$GITHUB_ENV"
 

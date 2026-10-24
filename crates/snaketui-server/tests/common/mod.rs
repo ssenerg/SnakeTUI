@@ -26,6 +26,8 @@ use tokio::time::{Instant, timeout};
 /// A server on `127.0.0.1:<free port>` with its own host key and database.
 pub struct TestServer {
     pub addr: SocketAddr,
+    /// Health and metrics, over HTTP.
+    pub admin: SocketAddr,
     pub dir: PathBuf,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -50,11 +52,15 @@ impl TestServer {
     pub fn in_dir(dir: PathBuf, tweak: impl FnOnce(&mut ServerConfig)) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let admin_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let admin = admin_listener.local_addr().unwrap();
         let mut cfg = ServerConfig {
             listen: addr,
             host_key: dir.join("host_key"),
             database: format!("sqlite://{}", dir.join("db.sqlite").display()),
             workers: 2,
+            // Tests that stop servers mid-round would wait for it.
+            drain_timeout_secs: 0,
             ..ServerConfig::default()
         };
         tweak(&mut cfg);
@@ -65,11 +71,18 @@ impl TestServer {
                 let _ = stopped.await;
             };
             actix_rt::System::new()
-                .block_on(serve(cfg, listener, host_key, until_stopped))
+                .block_on(serve(
+                    cfg,
+                    listener,
+                    Some(admin_listener),
+                    host_key,
+                    until_stopped,
+                ))
                 .unwrap();
         });
         Self {
             addr,
+            admin,
             dir,
             stop: Some(stop),
             thread: Some(thread),
@@ -280,6 +293,19 @@ impl Player {
             .await;
         self.exit_status
     }
+}
+
+/// `GET path` from a server's admin port: the status code and the body.
+pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: snaketui\r\n\r\n");
+    conn.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    conn.read_to_string(&mut response).await.unwrap();
+    let status = response[9..12].parse().unwrap();
+    let body = response.split_once("\r\n\r\n").unwrap().1.to_string();
+    (status, body)
 }
 
 pub const ENTER: &[u8] = b"\r";

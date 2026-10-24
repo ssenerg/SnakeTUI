@@ -4,16 +4,18 @@ description = "Serves SnakeTUI over SSH: the game is the SSH server"
 version.workspace = true
 edition.workspace = true
 publish = false
+default-run = "snaketui-server"
 
 [dependencies]
 actix = "0.13.5"
 actix-rt = "2.15"
 anyhow.workspace = true
 argon2 = "0.6.0"
-async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs", "kv"] }
+async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
+percent-encoding = "2.3.2"
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 rand.workspace = true
 ratatui.workspace = true
@@ -36,5 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9.1"
 
 [dev-dependencies]
+snaketui-loadbot = { path = "../loadbot" }
 snaketui-test-services = { path = "../test-services" }
 vt100 = "0.18.1"

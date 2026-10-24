@@ -6,6 +6,7 @@
 //! threads (actix arbiters); its SSH I/O runs on the same thread.
 
 pub mod accept;
+pub mod admin;
 pub mod auth;
 pub mod backend;
 pub mod cluster;
@@ -17,6 +18,7 @@ pub mod matcher;
 pub mod matchmaker;
 pub mod metrics;
 pub mod presence;
+pub mod proxy;
 pub mod queue_service;
 pub mod rating;
 pub mod room;
@@ -44,7 +46,8 @@ use crate::lobby::LobbyActor;
 use crate::matchmaker::MatchmakerActor;
 use crate::metrics::TICK_LAG;
 use crate::presence::PresenceActor;
-use crate::room::{LocalRooms, RoomHandle, RoomHost, RoomRef, ServerId};
+use crate::proxy::Trusted;
+use crate::room::{Drain, LocalRooms, RoomHandle, RoomHost, RoomRef, ServerId};
 use crate::store::Store;
 
 /// Threads that run rooms, the lobby and the matchmaker.
@@ -53,14 +56,16 @@ const ROOM_THREADS: usize = 2;
 /// What every session can reach.
 pub struct Shared {
     pub cfg: ServerConfig,
+    /// Proxies whose connections start with a PROXY header.
+    pub proxies: Trusted,
     /// This server, among those sharing rooms; 0 for a server on its own.
     pub server: ServerId,
     pub rooms: LocalRooms,
     pub cluster: Option<Arc<Cluster>>,
     pub ssh: Arc<russh::server::Config>,
     pub store: Store,
-    /// Becomes `true` when the server is shutting down.
-    pub shutdown: watch::Sender<bool>,
+    /// How far along stopping the server is.
+    pub shutdown: watch::Sender<Stopping>,
     pub lobby: Addr<LobbyActor>,
     pub matchmaker: Addr<MatchmakerActor>,
     pub presence: Addr<PresenceActor>,
@@ -88,6 +93,16 @@ impl Shared {
     }
 }
 
+/// Stopping, step by step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stopping {
+    No,
+    /// No new players or matches; rounds in play finish.
+    Draining,
+    /// Everyone is logged out.
+    Now,
+}
+
 /// How long sessions get to say goodbye when the server stops.
 const GOODBYE: Duration = Duration::from_secs(3);
 
@@ -96,6 +111,7 @@ const GOODBYE: Duration = Duration::from_secs(3);
 pub async fn serve(
     cfg: ServerConfig,
     listener: std::net::TcpListener,
+    admin: Option<std::net::TcpListener>,
     host_key: PrivateKey,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
@@ -120,8 +136,8 @@ pub async fn serve(
     ));
     let lobby = LobbyActor::start_in_arbiter(&room_arbiters[0].handle(), {
         let host = Arc::clone(&host);
-        let cluster = cluster.clone();
-        move |_| LobbyActor::new(host, cluster)
+        let (cluster, store) = (cluster.clone(), store.clone());
+        move |_| LobbyActor::new(host, cluster, store)
     });
     let presence = PresenceActor::start_in_arbiter(&room_arbiters[0].handle(), {
         let cluster = cluster.clone();
@@ -145,12 +161,13 @@ pub async fn serve(
     let guesses = GuessLimits::new(store.clone());
     let shared = Arc::new(Shared {
         ssh: Arc::new(ssh::config(host_key)),
+        proxies: Trusted::parse(&cfg.trusted_proxies)?,
         cfg,
         server,
         rooms,
         cluster: cluster.clone(),
         store,
-        shutdown: watch::channel(false).0,
+        shutdown: watch::channel(Stopping::No).0,
         lobby,
         matchmaker,
         presence,
@@ -185,6 +202,16 @@ pub async fn serve(
         workers = arbiters.len(),
         "serving SnakeTUI over SSH"
     );
+    let answering = match admin {
+        Some(admin) => {
+            admin.set_nonblocking(true)?;
+            let admin = tokio::net::TcpListener::from_std(admin)?;
+            info!(addr = %admin.local_addr()?, "health and metrics over HTTP");
+            let serving = admin::serve_admin(admin, Arc::clone(&shared), Arc::clone(&limits));
+            Some(actix_rt::spawn(serving))
+        }
+        None => None,
+    };
     let accepting = actix_rt::spawn(accept::accept_loop(
         listener,
         workers,
@@ -193,13 +220,36 @@ pub async fn serve(
     ));
 
     stop.await;
-    info!(players = limits.open(), "shutting down");
     accepting.abort();
     tidying.abort();
-    shared.shutdown.send_replace(true);
+    let drain = shared.cfg.drain_timeout();
+    if !drain.is_zero() {
+        info!(
+            players = limits.open(),
+            rooms = shared.rooms.len(),
+            "draining: rounds in play finish first"
+        );
+        shared.shutdown.send_replace(Stopping::Draining);
+        if let Some(cluster) = &shared.cluster {
+            cluster.set_draining();
+        }
+        shared.matchmaker.do_send(Drain);
+        for room in shared.rooms.all() {
+            room.do_send(Drain);
+        }
+        let deadline = Instant::now() + drain;
+        while (limits.open() > 0 || !shared.rooms.is_empty()) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    info!(players = limits.open(), "shutting down");
+    shared.shutdown.send_replace(Stopping::Now);
     let deadline = Instant::now() + GOODBYE;
     while limits.open() > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(answering) = answering {
+        answering.abort();
     }
     for arbiter in arbiters.into_iter().chain(room_arbiters) {
         arbiter.stop();

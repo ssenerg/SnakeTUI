@@ -1,0 +1,11 @@
+# The image's settings: everything else is at its default (see
+# ../server.toml.example). To change them, mount your own file at
+# /etc/snaketui/server.toml.
+
+# docker-compose.yml publishes these on the host.
+listen = "0.0.0.0:2222"
+admin_listen = "0.0.0.0:9022"
+
+# Both in the volume at /var/lib/snaketui: keep it.
+host_key = "/var/lib/snaketui/host_ed25519_key"
+database = "sqlite:///var/lib/snaketui/snaketui.db"

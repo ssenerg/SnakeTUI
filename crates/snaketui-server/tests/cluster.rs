@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -65,9 +66,9 @@ async fn a_username_locked_on_one_server_is_locked_on_all() {
 }
 
 /// Servers in one cluster, one in each of `regions`, with a database and
-/// NATS names of their own. Also gives settings a matchmaker for the
-/// cluster can use.
-async fn cluster_in(regions: &[&str]) -> (Vec<ServerProcess>, String) {
+/// NATS names of their own, and `extra` settings. Also gives settings a
+/// matchmaker for the cluster can use.
+async fn cluster_in(regions: &[&str], extra: &str) -> (Vec<ServerProcess>, String) {
     static N: AtomicU32 = AtomicU32::new(0);
     let db = snaketui_test_services::postgres().await;
     let nats = snaketui_test_services::nats();
@@ -78,7 +79,7 @@ async fn cluster_in(regions: &[&str]) -> (Vec<ServerProcess>, String) {
     );
     let settings = |region: &str| {
         format!(
-            "database = \"{db}\"\n\n[cluster]\nnats = \"{nats}\"\nname = \"{name}\"\nregion = \"{region}\"\n"
+            "database = \"{db}\"\n{extra}\n[cluster]\nnats = \"{nats}\"\nname = \"{name}\"\nregion = \"{region}\"\n"
         )
     };
     let mut servers: Vec<ServerProcess> = regions
@@ -95,7 +96,7 @@ async fn cluster_in(regions: &[&str]) -> (Vec<ServerProcess>, String) {
 
 /// `n` servers in one cluster and one region.
 async fn cluster(n: usize) -> Vec<ServerProcess> {
-    cluster_in(&vec!["local"; n]).await.0
+    cluster_in(&vec!["local"; n], "").await.0
 }
 
 /// Queues a guest from a fresh home menu.
@@ -215,7 +216,7 @@ async fn friends_on_different_servers_see_each_other_and_play_together() {
 
 #[tokio::test]
 async fn quick_play_matches_within_a_region_first_then_across_regions() {
-    let (servers, settings) = cluster_in(&["eu", "eu", "us"]).await;
+    let (servers, settings) = cluster_in(&["eu", "eu", "us"], "").await;
     // Five times faster: matches fill for 2 s, and regions open after 4 s.
     let _queue = MatchmakerProcess::start(&settings, 5.0);
     let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
@@ -251,7 +252,7 @@ async fn quick_play_matches_within_a_region_first_then_across_regions() {
 
 #[tokio::test]
 async fn a_restarted_matchmaker_loses_no_waiting_players() {
-    let (servers, settings) = cluster_in(&["eu", "eu"]).await;
+    let (servers, settings) = cluster_in(&["eu", "eu"], "").await;
     let mut queue = MatchmakerProcess::start(&settings, 1.0);
     let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
     let mut ben = guest(servers[1].addr, "ben", 100, 30).await;
@@ -277,7 +278,7 @@ async fn a_restarted_matchmaker_loses_no_waiting_players() {
 
 #[tokio::test]
 async fn a_match_across_servers_counts_for_both_players() {
-    let (servers, settings) = cluster_in(&["eu", "eu"]).await;
+    let (servers, settings) = cluster_in(&["eu", "eu"], "").await;
     let _queue = MatchmakerProcess::start(&settings, 5.0);
     let (mut ann, _) = signed_up(servers[0].addr, "ann").await;
     let (mut ben, _) = signed_up(servers[1].addr, "ben").await;
@@ -299,4 +300,96 @@ async fn a_match_across_servers_counts_for_both_players() {
         pick(p, QUICK_PLAY, ACCOUNT).await;
         p.wait_for("1 games").await;
     }
+}
+
+/// Every server's tick-lag histogram, added up: bucket bound to count.
+async fn tick_lag(admins: &[SocketAddr]) -> Vec<(String, u64)> {
+    let mut total: Vec<(String, u64)> = Vec::new();
+    for &admin in admins {
+        let (_, metrics) = http_get(admin, "/metrics").await;
+        for (i, line) in metrics
+            .lines()
+            .filter_map(|l| l.strip_prefix("snaketui_tick_lag_seconds_bucket{le=\""))
+            .enumerate()
+        {
+            let (bound, n) = line.split_once("\"} ").unwrap();
+            let n: u64 = n.parse().unwrap();
+            match total.get_mut(i) {
+                Some((_, sum)) => *sum += n,
+                None => total.push((bound.to_string(), n)),
+            }
+        }
+    }
+    total
+}
+
+/// The bucket bound, in seconds, that a share `q` of the ticks between
+/// `before` and `after` came in under.
+fn lag_quantile(before: &[(String, u64)], after: &[(String, u64)], q: f64) -> f64 {
+    let deltas: Vec<(&str, u64)> = before
+        .iter()
+        .zip(after)
+        .map(|((bound, b), (_, a))| (bound.as_str(), a - b))
+        .collect();
+    let total = deltas.last().unwrap().1;
+    let want = (total as f64 * q).ceil() as u64;
+    deltas
+        .iter()
+        .find(|(_, n)| *n >= want)
+        .map_or(f64::INFINITY, |(bound, _)| bound.parse().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a load check with 5,000 bots; run it on its own, in a release build"]
+async fn five_thousand_players_on_two_servers() {
+    const PLAYERS: usize = 5000;
+    snaketui_loadbot::raise_open_files();
+    let extra = "workers = 0\nmax_sessions = 4000\nmax_sessions_per_ip = 10000\n\
+                 admin_listen = \"127.0.0.1:0\"\n";
+    let (servers, settings) = cluster_in(&["local", "local"], extra).await;
+    let _queue = MatchmakerProcess::start(&settings, 1.0);
+    let admins: Vec<SocketAddr> = servers.iter().map(|s| s.admin().unwrap()).collect();
+    let stats = snaketui_loadbot::start(snaketui_loadbot::Settings {
+        servers: servers.iter().map(|s| s.addr).collect(),
+        players: PLAYERS,
+        ramp: Duration::from_secs(60),
+    });
+    let ramping = Instant::now();
+    while stats.playing.load(Ordering::Relaxed) < PLAYERS * 99 / 100 {
+        let playing = stats.playing.load(Ordering::Relaxed);
+        assert!(
+            ramping.elapsed() < Duration::from_secs(150),
+            "only {playing} of {PLAYERS} got in"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Let matches form, then measure for half a minute.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let before = tick_lag(&admins).await;
+    let bytes = stats.bytes.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let after = tick_lag(&admins).await;
+    let sent = stats.bytes.load(Ordering::Relaxed) - bytes;
+    let mut rooms = 0;
+    for &admin in &admins {
+        let (_, metrics) = http_get(admin, "/metrics").await;
+        rooms += metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("snaketui_rooms "))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+    }
+    let ticks = after.last().unwrap().1 - before.last().unwrap().1;
+    let p99 = lag_quantile(&before, &after, 0.99);
+    eprintln!(
+        "{} players on 2 servers, {rooms} rooms: {ticks} room ticks in 30 s, \
+         lag p50 under {} s, p99 under {p99} s; {} KiB/s to players; {} failures",
+        stats.playing.load(Ordering::Relaxed),
+        lag_quantile(&before, &after, 0.5),
+        sent / 1024 / 30,
+        stats.failures.load(Ordering::Relaxed),
+    );
+    assert!(ticks > 0);
+    assert!(p99 <= 0.01, "rooms fell behind: p99 over {p99} s");
 }
