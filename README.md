@@ -5,9 +5,13 @@ A highly configurable snake game for your terminal, built in Rust with
 
 ## Features
 
-- **Responsive controls** — direction keys move the snake immediately, ahead of
-  the tick timer. Press an arrow three times within one tick and the snake
-  moves three times.
+- **Two move timings**
+  - `instant` — direction keys move the snake immediately, ahead of the tick
+    timer. Press an arrow three times within one tick and the snake moves
+    three times.
+  - `on tick` — the snake moves only on the tick. Keys pressed in between are
+    queued (up to three) and used one per tick, so a quick up-then-left still
+    turns twice.
 - **Three edge-wall modes**
   - `solid` — the board is enclosed; hitting the border ends the game
   - `none (wrap)` — the snake wraps around to the opposite side
@@ -83,6 +87,7 @@ Letter keys work the same with Shift or Caps Lock on.
 | inner walls | Amount of randomly generated interior walls |
 | food / super food / poison spawns every | Spawn interval per item type (`off` disables) |
 | food / super food / poison lifetime | Seconds before an uneaten item disappears (`off` = forever) |
+| move timing | `instant` (a key moves the snake right away) or `on tick` (keys queue up, one per tick) |
 | growth mode | `instant` or `when food reaches tail` |
 | pass through self | If `yes`, the snake can cross its own body |
 | super food growth | Length gained from super food |
@@ -103,6 +108,7 @@ Everything lives in `~/.snaketui/`:
 | `records` | Best length per gameplay-configuration combination |
 
 Colors are cosmetic and don't affect which record a game counts toward.
+On-tick games keep records separate from instant ones.
 
 ## Development
 
@@ -111,7 +117,7 @@ The code is a Cargo workspace:
 | Crate | What's in it |
 | --- | --- |
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
-| `crates/snake-core` | Game rules: board generation, snake, food, settings, records. No terminal or file access |
+| `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), settings, records. No terminal or file access |
 | `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
 
 ```sh

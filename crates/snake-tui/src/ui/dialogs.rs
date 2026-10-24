@@ -3,7 +3,7 @@ use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
-use snake_core::game::GameOverReason;
+use snake_core::solo::GameOverReason;
 
 use super::dialog;
 use crate::app::App;
@@ -49,7 +49,7 @@ pub fn draw_game_over(frame: &mut Frame, app: &App, new_record: bool) {
     let inner = dialog(frame, title, color, 46, 11);
 
     let dim = Style::default().fg(Color::DarkGray);
-    let secs = game.clock.as_secs();
+    let secs = game.clock().as_secs();
     let mut lines = vec![
         Line::default(),
         Line::from(reason).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),

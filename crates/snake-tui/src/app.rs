@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use ratatui::layout::Size;
 use snake_core::config::GameConfig;
-use snake_core::game::Game;
 use snake_core::geom::Direction;
 use snake_core::records::Records;
 use snake_core::settings::SETTINGS;
+use snake_core::solo::SoloGame;
 
 use crate::key::Key;
 use crate::ui;
@@ -32,7 +32,7 @@ pub enum Effect {
 pub struct App {
     pub cfg: GameConfig,
     pub selected: usize,
-    pub game: Option<Game>,
+    pub game: Option<SoloGame>,
     pub records: Records,
     pub record: u32,
     pub screen: Screen,
@@ -76,7 +76,7 @@ impl App {
             && self
                 .game
                 .as_ref()
-                .is_some_and(|g| !ui::board_fits(g, self.size))
+                .is_some_and(|g| !ui::board_fits(g.world.width, g.world.height, self.size))
         {
             self.screen = Screen::Paused { selected: 0 };
         }
@@ -98,9 +98,9 @@ impl App {
     }
 
     fn start_game(&mut self, effects: &mut Vec<Effect>) {
-        if let Ok(game) = Game::new(self.cfg.rules.clone()) {
+        if let Ok(game) = SoloGame::new(self.cfg.rules.clone()) {
             effects.push(Effect::SaveConfig);
-            self.record = self.records.get(&game.rules.record_key());
+            self.record = self.records.get(&game.rules().record_key());
             self.game = Some(game);
             self.screen = Screen::Playing;
             self.pause_if_hidden();
@@ -110,7 +110,7 @@ impl App {
     fn save_record(&mut self, effects: &mut Vec<Effect>) -> bool {
         let Some(game) = &self.game else { return false };
         let len = game.len() as u32;
-        let new_record = self.records.update(&game.rules.record_key(), len);
+        let new_record = self.records.update(&game.rules().record_key(), len);
         if new_record {
             effects.push(Effect::SaveRecords);
         }

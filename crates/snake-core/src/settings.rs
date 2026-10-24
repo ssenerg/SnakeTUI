@@ -2,8 +2,8 @@
 //! it's shown in, how it's adjusted, and how it's saved as `key=value` text.
 
 use crate::config::{
-    COLOR_NAMES, ColorSlot, GLYPHS, GameConfig, GrowthMode, IconSlot, InnerWalls, WallMode,
-    color_name, glyph_name,
+    COLOR_NAMES, ColorSlot, GLYPHS, GameConfig, GrowthMode, IconSlot, InnerWalls, MoveTiming,
+    WallMode, color_name, glyph_name,
 };
 
 #[derive(Clone, Copy)]
@@ -219,6 +219,17 @@ pub const SETTINGS: &[Setting] = &[
             max: 120,
             step: 1,
             fmt: NumFmt::SecsOrOff,
+        },
+    },
+    Setting {
+        label: "move timing",
+        key: "move_timing",
+        section: Section::Gameplay,
+        kind: Kind::Choice {
+            get: |c| c.rules.move_timing.index(),
+            set: |c, i| c.rules.move_timing = MoveTiming::ALL[i],
+            saved: &MoveTiming::LABELS,
+            shown: &MoveTiming::DISPLAY,
         },
     },
     Setting {

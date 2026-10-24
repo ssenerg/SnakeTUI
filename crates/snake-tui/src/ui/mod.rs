@@ -1,3 +1,4 @@
+mod board;
 mod dialogs;
 mod game;
 mod menu;
@@ -9,6 +10,7 @@ use ratatui::widgets::{Block, BorderType, Clear};
 
 use crate::app::{App, Screen};
 
+pub use board::BoardWidget;
 pub use game::board_fits;
 
 pub fn draw(frame: &mut Frame, app: &App) {

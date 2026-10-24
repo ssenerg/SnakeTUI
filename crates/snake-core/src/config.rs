@@ -134,6 +134,25 @@ impl GrowthMode {
     }
 }
 
+/// When a direction key moves the snake.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveTiming {
+    /// Right away, ahead of the tick timer.
+    Instant,
+    /// On the next tick; keys pressed in between are queued.
+    OnTick,
+}
+
+impl MoveTiming {
+    pub const ALL: [MoveTiming; 2] = [MoveTiming::Instant, MoveTiming::OnTick];
+    pub(crate) const LABELS: [&'static str; 2] = ["instant", "tick"];
+    pub(crate) const DISPLAY: [&'static str; 2] = ["instant", "on tick"];
+
+    pub(crate) fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ColorSlot {
     Head,
@@ -186,6 +205,7 @@ pub struct Rules {
     pub pass_through_self: bool,
     pub super_growth: u32,
     pub boost_duration_s: u64,
+    pub move_timing: MoveTiming,
 }
 
 impl Default for Rules {
@@ -206,15 +226,17 @@ impl Default for Rules {
             pass_through_self: false,
             super_growth: 3,
             boost_duration_s: 5,
+            move_timing: MoveTiming::Instant,
         }
     }
 }
 
 impl Rules {
     /// Identifies these rules in the records file. The format is stored on
-    /// disk, so changing it orphans existing records.
+    /// disk, so changing it orphans existing records. Settings added later
+    /// are appended only when they differ from the old behaviour.
     pub fn record_key(&self) -> String {
-        format!(
+        let mut key = format!(
             "size:{}x{} tick:{} edge:{} inner:{} food:{}/{} super:{}/{} poison:{}/{} growth:{} ghost:{} supergrow:{} boost:{}",
             self.width,
             self.height,
@@ -231,7 +253,11 @@ impl Rules {
             self.pass_through_self,
             self.super_growth,
             self.boost_duration_s,
-        )
+        );
+        if self.move_timing == MoveTiming::OnTick {
+            key.push_str(" timing:tick");
+        }
+        key
     }
 }
 
@@ -281,6 +307,18 @@ mod tests {
             Rules::default().record_key(),
             "size:30x20 tick:150 edge:full_edge_wall inner:off food:3/15 super:20/8 \
              poison:15/12 growth:instant ghost:false supergrow:3 boost:5"
+        );
+    }
+
+    #[test]
+    fn on_tick_games_have_their_own_records() {
+        let on_tick = Rules {
+            move_timing: MoveTiming::OnTick,
+            ..Rules::default()
+        };
+        assert_eq!(
+            on_tick.record_key(),
+            Rules::default().record_key() + " timing:tick"
         );
     }
 }

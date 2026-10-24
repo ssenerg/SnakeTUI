@@ -1,28 +1,26 @@
-use std::borrow::Cow;
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
-use snake_core::config::{ColorSlot, IconSlot, Theme};
-use snake_core::game::{FoodKind, Game};
+use snake_core::solo::SoloGame;
 
+use super::board::BoardWidget;
 use super::centered_rect;
 use crate::app::App;
-use crate::palette::theme_color;
 
 const PAD_X: u16 = 2;
 const PAD_Y: u16 = 1;
 
-/// Terminal size the board needs: two columns per cell, plus border and padding.
-fn board_size(game: &Game) -> (u16, u16) {
-    (game.width * 2 + 2 + 2 * PAD_X, game.height + 2 + 2 * PAD_Y)
+/// Terminal size a `width`×`height` board needs: two columns per cell, plus
+/// border and padding.
+fn board_size(width: u16, height: u16) -> (u16, u16) {
+    (width * 2 + 2 + 2 * PAD_X, height + 2 + 2 * PAD_Y)
 }
 
 /// Whether the board is drawn at all; below this size only a warning is shown.
-pub fn board_fits(game: &Game, size: Size) -> bool {
-    let (need_w, need_h) = board_size(game);
+pub fn board_fits(width: u16, height: u16, size: Size) -> bool {
+    let (need_w, need_h) = board_size(width, height);
     size.width >= need_w && size.height >= need_h
 }
 
@@ -30,8 +28,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let Some(game) = &app.game else { return };
     let area = frame.area();
 
-    let (need_w, need_h) = board_size(game);
-    if !board_fits(game, area.as_size()) {
+    let (width, height) = (game.world.width, game.world.height);
+    let (need_w, need_h) = board_size(width, height);
+    if !board_fits(width, height, area.as_size()) {
         frame.render_widget(
             Paragraph::new(format!(
                 "terminal too small — need at least {need_w}x{need_h}"
@@ -59,7 +58,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .title_bottom(hint_line(game).centered());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(board_lines(game, &app.cfg.theme)), inner);
+    let view = game.world.view();
+    frame.render_widget(
+        BoardWidget {
+            view: &view,
+            theme: &app.cfg.theme,
+        },
+        inner,
+    );
 }
 
 fn title_line() -> Line<'static> {
@@ -72,12 +78,12 @@ fn title_line() -> Line<'static> {
     .left_aligned()
 }
 
-fn stats_line(app: &App, game: &Game, board_w: u16) -> Line<'static> {
+fn stats_line(app: &App, game: &SoloGame, board_w: u16) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let len = game.len();
     let record = app.record.max(len as u32);
-    let secs = game.clock.as_secs();
+    let secs = game.clock().as_secs();
     let time = format!("{:02}:{:02}", secs / 60, secs % 60);
 
     if board_w < 52 {
@@ -101,7 +107,7 @@ fn stats_line(app: &App, game: &Game, board_w: u16) -> Line<'static> {
     ])
 }
 
-fn hint_line(game: &Game) -> Line<'static> {
+fn hint_line(game: &SoloGame) -> Line<'static> {
     if !game.started {
         Line::styled(
             " press an arrow key to start ",
@@ -122,81 +128,4 @@ fn hint_line(game: &Game) -> Line<'static> {
             Style::default().fg(Color::DarkGray),
         )
     }
-}
-
-fn board_lines(game: &Game, theme: &Theme) -> Vec<Line<'static>> {
-    #[derive(Clone, Copy)]
-    enum Cell {
-        Empty,
-        Wall,
-        Food,
-        Super,
-        Poison,
-        Body,
-        Head,
-    }
-
-    let (w, h) = (game.width as usize, game.height as usize);
-    let mut grid = vec![Cell::Empty; w * h];
-    for y in 0..game.height {
-        for x in 0..game.width {
-            if game.wall_at(x, y) {
-                grid[y as usize * w + x as usize] = Cell::Wall;
-            }
-        }
-    }
-    for food in &game.foods {
-        grid[food.pos.y as usize * w + food.pos.x as usize] = match food.kind {
-            FoodKind::Normal => Cell::Food,
-            FoodKind::Super => Cell::Super,
-            FoodKind::Poison => Cell::Poison,
-        };
-    }
-    for p in game.snake.iter().skip(1) {
-        grid[p.y as usize * w + p.x as usize] = Cell::Body;
-    }
-    if let Some(head) = game.snake.front() {
-        grid[head.y as usize * w + head.x as usize] = Cell::Head;
-    }
-
-    // Each food cell is the user-chosen glyph padded to the 2-column cell.
-    let food_txt = format!("{} ", theme.icon(IconSlot::Food));
-    let super_txt = format!("{} ", theme.icon(IconSlot::SuperFood));
-    let poison_txt = format!("{} ", theme.icon(IconSlot::Poison));
-
-    let bg = theme_color(theme, ColorSlot::Background);
-    let mut lines = Vec::with_capacity(h);
-    for y in 0..h {
-        let mut spans = Vec::with_capacity(w);
-        for x in 0..w {
-            let (text, fg, bold): (Cow<'static, str>, _, _) = match grid[y * w + x] {
-                Cell::Empty => ("  ".into(), bg, false),
-                Cell::Wall => ("██".into(), theme_color(theme, ColorSlot::Wall), false),
-                Cell::Head => ("██".into(), theme_color(theme, ColorSlot::Head), false),
-                Cell::Body => ("██".into(), theme_color(theme, ColorSlot::Body), false),
-                Cell::Food => (
-                    food_txt.clone().into(),
-                    theme_color(theme, ColorSlot::Food),
-                    true,
-                ),
-                Cell::Super => (
-                    super_txt.clone().into(),
-                    theme_color(theme, ColorSlot::SuperFood),
-                    true,
-                ),
-                Cell::Poison => (
-                    poison_txt.clone().into(),
-                    theme_color(theme, ColorSlot::Poison),
-                    true,
-                ),
-            };
-            let mut style = Style::default().fg(fg).bg(bg);
-            if bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(text, style));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
 }

@@ -1,14 +1,14 @@
 //! Players' terminals can be any size, and over SSH a panic while drawing
 //! would drop the connection, so every screen must draw at every size.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Size;
 use snake_core::config::{GameConfig, Rules};
-use snake_core::game::{Game, GameOverReason};
 use snake_core::records::Records;
+use snake_core::solo::{GameOverReason, SoloGame};
 use snake_tui::{App, Screen, ui};
 
 /// One app per screen worth drawing, on a board of `rules`.
@@ -21,7 +21,7 @@ fn screens(rules: &Rules) -> Vec<App> {
         let mut app = App::new(cfg.clone(), Records::default());
         app.screen = screen;
         if screen != Screen::Menu {
-            app.game = Some(Game::new(rules.clone()).unwrap());
+            app.game = Some(SoloGame::new(rules.clone()).unwrap());
         }
         app
     };
@@ -36,6 +36,13 @@ fn screens(rules: &Rules) -> Vec<App> {
     let mut started = new_app(Screen::Playing);
     started.game.as_mut().unwrap().started = true;
     apps.push(started);
+    // Every kind of food on the board, without moving the snake.
+    let mut with_food = new_app(Screen::Playing);
+    let game = with_food.game.as_mut().unwrap();
+    game.started = true;
+    game.world.advance_clock(Duration::from_secs(20));
+    assert!(game.world.foods.len() >= 3);
+    apps.push(with_food);
 
     for selected in [0, 1] {
         apps.push(new_app(Screen::Paused { selected }));
@@ -99,10 +106,17 @@ fn smallest_and_largest_boards_draw() {
         };
         // Two columns per cell, plus border and padding.
         let (need_w, need_h) = (width * 2 + 6, height + 4);
-        let game = Game::new(rules.clone()).unwrap();
-        assert!(ui::board_fits(&game, Size::new(need_w, need_h)));
-        assert!(!ui::board_fits(&game, Size::new(need_w - 1, need_h)));
-        assert!(!ui::board_fits(&game, Size::new(need_w, need_h - 1)));
+        assert!(ui::board_fits(width, height, Size::new(need_w, need_h)));
+        assert!(!ui::board_fits(
+            width,
+            height,
+            Size::new(need_w - 1, need_h)
+        ));
+        assert!(!ui::board_fits(
+            width,
+            height,
+            Size::new(need_w, need_h - 1)
+        ));
 
         let sizes = [
             (need_w - 1, need_h),
