@@ -364,6 +364,32 @@ async fn quick_play_offers_an_unrated_match_against_bots() {
 }
 
 #[tokio::test]
+async fn beating_guests_doesnt_move_a_rating() {
+    let seed = first_player_wins_seed();
+    let server = TestServer::with(|c| c.room_seed = Some(seed));
+    let (mut ann, _) = signed_up(server.addr, "ann").await;
+    ann.send(ENTER).await;
+    ann.wait_for("Finding a match").await;
+    let mut guest = connect_as(server.addr, Login::Guest).await;
+    pick(&guest, 0, QUICK_PLAY).await;
+    for p in [&mut ann, &mut guest] {
+        p.wait_until("the results", Duration::from_secs(30), |p| {
+            p.text().contains("RESULTS")
+        })
+        .await;
+    }
+    assert!(ann.text().contains("You win!"), "{}", ann.text());
+    assert!(
+        !line_of(&ann.text(), ". ann ").contains('+'),
+        "{}",
+        ann.text()
+    );
+    ann.send(ESC).await;
+    ann.wait_for("Signed in as ann").await;
+    assert_eq!(rating_on_home(&ann.text()), Some(1000), "{}", ann.text());
+}
+
+#[tokio::test]
 async fn a_rated_match_moves_the_winners_rating_up_and_the_losers_down() {
     let seed = first_player_wins_seed();
     let server = TestServer::with(|c| c.room_seed = Some(seed));

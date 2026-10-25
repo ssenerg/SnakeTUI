@@ -20,7 +20,7 @@ use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 
-use crate::rating::Rating;
+use crate::rating::{self, Rating};
 use crate::room::{RoomRef, ServerId};
 
 const SQLITE_SCHEMA: &str = "
@@ -644,6 +644,56 @@ impl Store {
 
     /// Saves everyone's new rating after a quick-play round, and counts the
     /// game and any win.
+    /// Rates a round between these accounts, given each one's place (1 is
+    /// first) and whether they won: works out their new ratings from the
+    /// ones saved now, saves them, and answers each account's rating
+    /// before and after, in the same order. Rounds ending at once, with
+    /// the same account in both, take turns, so neither overwrites the
+    /// other.
+    pub async fn rate_round(
+        &self,
+        players: &[(AccountId, usize, bool)],
+    ) -> Result<Vec<(Rating, Rating)>> {
+        let mut tx = self.pool.begin().await?;
+        // Taking each row's lock first, in one order for every round.
+        let mut ids: Vec<AccountId> = players.iter().map(|p| p.0).collect();
+        ids.sort_unstable();
+        for id in &ids {
+            sqlx::query("UPDATE accounts SET games = games WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut before = Vec::with_capacity(players.len());
+        for &(id, place, _) in players {
+            let row = sqlx::query("SELECT rating_mu, rating_sigma FROM accounts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let now = Rating {
+                mu: row.try_get(0)?,
+                sigma: row.try_get(1)?,
+            };
+            before.push((now, place));
+        }
+        let after = rating::after_round(&before);
+        for (&(id, _, won), rating) in players.iter().zip(&after) {
+            sqlx::query(
+                "UPDATE accounts SET rating_mu = $2, rating_sigma = $3,
+                     games = games + 1, wins = wins + $4
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(rating.mu)
+            .bind(rating.sigma)
+            .bind(i64::from(won))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(before.into_iter().map(|(r, _)| r).zip(after).collect())
+    }
+
     pub async fn save_rated_round(&self, results: &[RatedResult]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for r in results {
@@ -1097,6 +1147,7 @@ mod tests {
         signing_up_with_a_key_brings_the_guest_profile_along,
         keys_move_between_accounts_and_only_the_latest_ten_are_kept,
         rated_rounds_count_games_wins_and_new_ratings,
+        rounds_are_rated_from_the_saved_ratings,
         friendship_needs_both_sides,
         the_leaderboard_ranks_accounts_with_enough_games,
         requests_waiting_for_an_answer_are_limited,
@@ -1223,6 +1274,35 @@ mod tests {
             "not bob's"
         );
         assert!(store.account_for_key("SHA256:11").await.unwrap().is_none());
+    }
+
+    async fn rounds_are_rated_from_the_saved_ratings(store: Store) {
+        let ann = account(&store, "ann", None).await;
+        let ben = account(&store, "ben", None).await;
+        // ann's rating moved on elsewhere, after this round's players
+        // were picked with an older one.
+        let strong = Rating {
+            mu: 40.0,
+            sigma: 3.0,
+        };
+        let results = [RatedResult {
+            account: ann.id,
+            rating: strong,
+            won: true,
+        }];
+        store.save_rated_round(&results).await.unwrap();
+
+        let changes = store
+            .rate_round(&[(ann.id, 2, false), (ben.id, 1, true)])
+            .await
+            .unwrap();
+        assert_eq!(changes[0].0, strong, "rated from what's saved");
+        assert!(changes[0].1.mu < strong.mu && changes[1].1.mu > changes[1].0.mu);
+        let ann_now = store.load_account(ann.id).await.unwrap();
+        assert_eq!(ann_now.account.rating, changes[0].1);
+        assert_eq!((ann_now.account.games, ann_now.account.wins), (2, 1));
+        let ben_now = store.load_account(ben.id).await.unwrap();
+        assert_eq!((ben_now.account.games, ben_now.account.wins), (1, 1));
     }
 
     async fn rated_rounds_count_games_wins_and_new_ratings(store: Store) {

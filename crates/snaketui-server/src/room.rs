@@ -26,8 +26,8 @@ use crate::cluster::Cluster;
 use crate::cluster::wire::{InputKind, RatedAt};
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
-use crate::rating::{self, Rating};
-use crate::store::{AccountId, RatedResult, Store};
+use crate::rating::Rating;
+use crate::store::{AccountId, Store};
 
 pub type ViewRx = watch::Receiver<Arc<RoomView>>;
 
@@ -311,13 +311,16 @@ pub struct Rated {
 
 /// A player in a rated room.
 pub struct RatedMember {
-    /// Guests play at the starting rating, and nothing is saved for them.
+    /// Guests play, but only accounts are rated, against each other.
     pub account: Option<AccountId>,
+    /// What they were matched by. Ratings are worked out from the saved
+    /// ones instead.
     pub rating: Rating,
     pub notify: RatedNotify,
 }
 
 /// Where a player's new rating goes.
+#[derive(Clone)]
 pub enum RatedNotify {
     /// Their session, on this server.
     Here(Recipient<Rated>),
@@ -517,7 +520,7 @@ impl RoomActor {
         let Some(events) = self.guarded(ctx, |round| round.advance(dt)) else {
             return;
         };
-        self.on_events(events);
+        self.on_events(events, ctx);
         self.publish();
         if self.round.is_empty() {
             return ctx.stop();
@@ -557,63 +560,71 @@ impl RoomActor {
         self.present.remove(&id);
         self.pings.remove(&id);
         if let Some(events) = self.guarded(ctx, |round| round.leave(id)) {
-            self.on_events(events);
+            self.on_events(events, ctx);
         }
     }
 
-    fn on_events(&mut self, events: Vec<RoundEvent>) {
+    fn on_events(&mut self, events: Vec<RoundEvent>, ctx: &mut Context<Self>) {
         for event in events {
             let RoundEvent::Ended {
                 outcome,
                 placements,
             } = event;
             debug!(code = ?self.code, ?outcome, "round over");
-            self.rate(&outcome, &placements);
+            self.rate(&outcome, &placements, ctx);
         }
     }
 
-    /// Works out everyone's new rating, saves the accounts' ones, tells each
-    /// player, and shows the changes with the results.
-    fn rate(&mut self, outcome: &Outcome, placements: &[Placement]) {
+    /// Rates the accounts that played against each other: works out their
+    /// new ratings from the saved ones, saves them, tells each player, and
+    /// shows the changes with the results. It finishes even if the room
+    /// closes meanwhile.
+    fn rate(&mut self, outcome: &Outcome, placements: &[Placement], ctx: &mut Context<Self>) {
+        self.changes.clear();
         let Some(ratings) = &self.ratings else {
             return;
         };
-        let players: Vec<(&Placement, &RatedMember)> = placements
-            .iter()
-            .filter_map(|p| ratings.members.get(&p.who.id).map(|m| (p, m)))
-            .collect();
-        let before: Vec<(Rating, usize)> =
-            players.iter().map(|(p, m)| (m.rating, p.place)).collect();
-        let after = rating::after_round(&before);
         let winner = match outcome {
             Outcome::Won { winner, .. } => Some(winner.id),
             Outcome::Draw { .. } => None,
         };
-        let mut saved = Vec::new();
-        self.changes.clear();
-        for ((placement, member), rating) in players.into_iter().zip(after) {
-            let won = winner == Some(placement.who.id);
-            member.notify.send(Rated { rating, won });
-            if let Some(account) = member.account {
-                saved.push(RatedResult {
-                    account,
-                    rating,
-                    won,
-                });
-                self.changes.push(RatingChange {
-                    id: placement.who.id,
-                    before: member.rating.shown(),
-                    after: rating.shown(),
-                });
-            }
+        let rated = rated_players(placements, &ratings.members);
+        // Rated against nobody: nothing changes.
+        if rated.len() < 2 {
+            return;
         }
-        let store = ratings.store.clone();
+        let players: Vec<(AccountId, usize, bool)> = rated
+            .iter()
+            .map(|&(id, account, place)| (account, place, winner == Some(id)))
+            .collect();
+        let notify: Vec<(PlayerId, Option<RatedNotify>)> = rated
+            .iter()
+            .map(|&(id, _, _)| (id, ratings.members.get(&id).map(|m| m.notify.clone())))
+            .collect();
+        let (store, room) = (ratings.store.clone(), ctx.address());
         actix::spawn(async move {
-            if let Err(e) = store.save_rated_round(&saved).await {
-                warn!(error = %e, "couldn't save ratings");
+            let changes = match store.rate_round(&players).await {
+                Ok(changes) => changes,
+                Err(e) => return warn!(error = %e, "couldn't save ratings"),
+            };
+            let mut shown = Vec::with_capacity(changes.len());
+            for (((id, notify), (_, _, won)), (before, after)) in
+                notify.into_iter().zip(&players).zip(changes)
+            {
+                if let Some(notify) = notify {
+                    notify.send(Rated {
+                        rating: after,
+                        won: *won,
+                    });
+                }
+                shown.push(RatingChange {
+                    id,
+                    before: before.shown(),
+                    after: after.shown(),
+                });
             }
+            room.do_send(RatingsChanged(shown));
         });
-        self.publish_now();
     }
 
     /// Runs `f` on the round; a panic closes the room with a message for its
@@ -659,6 +670,27 @@ impl RoomActor {
     }
 }
 
+/// Who a round rates, with their account and place: accounts only, each
+/// once. Guests aren't rated, and beating them doesn't count; an account
+/// that played twice isn't rated at all.
+fn rated_players(
+    placements: &[Placement],
+    members: &HashMap<PlayerId, RatedMember>,
+) -> Vec<(PlayerId, AccountId, usize)> {
+    let accounts: Vec<(PlayerId, AccountId, usize)> = placements
+        .iter()
+        .filter_map(|p| {
+            let account = members.get(&p.who.id)?.account?;
+            Some((p.who.id, account, p.place))
+        })
+        .collect();
+    accounts
+        .iter()
+        .filter(|(_, account, _)| accounts.iter().filter(|a| a.1 == *account).count() == 1)
+        .copied()
+        .collect()
+}
+
 fn view_of(
     round: &Round,
     code: &Option<String>,
@@ -690,6 +722,20 @@ impl Handler<Join> for RoomActor {
         self.present.insert(id, msg.presence);
         self.publish();
         Ok(self.view.subscribe())
+    }
+}
+
+/// A rated round's changes, saved: shown with its results.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct RatingsChanged(Vec<RatingChange>);
+
+impl Handler<RatingsChanged> for RoomActor {
+    type Result = ();
+
+    fn handle(&mut self, RatingsChanged(changes): RatingsChanged, _: &mut Self::Context) {
+        self.changes = changes;
+        self.publish_now();
     }
 }
 
@@ -793,9 +839,40 @@ impl Handler<Ready> for RoomActor {
 
 #[cfg(test)]
 mod tests {
-    use snake_core::round::{RoomKind, Round, RoundSettings, quick_rules};
+    use snake_core::round::{Placement, RoomKind, Round, RoundSettings, quick_rules};
 
     use super::*;
+
+    #[test]
+    fn only_accounts_are_rated_each_once() {
+        let member = |account| RatedMember {
+            account,
+            rating: Rating::default(),
+            notify: RatedNotify::Nobody,
+        };
+        let members = HashMap::from([
+            (1, member(Some(10))),
+            (2, member(None)),
+            (3, member(Some(30))),
+            (4, member(Some(30))),
+            (5, member(Some(50))),
+        ]);
+        let placements: Vec<Placement> = (1..=5)
+            .map(|id| Placement {
+                who: Entrant {
+                    id,
+                    name: format!("p{id}"),
+                },
+                place: id as usize,
+                length: 3,
+            })
+            .collect();
+        assert_eq!(
+            rated_players(&placements, &members),
+            [(1, 10, 1), (5, 50, 5)],
+            "no guest, and not the account that played twice"
+        );
+    }
 
     #[actix_rt::test]
     async fn watchers_have_no_seats_and_only_so_many_fit() {
