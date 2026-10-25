@@ -11,7 +11,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
-use snake_core::round::{Entrant, PlayerId, RoomKind, Round, RoundSettings, quick_rules};
+use snake_core::round::{
+    Entrant, PlayerId, RoomKind, Round, RoundSettings, bot_entrant, quick_rules,
+};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -35,6 +37,8 @@ const RESEND_EVERY: Duration = Duration::from_secs(15);
 /// In a cluster: how long a player's server waits for news of their rating
 /// after their match started elsewhere.
 const RATED_WAIT: Duration = Duration::from_secs(15 * 60);
+/// Bots in a match against bots.
+const BOT_MATCH_BOTS: usize = 3;
 
 /// Puts a player in the queue. They get [`Matched`] once a match forms.
 #[derive(Message)]
@@ -52,6 +56,12 @@ pub struct Enqueue {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Dequeue(pub PlayerId);
+
+/// A waiting player gives up on people: they leave the queue for an
+/// unrated match against bots, here, and get [`Matched`].
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct BotMatch(pub PlayerId);
 
 /// A match formed: the player is already seated in this room.
 #[derive(Message)]
@@ -493,6 +503,32 @@ impl Handler<Drain> for MatchmakerActor {
 
     fn handle(&mut self, _: Drain, _: &mut Self::Context) {
         self.draining = true;
+    }
+}
+
+impl Handler<BotMatch> for MatchmakerActor {
+    type Result = ();
+
+    fn handle(&mut self, BotMatch(id): BotMatch, _: &mut Self::Context) {
+        // Matched meanwhile, or the server is stopping: they stay as they
+        // are.
+        if self.draining {
+            return;
+        }
+        let Some(waiter) = self.waiting.remove(&id) else {
+            return;
+        };
+        self.unqueue(id);
+        let seed = self.seed.unwrap_or_else(rand::random);
+        let mut entrants = vec![waiter.who.clone()];
+        entrants.extend((0..BOT_MATCH_BOTS).map(bot_entrant));
+        let round = Round::new_match(self.settings.clone(), seed, entrants);
+        let present = HashMap::from([(id, waiter.presence.clone())]);
+        // No ratings: nothing about it is saved.
+        let (room, view) = RoomActor::new(round, None, None, present, None);
+        let room = self.host.start(room);
+        debug!(player = id, "a match against bots");
+        waiter.reply.do_send(Matched { room, view });
     }
 }
 

@@ -343,6 +343,31 @@ fn lobby_line(p: &Player, who: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_host_plays_bots_in_a_private_room() {
+    let server = TestServer::start();
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    create_room(&mut ann).await;
+    ann.send(b"b").await;
+    ann.wait_for("Viper (bot)").await;
+    ann.send(b"b").await;
+    ann.wait_for("Cobra (bot)").await;
+    ann.send(b"x").await;
+    ann.wait_until("Cobra out", Duration::from_secs(5), |p| {
+        !p.text().contains("Cobra")
+    })
+    .await;
+    // Bots are always ready, so ann's Enter starts the round.
+    ann.send(ENTER).await;
+    ann.wait_for("GET READY").await;
+    // She never steers: she's soon out, and the round with her.
+    ann.wait_until("the results", Duration::from_secs(20), |p| {
+        p.text().contains("RESULTS")
+    })
+    .await;
+    assert!(ann.text().contains("Viper (bot)"), "{}", ann.text());
+}
+
+#[tokio::test]
 async fn the_host_sets_the_rules_for_everyone() {
     let server = TestServer::start();
     let mut ann = guest(server.addr, "ann", 100, 30).await;

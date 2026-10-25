@@ -17,7 +17,7 @@ use crate::rating::Rating;
 use crate::room::{RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -133,6 +133,10 @@ pub enum InputKind {
     Ping(Duration),
     /// The host changes the rules of the room's next rounds.
     Rules(Rules),
+    /// The host adds a bot.
+    AddBot,
+    /// The host takes the last bot out.
+    RemoveBot,
 }
 
 /// What are these accounts doing? Every other server answers for its own

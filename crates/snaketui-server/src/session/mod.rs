@@ -28,7 +28,7 @@ use crate::identity::{Player, nickname};
 use crate::input::{KeyParser, STATUS_QUERY};
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
-use crate::matchmaker::{Dequeue, Enqueue, Matched};
+use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::PINGS;
 use crate::presence::Status;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
@@ -526,6 +526,17 @@ impl SessionActor {
                         link.room.set_rules(self.id, rules);
                     }
                 }
+                Effect::AddBot => {
+                    if let Some(link) = &self.room {
+                        link.room.bot(self.id, true);
+                    }
+                }
+                Effect::RemoveBot => {
+                    if let Some(link) = &self.room {
+                        link.room.bot(self.id, false);
+                    }
+                }
+                Effect::PlayBots => self.shared.matchmaker.do_send(BotMatch(self.id)),
                 Effect::LeaveRoom => self.leave_room(ctx),
                 Effect::SetNickname(name) => self.rename(&name, ctx),
                 Effect::SignUp { username, password } => self.sign_up(username, password, ctx),

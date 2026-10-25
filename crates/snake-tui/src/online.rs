@@ -8,7 +8,7 @@ use std::time::Duration;
 use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::records::Records;
 use snake_core::round::{
-    PhaseView, PlayerId, RoomKind, RoomView, SeatView, max_players_for, quick_rules,
+    PhaseView, PlayerId, RoomKind, RoomView, SeatView, is_bot, max_players_for, quick_rules,
 };
 use snake_core::settings::{SETTINGS, room_settings};
 use zeroize::{Zeroize, Zeroizing};
@@ -23,6 +23,10 @@ pub const MAX_SECRET: usize = 128;
 /// Rated games an account needs before the leaderboard lists it: new
 /// ratings swing a lot.
 pub const RANKED_AFTER: u32 = 5;
+
+/// How long quick play waits for people before offering a match against
+/// bots.
+pub const BOTS_OFFERED_AFTER: Duration = Duration::from_secs(20);
 
 /// A password while it's typed and sent: wiped from memory when dropped,
 /// and never shown by `Debug`.
@@ -617,9 +621,15 @@ impl App {
     }
 
     pub(crate) fn finding_key(&mut self, key: Key, effects: &mut Vec<Effect>) {
-        if matches!(key, Key::Esc | Key::Char('q')) {
-            effects.push(Effect::LeaveQueue);
-            self.go_home(HomeItem::QuickPlay, None);
+        let waited = self.online.as_ref().map_or(Duration::ZERO, |o| o.waited);
+        match key {
+            Key::Esc | Key::Char('q') => {
+                effects.push(Effect::LeaveQueue);
+                self.go_home(HomeItem::QuickPlay, None);
+            }
+            // The match comes back like any other.
+            Key::Char('b') if waited >= BOTS_OFFERED_AFTER => effects.push(Effect::PlayBots),
+            _ => {}
         }
     }
 
@@ -661,6 +671,20 @@ impl App {
                 // Everyone can read the rules; the host changes them there.
                 Key::Char('e') => {
                     self.screen = Screen::RoomRules { selected: 0 };
+                    false
+                }
+                Key::Char('b') if room.hosting() => {
+                    if room.view.seats.len() < room.view.max_players {
+                        effects.push(Effect::AddBot);
+                    } else {
+                        online.notice = Some("The room is full.".to_string());
+                    }
+                    false
+                }
+                Key::Char('x') if room.hosting() => {
+                    if room.view.seats.iter().any(|s| is_bot(s.who.id)) {
+                        effects.push(Effect::RemoveBot);
+                    }
                     false
                 }
                 Key::Char('i') if signed_in => {
@@ -1275,6 +1299,44 @@ mod tests {
             })
             .to_vec();
         Arc::new(Round::new_match(settings, 1, players).view())
+    }
+
+    #[test]
+    fn the_host_adds_bots_and_takes_them_out() {
+        let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
+        let mut round = Round::new(settings, 1);
+        for id in 1..=2 {
+            let name = format!("~p{id}");
+            round.join(Entrant { id, name }).unwrap();
+        }
+        let mut host = online();
+        host.enter_room(1, Arc::new(round.view()));
+        assert_eq!(host.handle(Key::Char('b')), [Effect::AddBot]);
+        assert_eq!(host.handle(Key::Char('x')), [], "no bot to take out");
+        assert!(round.add_bot(1));
+        host.update_room(Arc::new(round.view()));
+        assert_eq!(host.handle(Key::Char('x')), [Effect::RemoveBot]);
+        while round.add_bot(1) {}
+        host.update_room(Arc::new(round.view()));
+        assert_eq!(host.handle(Key::Char('b')), []);
+        assert_eq!(notice(&host), Some("The room is full."));
+
+        let mut guest = online();
+        guest.enter_room(2, Arc::new(round.view()));
+        assert_eq!(guest.handle(Key::Char('b')), [], "only the host");
+        assert_eq!(guest.handle(Key::Char('x')), []);
+    }
+
+    #[test]
+    fn quick_play_offers_bots_after_a_while() {
+        let mut app = online();
+        assert_eq!(choose(&mut app, HomeItem::QuickPlay), [Effect::QuickPlay]);
+        assert_eq!(app.handle(Key::Char('b')), [], "people may come yet");
+        app.online.as_mut().unwrap().waited = BOTS_OFFERED_AFTER;
+        assert_eq!(app.handle(Key::Char('b')), [Effect::PlayBots]);
+        assert_eq!(app.screen, Screen::Finding, "until the match comes");
+        app.enter_room(1, matched_view());
+        assert_eq!(app.screen, Screen::Room);
     }
 
     #[test]

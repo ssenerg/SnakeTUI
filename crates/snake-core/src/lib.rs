@@ -6,6 +6,7 @@
 //! [`view::MatchView`] is the snapshot that gets drawn.
 
 pub mod board;
+pub mod bot;
 pub mod config;
 pub mod geom;
 pub mod records;

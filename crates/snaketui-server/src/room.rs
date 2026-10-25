@@ -235,6 +235,23 @@ impl RoomHandle {
         }
     }
 
+    /// The host adds a bot, or with `add` false, takes one out.
+    pub fn bot(&self, id: PlayerId, add: bool) {
+        match self {
+            RoomHandle::Local { addr, .. } => {
+                let _ = addr.try_send(Bot { id, add });
+            }
+            RoomHandle::Remote { at, cluster } => {
+                let kind = if add {
+                    InputKind::AddBot
+                } else {
+                    InputKind::RemoveBot
+                };
+                cluster.send_input(*at, id, kind)
+            }
+        }
+    }
+
     pub fn set_rules(&self, id: PlayerId, rules: Rules) {
         match self {
             RoomHandle::Local { addr, .. } => {
@@ -341,6 +358,14 @@ pub struct Ready(pub PlayerId);
 pub struct SetRules {
     pub id: PlayerId,
     pub rules: Rules,
+}
+
+/// The host adds a bot, or takes one out.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct Bot {
+    pub id: PlayerId,
+    pub add: bool,
 }
 
 /// A player's latest round trip, for everyone in the room to see.
@@ -645,6 +670,24 @@ impl Handler<SetRules> for RoomActor {
     fn handle(&mut self, SetRules { id, rules }: SetRules, ctx: &mut Self::Context) {
         if self.guarded(ctx, |round| round.set_rules(id, rules)) == Some(true) {
             debug!(code = ?self.code, "rules changed");
+            self.publish();
+        }
+    }
+}
+
+impl Handler<Bot> for RoomActor {
+    type Result = ();
+
+    fn handle(&mut self, Bot { id, add }: Bot, ctx: &mut Self::Context) {
+        let changed = self.guarded(ctx, |round| {
+            if add {
+                round.add_bot(id)
+            } else {
+                round.remove_bot(id)
+            }
+        });
+        if changed == Some(true) {
+            debug!(code = ?self.code, add, players = self.round.players(), "bots changed");
             self.publish();
         }
     }

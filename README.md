@@ -76,7 +76,9 @@ gives no speed boost.
 
 - **Quick play** puts you in a queue. A match starts as soon as 8 players
   are waiting, or after 10 seconds with at least 2. It plays one round on a
-  30×18 board, which fits an 80×23 terminal. Matches are rated.
+  30×18 board, which fits an 80×23 terminal. Matches are rated. After 20
+  seconds with nobody to play, press `b` for a match against 3 bots
+  instead; it isn't rated.
 - **Private rooms** use your single-player settings and get a 6-character
   code to share. Anyone with the code can join. A round starts 15 seconds
   after the second player arrives, or as soon as everyone presses Enter.
@@ -89,6 +91,13 @@ gives no speed boost.
   nobody starts by rules they didn't see. A board too small for everyone
   already in the room is refused. The changes belong to the room; the host's
   own settings stay as they were.
+- **Bots.** In a private room's lobby, the host adds a bot with `b` and takes
+  the last one out with `x`. Bots are always ready, so a player alone can
+  start a round with them. Someone joining a full room takes a bot's seat.
+  A bot heads for the nearest food it can reach and stays clear of walls,
+  bodies, poison and dead ends. Bots are named after snakes (Viper, Cobra,
+  and so on), and accounts can't take those names. Once every person's snake
+  is out, the round ends: the longest bot left wins.
 - **Winning.** The last snake alive wins. If all the snakes still in play
   crash on the same tick, it's a draw. After 3 minutes, the longest snake
   still alive wins.

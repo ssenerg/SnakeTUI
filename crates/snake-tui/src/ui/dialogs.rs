@@ -7,7 +7,7 @@ use snake_core::solo::GameOverReason;
 
 use super::dialog;
 use crate::app::App;
-use crate::online::Field;
+use crate::online::{BOTS_OFFERED_AFTER, Field};
 
 pub fn draw_pause(frame: &mut Frame, selected: usize) {
     let inner = dialog(frame, " PAUSED ", Color::Yellow, 36, 8);
@@ -119,14 +119,25 @@ pub fn draw_finding(frame: &mut Frame, app: &App) {
             status.push_str(" · all regions");
         }
     }
-    let width = if online.region.is_some() { 50 } else { 36 };
-    let inner = dialog(frame, " Finding a match ", Color::Cyan, width, 7);
-    let lines = vec![
-        Line::default(),
-        Line::from(status),
-        Line::default(),
-        Line::from("Esc cancel").style(Style::default().fg(Color::DarkGray)),
-    ];
+    // Nobody yet: bots are offered instead.
+    let bots = online.waited >= BOTS_OFFERED_AFTER;
+    let width = if online.region.is_some() || bots {
+        50
+    } else {
+        36
+    };
+    let height = if bots { 9 } else { 7 };
+    let inner = dialog(frame, " Finding a match ", Color::Cyan, width, height);
+    let mut lines = vec![Line::default(), Line::from(status), Line::default()];
+    if bots {
+        lines.push(Line::from("Nobody yet? Play bots now, unrated."));
+        lines.push(Line::default());
+        lines.push(
+            Line::from("b play bots · Esc cancel").style(Style::default().fg(Color::DarkGray)),
+        );
+    } else {
+        lines.push(Line::from("Esc cancel").style(Style::default().fg(Color::DarkGray)));
+    }
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 

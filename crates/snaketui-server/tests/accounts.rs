@@ -266,6 +266,30 @@ fn rating_on_home(text: &str) -> Option<u32> {
 }
 
 #[tokio::test]
+async fn quick_play_offers_an_unrated_match_against_bots() {
+    let server = TestServer::start();
+    let (mut ann, _) = signed_up(server.addr, "ann").await;
+    ann.send(ENTER).await;
+    ann.wait_for("Finding a match").await;
+    assert!(!ann.text().contains("bots"), "{}", ann.text());
+    ann.wait_until("bots offered", Duration::from_secs(30), |p| {
+        p.text().contains("b play bots")
+    })
+    .await;
+    ann.send(b"b").await;
+    ann.wait_until("the results", Duration::from_secs(30), |p| {
+        p.text().contains("RESULTS")
+    })
+    .await;
+    let text = ann.text();
+    assert!(text.contains("(bot)"), "{text}");
+    assert!(!line_of(&text, ". ann ").contains('−'), "unrated: {text}");
+    ann.send(ESC).await;
+    ann.wait_for("Signed in as ann").await;
+    assert_eq!(rating_on_home(&ann.text()), Some(1000), "{}", ann.text());
+}
+
+#[tokio::test]
 async fn a_rated_match_moves_the_winners_rating_up_and_the_losers_down() {
     let seed = first_player_wins_seed();
     let server = TestServer::with(|c| c.room_seed = Some(seed));

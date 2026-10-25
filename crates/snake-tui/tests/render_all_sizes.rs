@@ -11,9 +11,10 @@ use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
 use snake_core::round::RatingChange;
 use snake_core::round::{
-    Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, quick_rules,
+    Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, bot_entrant, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
+use snake_tui::online::BOTS_OFFERED_AFTER;
 use snake_tui::online::{
     Field, FormKind, FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile,
     QueueRegion,
@@ -131,7 +132,25 @@ fn room_views(rules: &Rules) -> Vec<RoomView> {
         }
         views.push(round.view());
     }
+    // A private lobby full of bots, and a match against bots, played out.
+    if let Some(settings) = RoundSettings::new(rules.clone(), RoomKind::Private) {
+        let mut round = Round::new(settings, 1);
+        round.join(entrant(1)).unwrap();
+        while round.add_bot(1) {}
+        views.push(round.view());
+    }
     let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+    let bots = (0..3).map(bot_entrant);
+    let mut round = Round::new_match(
+        settings.clone(),
+        3,
+        [entrant(1)].into_iter().chain(bots).collect(),
+    );
+    while !matches!(round.view().phase, PhaseView::Results { .. }) {
+        round.advance(step);
+    }
+    views.push(round.view());
+
     let mut round = Round::new_match(settings, 2, (1..=8).map(entrant).collect());
     views.push(round.view());
     for _ in 0..40 {
@@ -291,6 +310,10 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         apps.push(app);
     }
     apps.push(new_app(Screen::Finding));
+    // Long enough for bots to be offered.
+    let mut bored = new_app(Screen::Finding);
+    bored.online.as_mut().unwrap().waited = BOTS_OFFERED_AFTER;
+    apps.push(bored);
     // In a cluster, after the queue has opened to every region.
     let mut regional = new_app(Screen::Finding);
     regional.set_region(QueueRegion {
@@ -524,7 +547,8 @@ fn only_the_host_sees_how_to_change_the_speed() {
     };
     let host = lobby_of(1);
     assert!(host.contains("◂ 150 ms ticks ▸"), "{host}");
-    assert!(host.contains("←→ speed · e rules"), "{host}");
+    assert!(host.contains("Enter ready · e rules"), "{host}");
+    assert!(host.contains("←→ speed · b add a bot"), "{host}");
     let guest = lobby_of(2);
     assert!(
         guest.contains("150 ms ticks") && !guest.contains('◂'),
@@ -607,4 +631,36 @@ fn the_leaderboard_shows_what_fits_and_always_your_place() {
         unranked.contains("2 more rated games to be ranked."),
         "{unranked}"
     );
+}
+
+#[test]
+fn bots_are_marked_and_offered() {
+    let app_at = |screen: Screen| {
+        let mut app = App::online(
+            GameConfig::default(),
+            Records::default(),
+            "~p1".into(),
+            true,
+        );
+        app.screen = screen;
+        app
+    };
+    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Round::new(settings, 1);
+    round.join(entrant(1)).unwrap();
+    round.add_bot(1);
+    round.add_bot(1);
+    let mut host = app_at(Screen::Room);
+    host.enter_room(1, Arc::new(round.view()));
+    let lobby = shown(&host, 80, 24);
+    assert!(lobby.contains("✓ Viper (bot)"), "always ready: {lobby}");
+    assert!(lobby.contains("Cobra (bot)"), "{lobby}");
+    assert!(lobby.contains("b add a bot · x take one out"), "{lobby}");
+
+    let mut waiting = app_at(Screen::Finding);
+    assert!(!shown(&waiting, 80, 24).contains("bots"));
+    waiting.online.as_mut().unwrap().waited = BOTS_OFFERED_AFTER;
+    let offer = shown(&waiting, 80, 24);
+    assert!(offer.contains("Play bots now, unrated."), "{offer}");
+    assert!(offer.contains("b play bots · Esc cancel"), "{offer}");
 }

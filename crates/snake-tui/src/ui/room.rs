@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use snake_core::config::ColorSlot;
 use snake_core::geom::Point;
-use snake_core::round::{Outcome, PhaseView, RoomKind};
+use snake_core::round::{Entrant, Outcome, PhaseView, RoomKind, is_bot};
 use snake_core::view::MatchView;
 
 use super::board::{BoardWidget, SnakeLook};
@@ -41,6 +41,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         (PhaseView::Waiting { starts_in }, _) => draw_lobby(frame, app, room, *starts_in),
         (_, Some(board)) => draw_match(frame, app, room, board),
         _ => {}
+    }
+}
+
+/// A player's name, marked if they're a bot.
+fn named(who: &Entrant) -> String {
+    if is_bot(who.id) {
+        format!("{} (bot)", who.name)
+    } else {
+        who.name.clone()
     }
 }
 
@@ -76,7 +85,7 @@ fn ping_style(ping: Duration) -> Style {
 fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
     let view = &room.view;
     let online = app.online.as_ref();
-    let height = 12 + view.seats.len() as u16;
+    let height = 12 + view.seats.len() as u16 + u16::from(room.hosting());
     let inner = dialog(frame, " Private room ", Color::Cyan, 60, height);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::default()];
@@ -122,6 +131,9 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         if seat.who.id == room.me {
             spans.push(Span::styled(" (you)", dim()));
         }
+        if is_bot(seat.who.id) {
+            spans.push(Span::styled(" (bot)", dim()));
+        }
         if seat.wins > 0 {
             let s = if seat.wins == 1 { "" } else { "s" };
             spans.push(Span::styled(format!(" · {} win{s}", seat.wins), dim()));
@@ -147,12 +159,14 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
     });
     let signed_in = online.is_some_and(|o| o.account.is_some());
     let hint = match (room.hosting(), signed_in) {
-        (true, true) => "Enter ready · ←→ speed · e rules · i invite · Esc leave",
-        (true, false) => "Enter ready · ←→ speed · e rules · Esc leave",
+        (true, true) => "Enter ready · e rules · i invite · Esc leave",
         (false, true) => "Enter ready · e rules · i invite friends · Esc leave",
-        (false, false) => "Enter ready · e rules · Esc leave",
+        (_, false) => "Enter ready · e rules · Esc leave",
     };
     lines.push(Line::from(hint).style(dim()));
+    if room.hosting() {
+        lines.push(Line::from("←→ speed · b add a bot · x take one out").style(dim()));
+    }
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
@@ -416,7 +430,7 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
         Outcome::Won { winner, .. } if winner.id == room.me => {
             ("★ You win! ★".to_string(), Color::LightGreen)
         }
-        Outcome::Won { winner, .. } => (format!("{} wins!", winner.name), Color::LightCyan),
+        Outcome::Won { winner, .. } => (format!("{} wins!", named(winner)), Color::LightCyan),
         Outcome::Draw { .. } => ("Draw!".to_string(), Color::LightYellow),
     };
     let inner = dialog(frame, " RESULTS ", color, 48, height);
@@ -444,7 +458,7 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
         } else {
             Style::default()
         };
-        let name: String = p.who.name.chars().take(18).collect();
+        let name: String = named(&p.who).chars().take(18).collect();
         let mut spans = vec![Span::styled(
             format!("{:>2}. {name:<18} {:>4}", p.place, p.length),
             style,

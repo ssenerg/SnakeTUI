@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use snake_core::round::bot_names;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
@@ -20,7 +21,7 @@ pub const MAX_USERNAME: usize = 16;
 pub const MIN_PASSWORD: usize = 8;
 pub const MAX_PASSWORD: usize = 128;
 
-/// Names nobody may take, on top of the generic login names.
+/// Names nobody may take, on top of the generic login names and the bots'.
 const RESERVED: &[&str] = &[
     "anonymous",
     "everyone",
@@ -46,7 +47,8 @@ pub fn check_username(name: &str) -> Result<(), &'static str> {
         return Err("Usernames use letters, digits, _ and - only.");
     }
     let lower = name.to_ascii_lowercase();
-    if GENERIC_USERS.contains(&lower.as_str()) || RESERVED.contains(&lower.as_str()) {
+    let bot = bot_names().iter().any(|b| b.eq_ignore_ascii_case(&lower));
+    if GENERIC_USERS.contains(&lower.as_str()) || RESERVED.contains(&lower.as_str()) || bot {
         return Err("That username is reserved. Pick another.");
     }
     Ok(())
@@ -270,6 +272,8 @@ mod tests {
         assert!(check_username("Root").is_err());
         assert!(check_username("ADMIN").is_err());
         assert!(check_username("moderator").is_err());
+        assert!(check_username("viper").is_err(), "a bot's name");
+        assert!(check_username("PYTHON").is_err(), "a bot's name");
     }
 
     #[test]

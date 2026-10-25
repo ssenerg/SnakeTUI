@@ -174,9 +174,10 @@ pub async fn serve(
         hasher: Hasher::new()?,
         guesses,
         queue_len,
-        // In a cluster, ids from different servers meet in rooms.
+        // In a cluster, ids from different servers meet in rooms. The top
+        // bit stays clear: it marks bots.
         next_player: AtomicU64::new(if cluster.is_some() {
-            u64::from(rand::random::<u32>()) << 32 | 1
+            u64::from(rand::random::<u32>() >> 1) << 32 | 1
         } else {
             1
         }),

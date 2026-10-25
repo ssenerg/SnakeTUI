@@ -80,6 +80,13 @@ pub enum Effect {
     ToggleReady,
     /// The host's rules for the room's next rounds.
     RoomRules(Rules),
+    /// The host adds a bot to the room.
+    AddBot,
+    /// The host takes the last bot out.
+    RemoveBot,
+    /// Leave the queue for an unrated match against bots; answer with
+    /// [`App::enter_room`].
+    PlayBots,
     LeaveRoom,
     /// Answer with [`App::set_name`].
     SetNickname(String),

@@ -165,7 +165,7 @@ async fn players_on_two_servers_share_a_private_room() {
 }
 
 #[tokio::test]
-async fn a_host_on_another_server_sets_the_rules() {
+async fn a_host_on_another_server_sets_the_rules_and_adds_bots() {
     let servers = cluster(2).await;
     let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
     let mut ben = guest(servers[1].addr, "ben", 100, 30).await;
@@ -180,6 +180,10 @@ async fn a_host_on_another_server_sets_the_rules() {
     ben.wait_for("Room rules").await;
     ben.send(b"\x1b[D").await;
     ben.wait_for("◂ 29 ▸").await;
+    ben.send(ESC).await;
+    ben.wait_for("Private room").await;
+    ben.send(b"b").await;
+    ben.wait_for("Viper (bot)").await;
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
+use crate::bot;
 use crate::config::{MoveTiming, Rules};
 use crate::geom::Direction;
 use crate::settings::rules_in_range;
@@ -22,6 +23,31 @@ pub type PlayerId = u64;
 
 pub const MIN_PLAYERS: usize = 2;
 pub const MAX_PLAYERS: usize = 8;
+
+/// Bots' ids have this bit set; the server never gives it to a person.
+pub const BOT: PlayerId = 1 << 63;
+/// Bots are named after snakes, one name for every seat but a person's.
+const BOT_NAMES: [&str; MAX_PLAYERS - 1] = [
+    "Viper", "Cobra", "Mamba", "Krait", "Taipan", "Adder", "Python",
+];
+
+/// Whether this player is a bot.
+pub fn is_bot(id: PlayerId) -> bool {
+    id & BOT != 0
+}
+
+/// The room's bot number `n`, from 0.
+pub fn bot_entrant(n: usize) -> Entrant {
+    Entrant {
+        id: BOT | n as PlayerId,
+        name: BOT_NAMES[n % BOT_NAMES.len()].to_string(),
+    }
+}
+
+/// Every bot's name, which accounts can't take.
+pub fn bot_names() -> &'static [&'static str] {
+    &BOT_NAMES
+}
 
 /// The board every quick-play match uses. With the scoreboard beside it, it
 /// fits an 80×23 terminal (80×24 with a tmux status bar).
@@ -218,8 +244,18 @@ impl Round {
         self.seats.len()
     }
 
+    /// Whether no person is left: bots don't keep a room open.
     pub fn is_empty(&self) -> bool {
-        self.seats.is_empty()
+        self.seats.iter().all(|s| is_bot(s.who.id))
+    }
+
+    /// The room's host: the person in it longest.
+    fn host(&self) -> Option<&Seat> {
+        self.seats.iter().find(|s| !is_bot(s.who.id))
+    }
+
+    fn hosts(&self, id: PlayerId) -> bool {
+        self.host().is_some_and(|s| s.who.id == id)
     }
 
     pub fn contains(&self, id: PlayerId) -> bool {
@@ -249,7 +285,14 @@ impl Round {
             return Err(JoinError::Closed);
         }
         if self.seats.len() >= self.settings.max_players {
-            return Err(JoinError::Full);
+            // A person takes a bot's seat, between rounds.
+            let bot = self.seats.iter().rposition(|s| is_bot(s.who.id));
+            match bot {
+                Some(i) if !self.in_play() => {
+                    self.seats.remove(i);
+                }
+                _ => return Err(JoinError::Full),
+            }
         }
         self.seats.push(Seat {
             who,
@@ -299,9 +342,66 @@ impl Round {
         };
         seat.ready = !seat.ready;
         self.changed = true;
-        if self.seats.len() >= MIN_PLAYERS && self.seats.iter().all(|s| s.ready) {
+        if self.seats.len() >= MIN_PLAYERS && self.seats.iter().all(|s| s.ready || is_bot(s.who.id))
+        {
             self.begin_countdown();
         }
+    }
+
+    /// The host adds a bot, in a private room's lobby with a seat to
+    /// spare. Says whether one joined.
+    pub fn add_bot(&mut self, id: PlayerId) -> bool {
+        if !self.lobby_by(id) || self.seats.len() >= self.settings.max_players {
+            return false;
+        }
+        // The first name no bot here has.
+        let Some(n) = (0..BOT_NAMES.len()).find(|&n| !self.contains(bot_entrant(n).id)) else {
+            return false;
+        };
+        self.seats.push(Seat {
+            who: bot_entrant(n),
+            ready: false,
+            slot: None,
+            wins: 0,
+        });
+        self.lobby_changed();
+        true
+    }
+
+    /// The host takes out the bot that joined last. Says whether there was
+    /// one.
+    pub fn remove_bot(&mut self, id: PlayerId) -> bool {
+        if !self.lobby_by(id) {
+            return false;
+        }
+        let Some(i) = self.seats.iter().rposition(|s| is_bot(s.who.id)) else {
+            return false;
+        };
+        self.seats.remove(i);
+        self.lobby_changed();
+        true
+    }
+
+    /// Whether `id` hosts this private room, and it's between rounds.
+    fn lobby_by(&self, id: PlayerId) -> bool {
+        self.settings.kind == RoomKind::Private
+            && self.hosts(id)
+            && matches!(self.phase, Phase::Waiting { .. })
+    }
+
+    /// Who plays, or by what rules, just changed: nobody is ready any more,
+    /// and the start timer starts again, so nobody starts a round they
+    /// didn't see.
+    fn lobby_changed(&mut self) {
+        let enough = self.seats.len() >= MIN_PLAYERS;
+        let restart = self.clock + self.settings.start_after;
+        if let Phase::Waiting { start_at } = &mut self.phase {
+            *start_at = enough.then_some(restart);
+        }
+        for seat in &mut self.seats {
+            seat.ready = false;
+        }
+        self.changed = true;
     }
 
     /// The room's host (whoever has been in it longest) changes the rules
@@ -311,28 +411,18 @@ impl Round {
     /// nobody plays by rules they didn't see. Says whether the rules
     /// changed.
     pub fn set_rules(&mut self, id: PlayerId, rules: Rules) -> bool {
-        let host = self.seats.first().is_some_and(|s| s.who.id == id);
-        if self.settings.kind != RoomKind::Private || !host || !rules_in_range(&rules) {
+        if !self.lobby_by(id) || !rules_in_range(&rules) {
             return false;
         }
-        let Phase::Waiting { start_at } = &mut self.phase else {
-            return false;
-        };
         let Some(next) = RoundSettings::new(rules, self.settings.kind) else {
             return false;
         };
         if next.rules == self.settings.rules || next.max_players < self.seats.len() {
             return false;
         }
-        if start_at.is_some() {
-            *start_at = Some(self.clock + self.settings.start_after);
-        }
         self.settings.rules = next.rules;
         self.settings.max_players = next.max_players;
-        for seat in &mut self.seats {
-            seat.ready = false;
-        }
-        self.changed = true;
+        self.lobby_changed();
         true
     }
 
@@ -370,7 +460,7 @@ impl Round {
             Phase::Running { ends_at } => {
                 self.run(dt, &mut events);
                 if matches!(self.phase, Phase::Running { .. }) && self.clock >= ends_at {
-                    self.end(true, &mut events);
+                    self.end(true, true, &mut events);
                 }
             }
             Phase::Results {
@@ -401,6 +491,14 @@ impl Round {
             self.tick_accum = Duration::ZERO;
         }
         self.steps += 1;
+        for (slot, racer) in self.racers.iter().enumerate() {
+            if is_bot(racer.who.id)
+                && racer.died_at.is_none()
+                && let Some(dir) = bot::choose(world, slot as u8)
+            {
+                world.steer(slot as u8, dir);
+            }
+        }
         let outcome = world.step();
         for (id, _) in outcome.deaths {
             self.racers[id as usize].died_at = Some(self.steps);
@@ -497,13 +595,20 @@ impl Round {
 
     fn end_if_decided(&mut self, events: &mut Vec<RoundEvent>) {
         let alive = self.racers.iter().filter(|r| r.died_at.is_none()).count();
+        // Nobody watches bots play on: once every person's snake is out,
+        // the longest bot left wins.
+        let mut people = self.racers.iter().filter(|r| !is_bot(r.who.id)).peekable();
+        let people_out = people.peek().is_some() && people.all(|r| r.died_at.is_some());
         if alive <= 1 {
-            self.end(false, events);
+            self.end(false, false, events);
+        } else if people_out {
+            self.end(false, true, events);
         }
     }
 
-    fn end(&mut self, time_up: bool, events: &mut Vec<RoundEvent>) {
-        self.placements = self.rank(time_up);
+    /// Ends the round; `by_length` ranks the snakes still alive by length.
+    fn end(&mut self, time_up: bool, by_length: bool, events: &mut Vec<RoundEvent>) {
+        self.placements = self.rank(by_length);
         let first: Vec<&Placement> = self.placements.iter().filter(|p| p.place == 1).collect();
         let outcome = match first.as_slice() {
             [only] => Outcome::Won {
@@ -532,12 +637,12 @@ impl Round {
         });
     }
 
-    /// Living snakes first (by length when time ran out), then the dead,
-    /// latest death first. Equal keys share a place.
-    fn rank(&self, time_up: bool) -> Vec<Placement> {
+    /// Living snakes first (by length when the round was cut short), then
+    /// the dead, latest death first. Equal keys share a place.
+    fn rank(&self, by_length: bool) -> Vec<Placement> {
         // Higher keys finish better.
         let key = |r: &Racer| match r.died_at {
-            None if time_up => (2, r.length as u64),
+            None if by_length => (2, r.length as u64),
             None => (2, 0),
             Some(step) => (1, step),
         };
@@ -593,7 +698,7 @@ impl Round {
                 let racer = s.slot.map(|i| &self.racers[i as usize]);
                 SeatView {
                     who: s.who.clone(),
-                    ready: s.ready,
+                    ready: s.ready || is_bot(s.who.id),
                     slot: s.slot,
                     alive: racer.is_some_and(|r| r.died_at.is_none()),
                     length: racer.map_or(0, |r| r.length),
@@ -708,9 +813,12 @@ impl RoomView {
         self.seats.iter().find(|s| s.who.id == id && !s.left)
     }
 
-    /// Private rooms: who sets the rules, the player in it longest.
+    /// Private rooms: who sets the rules, the person in it longest.
     pub fn host(&self) -> Option<&SeatView> {
-        self.seats.first().filter(|s| !s.left)
+        self.seats
+            .iter()
+            .find(|s| !is_bot(s.who.id))
+            .filter(|s| !s.left)
     }
 }
 
@@ -916,6 +1024,95 @@ mod tests {
         assert!(round.set_rules(1, small), "two fit");
         assert_eq!(round.view().max_players, 2);
         assert_eq!(round.join(who(3)), Err(JoinError::Full));
+    }
+
+    #[test]
+    fn the_host_adds_and_removes_bots_in_the_lobby() {
+        let mut round = private();
+        round.join(who(1)).unwrap();
+        assert!(round.add_bot(1));
+        assert!(!round.add_bot(2), "only the host");
+        round.join(who(2)).unwrap();
+        round.toggle_ready(2);
+        round.advance(Duration::from_secs(10));
+        assert!(round.add_bot(1));
+        let view = round.view();
+        let names: Vec<&str> = view.seats.iter().map(|s| s.who.name.as_str()).collect();
+        assert_eq!(names, ["~p1", "Viper", "~p2", "Cobra"]);
+        assert!(
+            view.seats
+                .iter()
+                .filter(|s| is_bot(s.who.id))
+                .all(|s| s.ready)
+        );
+        assert!(!view.seats[2].ready, "a new bot means ready again");
+        assert_eq!(
+            view.phase,
+            PhaseView::Waiting {
+                starts_in: Some(Duration::from_secs(15))
+            },
+            "and the start timer starts again"
+        );
+        assert_eq!(view.host().map(|s| s.who.id), Some(1));
+
+        assert!(round.remove_bot(1));
+        assert!(round.add_bot(1));
+        let bots: Vec<String> = round
+            .view()
+            .seats
+            .iter()
+            .filter(|s| is_bot(s.who.id))
+            .map(|s| s.who.name.clone())
+            .collect();
+        assert_eq!(bots, ["Viper", "Cobra"], "the free name again");
+        while round.add_bot(1) {}
+        assert_eq!(round.players(), MAX_PLAYERS);
+
+        // A person takes a bot's seat in a full room.
+        round.join(who(3)).unwrap();
+        assert_eq!(round.players(), MAX_PLAYERS);
+        assert!(round.contains(3));
+        // When the people go, so does the room.
+        for id in 1..=3 {
+            round.leave(id);
+        }
+        assert!(round.is_empty());
+
+        let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+        let mut matched = Round::new_match(settings, 1, vec![who(1), who(2)]);
+        assert!(!matched.add_bot(1), "matches have who they have");
+    }
+
+    #[test]
+    fn bots_play_and_the_round_ends_once_the_people_are_out() {
+        let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+        let players = vec![who(1), bot_entrant(0), bot_entrant(1), bot_entrant(2)];
+        let mut round = Round::new_match(settings, 3, players);
+        // The person never steers, so they hit a wall soon; the bots don't.
+        let events = run_until(&mut round, |r| {
+            matches!(phase(r), PhaseView::Results { .. })
+        });
+        let Some(RoundEvent::Ended {
+            outcome,
+            placements,
+        }) = events.last()
+        else {
+            panic!("no results: {events:?}");
+        };
+        // The longest bot left wins; bots as long as each other draw.
+        match outcome {
+            Outcome::Won { winner, time_up } => assert!(is_bot(winner.id) && !time_up),
+            Outcome::Draw { time_up } => assert!(!time_up),
+        }
+        assert!(
+            round.steps < 100,
+            "ended as the person crashed: {}",
+            round.steps
+        );
+        let last = placements.last().unwrap();
+        assert_eq!(last.who.id, 1, "{placements:?}");
+        let bots_first = placements.iter().take(3).all(|p| is_bot(p.who.id));
+        assert!(bots_first, "{placements:?}");
     }
 
     #[test]
