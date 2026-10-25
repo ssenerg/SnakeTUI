@@ -199,6 +199,8 @@ pub struct SessionActor {
     account: Option<Account>,
     sign_in_failures: u8,
     invite: Option<PendingInvite>,
+    /// Counts friends-list refreshes; only the latest one's list is shown.
+    friends_refresh: u64,
     /// What friends were last told this player is doing.
     status: Option<Status>,
     hangup: Option<Hangup>,
@@ -280,6 +282,7 @@ impl SessionActor {
             account: None,
             sign_in_failures: 0,
             invite: None,
+            friends_refresh: 0,
             status: None,
             hangup: None,
             out: None,

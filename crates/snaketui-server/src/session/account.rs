@@ -356,6 +356,8 @@ impl SessionActor {
         let Some(account) = self.account_id() else {
             return;
         };
+        self.friends_refresh += 1;
+        let asked = self.friends_refresh;
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
         let lists = async move {
             let lists = store.friend_lists(account).await?;
@@ -385,7 +387,14 @@ impl SessionActor {
                 outgoing: lists.outgoing.into_iter().map(|f| f.username).collect(),
             })
         };
-        ctx.spawn(lists.into_actor(self).map(|lists, act, ctx| {
+        ctx.spawn(lists.into_actor(self).map(move |lists, act, ctx| {
+            // Refreshes overlap, and one that started earlier can finish
+            // later, with a list from before: say, read halfway through
+            // accepting a request, so it has neither the request nor the
+            // new friend. Only the latest one counts.
+            if asked != act.friends_refresh {
+                return;
+            }
             match lists {
                 Ok(view) => {
                     if let Some(app) = act.app.as_mut() {
