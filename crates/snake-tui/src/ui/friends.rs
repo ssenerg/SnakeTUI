@@ -77,10 +77,14 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 } else {
                     dim
                 };
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(format!("{marker}{:<16}", friend.name), style),
                     Span::styled(format!("  {}", friend.status), status),
-                ])
+                ];
+                if friend.watch {
+                    spans.push(Span::styled(" · v watch", dim));
+                }
+                Line::from(spans)
             }
             FriendsRow::Asked(a) => Line::from(vec![
                 Span::styled(format!("{marker}{:<16}", view.outgoing[*a]), style),
@@ -102,7 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
     let footer = vec![
         status,
         Line::styled(
-            "↑↓ select · Enter invite or answer · x remove · Esc back",
+            "↑↓ select · Enter invite or answer · v watch · x remove · Esc back",
             dim,
         ),
     ];

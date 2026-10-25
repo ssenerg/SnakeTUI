@@ -251,6 +251,34 @@ async fn friends_on_different_servers_see_each_other_and_play_together() {
 }
 
 #[tokio::test]
+async fn friends_watch_games_on_other_servers() {
+    let servers = cluster(2).await;
+    let (mut ann, _) = signed_up(servers[0].addr, "ann").await;
+    let (mut ben, _) = signed_up(servers[1].addr, "ben").await;
+    make_friends(&mut ann, &mut ben).await;
+    // ben's room runs on his server.
+    ben.send(ESC).await;
+    ben.wait_for("Signed in as ben").await;
+    ben.send(UP).await;
+    ben.send(UP).await;
+    ben.send(ENTER).await;
+    ben.wait_for("Private room").await;
+    ben.send(b"b").await;
+    ben.wait_for("Viper (bot)").await;
+
+    ann.send(ESC).await;
+    ann.wait_for("Signed in as ann").await;
+    ann.send(ENTER).await;
+    ann.wait_for("in a private room · v watch").await;
+    ann.send(DOWN).await;
+    ann.send(b"v").await;
+    ann.wait_for("Watching ben").await;
+    ben.wait_for("1 watching").await;
+    ben.send(ENTER).await;
+    ann.wait_for("ben is").await;
+}
+
+#[tokio::test]
 async fn quick_play_matches_within_a_region_first_then_across_regions() {
     let (servers, settings) = cluster_in(&["eu", "eu", "us"], "").await;
     // Five times faster: matches fill for 2 s, and regions open after 4 s.

@@ -24,7 +24,7 @@ use tokio::task::AbortHandle;
 use super::Cluster;
 use super::wire::{Input, InputKind, JoinReply, JoinRequest, decode};
 use crate::room::{
-    Bot, Join, Leave, Ping, Ready, RoomId, RoomRef, ServerId, SetRules, Steer, ViewRx,
+    Bot, Join, Leave, Ping, Ready, RoomId, RoomRef, ServerId, SetRules, Steer, ViewRx, Watch,
 };
 
 pub const ROOM_LOST: &str = "The server running this room went away.";
@@ -96,11 +96,21 @@ impl Cluster {
         };
         let seat = Arc::new(());
         let player = request.who.id;
-        let join = Join {
-            who: request.who,
-            presence: Arc::downgrade(&seat),
+        let presence = Arc::downgrade(&seat);
+        let view = if request.watch {
+            addr.send(Watch {
+                id: player,
+                presence,
+            })
+            .await
+        } else {
+            addr.send(Join {
+                who: request.who,
+                presence,
+            })
+            .await
         };
-        let view = addr.send(join).await.unwrap_or(Err(JoinError::Closed))?;
+        let view = view.unwrap_or(Err(JoinError::Closed))?;
         let now = (**view.borrow()).clone();
         self.exports
             .lock()
@@ -237,12 +247,14 @@ impl Cluster {
         }
     }
 
-    /// Takes a seat for `who` in the room at `at`, on another server.
+    /// Takes a seat for `who` in the room at `at`, on another server, or
+    /// with `watch`, lets them watch it.
     pub async fn join_remote(
         self: Arc<Self>,
         at: RoomRef,
         who: Entrant,
         presence: Weak<()>,
+        watch: bool,
     ) -> Result<ViewRx, JoinError> {
         if !self.alive(at.server) {
             return Err(JoinError::Closed);
@@ -262,6 +274,7 @@ impl Cluster {
         let request = JoinRequest {
             who,
             from: self.server,
+            watch,
         };
         let reply: Option<JoinReply> = self.request(self.room_subject(at, "join"), &request).await;
         let now = reply.unwrap_or(Err(JoinError::Closed))?;

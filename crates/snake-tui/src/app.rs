@@ -48,6 +48,8 @@ pub enum Screen {
     },
     /// Online: the best players by rating.
     Leaderboard,
+    /// Online: on the way to watching a friend's game.
+    JoiningToWatch,
     /// Online: a private room's rules, at [`snake_core::settings::room_settings`]
     /// entry `selected`. The host changes them.
     RoomRules {
@@ -87,6 +89,9 @@ pub enum Effect {
     /// Leave the queue for an unrated match against bots; answer with
     /// [`App::enter_room`].
     PlayBots,
+    /// Watch this friend's game; answer with [`App::watch_room`] or
+    /// [`App::watch_failed`].
+    Watch(String),
     LeaveRoom,
     /// Answer with [`App::set_name`].
     SetNickname(String),
@@ -352,7 +357,7 @@ impl App {
             Screen::Input(field) => self.input_key(field, key, effects),
             Screen::Finding => self.finding_key(key, effects),
             // Nothing to do until the room answers.
-            Screen::Joining { .. } => {}
+            Screen::Joining { .. } | Screen::JoiningToWatch => {}
             Screen::Room => self.room_key(key, effects),
             Screen::Form(kind) => self.form_key(kind, key, effects),
             Screen::Account { selected } => self.account_key(selected, key, effects),

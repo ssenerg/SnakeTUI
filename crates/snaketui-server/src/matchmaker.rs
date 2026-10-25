@@ -335,7 +335,7 @@ impl MatchmakerActor {
             return;
         };
         rated.insert(player, (w.on_rated.clone(), Instant::now()));
-        let join = Arc::clone(&cluster).join_remote(room, w.who.clone(), w.presence.clone());
+        let join = Arc::clone(&cluster).join_remote(room, w.who.clone(), w.presence.clone(), false);
         ctx.spawn(
             join.into_actor(self)
                 .map(move |joined, act, _| match joined {

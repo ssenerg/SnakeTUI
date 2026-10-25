@@ -733,6 +733,7 @@ impl Round {
             board: self.world.as_ref().map(World::view),
             placements: self.placements.clone(),
             ratings: Vec::new(),
+            watchers: 0,
         }
     }
 }
@@ -755,6 +756,8 @@ pub struct RoomView {
     pub placements: Vec<Placement>,
     /// Rated rooms: how the last round moved players' ratings.
     pub ratings: Vec<RatingChange>,
+    /// People watching who don't play. The server counts them.
+    pub watchers: usize,
 }
 
 /// A player's shown rating before and after a rated round.

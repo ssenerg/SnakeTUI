@@ -12,12 +12,12 @@ use snake_core::config::Rules;
 use snake_core::geom::Direction;
 use snake_core::round::{Entrant, JoinError, PlayerId, RoomView};
 
-use crate::presence::Status;
+use crate::presence::Doing;
 use crate::rating::Rating;
 use crate::room::{RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 8;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -112,6 +112,8 @@ pub struct RatedAt {
 pub struct JoinRequest {
     pub who: Entrant,
     pub from: ServerId,
+    /// Only to watch, without a seat.
+    pub watch: bool,
 }
 
 /// The room as it is now, to start from.
@@ -148,7 +150,7 @@ pub struct StatusQuery {
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct StatusReply(pub Vec<(AccountId, Status)>);
+pub struct StatusReply(pub Vec<(AccountId, Doing)>);
 
 #[cfg(test)]
 mod tests {

@@ -266,6 +266,45 @@ fn rating_on_home(text: &str) -> Option<u32> {
 }
 
 #[tokio::test]
+async fn friends_watch_each_others_games() {
+    let server = TestServer::start();
+    let (mut ann, _) = signed_up(server.addr, "ann").await;
+    let (mut ben, _) = signed_up(server.addr, "ben").await;
+    make_friends(&mut ann, &mut ben).await;
+
+    // ben makes a room, with a bot to play.
+    ben.send(ESC).await;
+    ben.wait_for("Signed in as ben").await;
+    ben.send(UP).await;
+    ben.send(UP).await;
+    ben.send(ENTER).await;
+    ben.wait_for("Private room").await;
+    ben.send(b"b").await;
+    ben.wait_for("Viper (bot)").await;
+
+    // ann opens her friends again and sees him there.
+    ann.send(ESC).await;
+    ann.wait_for("Signed in as ann").await;
+    ann.send(ENTER).await;
+    ann.wait_for("in a private room · v watch").await;
+    ann.send(DOWN).await;
+    ann.send(b"v").await;
+    ann.wait_for("Watching ben").await;
+    ben.wait_for("1 watching").await;
+    assert!(!ann.text().contains("Enter ready"), "{}", ann.text());
+
+    // The round starts for ben; ann follows his snake.
+    ben.send(ENTER).await;
+    ann.wait_for("ben is").await;
+    ann.send(ESC).await;
+    ann.wait_for("Add a friend").await;
+    ben.wait_until("nobody watching", Duration::from_secs(5), |p| {
+        !p.text().contains("watching")
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn quick_play_offers_an_unrated_match_against_bots() {
     let server = TestServer::start();
     let (mut ann, _) = signed_up(server.addr, "ann").await;

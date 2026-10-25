@@ -85,7 +85,8 @@ fn ping_style(ping: Duration) -> Style {
 fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
     let view = &room.view;
     let online = app.online.as_ref();
-    let height = 12 + view.seats.len() as u16 + u16::from(room.hosting());
+    let watchers = u16::from(view.watchers > 0);
+    let height = 12 + view.seats.len() as u16 + u16::from(room.hosting()) + watchers;
     let inner = dialog(frame, " Private room ", Color::Cyan, 60, height);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::default()];
@@ -144,6 +145,9 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         }
         lines.push(Line::from(spans));
     }
+    if view.watchers > 0 {
+        lines.push(Line::styled(format!("{} watching", view.watchers), dim()));
+    }
     lines.push(Line::default());
     lines.push(match starts_in {
         Some(left) => Line::from(format!(
@@ -158,10 +162,11 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         None => Line::default(),
     });
     let signed_in = online.is_some_and(|o| o.account.is_some());
-    let hint = match (room.hosting(), signed_in) {
-        (true, true) => "Enter ready · e rules · i invite · Esc leave",
-        (false, true) => "Enter ready · e rules · i invite friends · Esc leave",
-        (_, false) => "Enter ready · e rules · Esc leave",
+    let hint = match (&room.watching, room.hosting(), signed_in) {
+        (Some(friend), _, _) => format!("Watching {friend} · e rules · Esc leave"),
+        (None, true, true) => "Enter ready · e rules · i invite · Esc leave".into(),
+        (None, false, true) => "Enter ready · e rules · i invite friends · Esc leave".into(),
+        (None, _, false) => "Enter ready · e rules · Esc leave".into(),
     };
     lines.push(Line::from(hint).style(dim()));
     if room.hosting() {
@@ -174,7 +179,7 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
 /// theme's colors, the others in colors that stand apart from it.
 fn looks(app: &App, room: &InRoom, board: &MatchView) -> Vec<SnakeLook> {
     let theme = &app.cfg.theme;
-    let mine = room.my_seat().and_then(|s| s.slot);
+    let mine = room.followed().and_then(|s| s.slot);
     let others = opponent_colors(theme);
     let count = board
         .snakes
@@ -273,7 +278,7 @@ fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
 
     let looks = looks(app, room, board);
     let me = room
-        .my_seat()
+        .followed()
         .and_then(|s| s.slot)
         .and_then(|slot| board.snakes.iter().find(|s| s.id == slot))
         .and_then(|s| s.body.first().copied());
@@ -314,6 +319,7 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
 
     let mut seats: Vec<_> = room.view.seats.iter().collect();
     seats.sort_by_key(|s| std::cmp::Reverse((s.slot.is_some(), s.alive, s.length)));
+    let followed = room.followed().map(|s| s.who.id);
     // Round trips go last, as numbers if names keep 8 columns, or else as
     // a dot in their color.
     let (ping_w, name_w) = match (inner.width as usize).saturating_sub(8) {
@@ -337,7 +343,7 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
                 None => spans.push(Span::styled(" · ", dim())),
             }
             let name: String = seat.who.name.chars().take(name_w).collect();
-            let style = if seat.who.id == room.me {
+            let style = if Some(seat.who.id) == followed {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
@@ -364,6 +370,14 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
             Line::from(spans)
         })
         .collect();
+    let mut lines = lines;
+    if room.view.watchers > 0 {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            format!(" {} watching", room.view.watchers),
+            dim(),
+        ));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -379,6 +393,9 @@ fn status_line(room: &InRoom, cropped: bool, need_w: u16, need_h: u16) -> Line<'
             format!("Terminal too small: showing part of the board (needs {need_w}×{need_h})"),
             Style::default().fg(Color::LightRed),
         );
+    }
+    if let Some(friend) = &room.watching {
+        return Line::styled(format!("Watching {friend} · Esc leave"), dim());
     }
     let seat = room.my_seat();
     match &room.view.phase {
@@ -405,10 +422,14 @@ fn draw_countdown(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], left: D
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(slot) = room.my_seat().and_then(|s| s.slot) {
+    if let Some(slot) = room.followed().and_then(|s| s.slot) {
         let look = looks.get(slot as usize);
+        let who = match &room.watching {
+            Some(friend) => format!("{friend} is "),
+            None => "You're ".to_string(),
+        };
         lines.push(Line::from(vec![
-            Span::raw("You're "),
+            Span::raw(who),
             Span::styled(
                 format!(" {} ", slot + 1),
                 Style::default()
@@ -417,6 +438,8 @@ fn draw_countdown(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], left: D
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+    } else if let Some(friend) = &room.watching {
+        lines.push(Line::styled(format!("Watching {friend}"), dim()));
     } else {
         lines.push(Line::styled("You'll play the next round", dim()));
     }
@@ -451,7 +474,7 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
         },
     ];
     for p in &view.placements {
-        let style = if p.who.id == room.me {
+        let style = if Some(p.who.id) == room.followed().map(|s| s.who.id) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -479,6 +502,7 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
     }
     lines.push(Line::default());
     lines.push(match (view.kind, next_in) {
+        _ if room.watching.is_some() => Line::styled("Esc leave", dim()),
         (RoomKind::Match, _) => Line::styled("Enter find another match · Esc home", dim()),
         (RoomKind::Private, Some(left)) => {
             Line::styled(format!("Next round in {} s · Esc leave", secs(left)), dim())

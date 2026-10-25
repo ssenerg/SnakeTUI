@@ -1,6 +1,7 @@
 //! A session's account: signing up, in and out, remembered keys, its
 //! rating, friends, and invites.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use actix::prelude::*;
@@ -16,7 +17,9 @@ use tracing::{debug, warn};
 
 use super::SessionActor;
 use crate::auth;
-use crate::presence::{Deliver, Invite, Notice, Offline, Online, SetStatus, Status, StatusOf};
+use crate::presence::{
+    Deliver, Doing, Invite, Notice, Offline, Online, SetStatus, Status, StatusOf,
+};
 use crate::rating::Rating;
 use crate::room::{Rated, RoomHandle};
 use crate::store::{Account, AccountData, AccountId, Requested, now};
@@ -85,7 +88,10 @@ impl SessionActor {
             notices: ctx.address().recipient(),
             status: Status::Menu,
         });
-        self.status = Some(Status::Menu);
+        self.status = Some(Doing {
+            status: Status::Menu,
+            room: None,
+        });
         if let Some(app) = self.app.as_mut() {
             app.set_profile(Some(profile(&account)));
         }
@@ -100,6 +106,7 @@ impl SessionActor {
         };
         let room = app.online.as_ref().and_then(|o| o.room.as_ref());
         let status = match (app.screen, room) {
+            (_, Some(room)) if room.watching.is_some() => Status::Watching,
             (_, Some(room)) if room.view.kind == RoomKind::Match => Status::Match,
             (_, Some(_)) => Status::Room,
             (Screen::Finding, _) => Status::Queue,
@@ -109,12 +116,16 @@ impl SessionActor {
             ) => Status::SinglePlayer,
             _ => Status::Menu,
         };
-        if self.status != Some(status) {
-            self.status = Some(status);
+        let doing = Doing {
+            status,
+            room: self.room.as_ref().map(|link| link.room.at()),
+        };
+        if self.status != Some(doing) {
+            self.status = Some(doing);
             self.shared.presence.do_send(SetStatus {
                 account,
                 session: self.id,
-                status,
+                doing,
             });
         }
     }
@@ -372,13 +383,14 @@ impl SessionActor {
                 .friends
                 .into_iter()
                 .map(|f| {
-                    let status = online.get(&f.id);
+                    let doing = online.get(&f.id);
                     let row = FriendRow {
-                        online: status.is_some(),
-                        status: status.map_or_else(
+                        online: doing.is_some(),
+                        status: doing.map_or_else(
                             || format!("last seen {}", ago(f.last_seen)),
-                            |s| s.label().to_string(),
+                            |d| d.status.label().to_string(),
                         ),
+                        watch: doing.is_some_and(|d| d.watchable().is_some()),
                         name: f.username,
                     };
                     (row.online, row)
@@ -578,6 +590,54 @@ impl SessionActor {
         }));
     }
 
+    /// Watches the friend `name` play, in whatever room they're in, on
+    /// whichever server.
+    pub(super) fn watch(&mut self, name: String, ctx: &mut Context<Self>) {
+        let Some(me) = self.account.clone() else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        let who = self.entrant();
+        let seat = Arc::downgrade(&self.presence);
+        let found = async move {
+            let Some((them, _)) = shared.store.find_account(&name).await? else {
+                return anyhow::Ok(Err(format!("Nobody is called {name}.")));
+            };
+            if !shared.store.are_friends(me.id, them.id).await? {
+                return Ok(Err("You can only watch friends.".to_string()));
+            }
+            let doing = shared.presence.send(StatusOf(vec![them.id])).await?;
+            let over = format!("{} isn't playing a game to watch.", them.username);
+            let Some(room) = doing
+                .get(&them.id)
+                .and_then(|d| d.watchable())
+                .and_then(|at| shared.room(at))
+            else {
+                return Ok(Err(over));
+            };
+            Ok(match room.watch(who, seat).await {
+                Ok(view) => Ok((room, view, them.username)),
+                Err(JoinError::Full) => Err("Too many people are watching that game.".into()),
+                Err(JoinError::Closed) => Err(over),
+            })
+        };
+        ctx.spawn(found.into_actor(self).map(|found, act, ctx| match found {
+            Ok(Ok((room, view, friend))) => act.watching(room, view, friend, ctx),
+            Ok(Err(why)) => act.watch_failed(why, ctx),
+            Err(e) => {
+                warn!(error = %e, "couldn't find a game to watch");
+                act.watch_failed(TRY_AGAIN.to_string(), ctx);
+            }
+        }));
+    }
+
+    fn watch_failed(&mut self, why: String, ctx: &mut Context<Self>) {
+        if let Some(app) = self.app.as_mut() {
+            app.watch_failed(why);
+        }
+        self.render(ctx);
+    }
+
     /// Invites the friend `name` to the private room the player is in, or
     /// to a new one made with their settings.
     pub(super) fn invite(&mut self, name: String, ctx: &mut Context<Self>) {
@@ -605,7 +665,7 @@ impl SessionActor {
                 return Ok(Err("You can only invite friends.".to_string()));
             }
             let online = presence.send(StatusOf(vec![them.id])).await?;
-            match online.get(&them.id) {
+            match online.get(&them.id).map(|d| d.status) {
                 None => return Ok(Err(format!("{} is offline.", them.username))),
                 Some(Status::Match) => {
                     return Ok(Err(format!("{} is in a match right now.", them.username)));

@@ -21,6 +21,7 @@ use crate::store::AccountId;
 pub enum Status {
     Menu,
     SinglePlayer,
+    Watching,
     Queue,
     Room,
     Match,
@@ -31,9 +32,35 @@ impl Status {
         match self {
             Status::Menu => "online",
             Status::SinglePlayer => "playing single player",
+            Status::Watching => "watching a game",
             Status::Queue => "looking for a match",
             Status::Room => "in a private room",
             Status::Match => "in a match",
+        }
+    }
+}
+
+/// What a player is doing, and where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Doing {
+    pub status: Status,
+    /// The room they're playing in, which friends can watch.
+    pub room: Option<RoomRef>,
+}
+
+impl Doing {
+    /// Whether friends can watch them play.
+    pub fn watchable(&self) -> Option<RoomRef> {
+        self.room
+            .filter(|_| matches!(self.status, Status::Room | Status::Match))
+    }
+
+    /// The busier of the two, as a player signed in twice shows.
+    fn busier(self, other: Doing) -> Doing {
+        if other.status > self.status {
+            other
+        } else {
+            self
         }
     }
 }
@@ -75,12 +102,12 @@ pub struct Offline {
 pub struct SetStatus {
     pub account: AccountId,
     pub session: PlayerId,
-    pub status: Status,
+    pub doing: Doing,
 }
 
 /// What each of these accounts is doing; offline ones are left out.
 #[derive(Message)]
-#[rtype(result = "HashMap<AccountId, Status>")]
+#[rtype(result = "HashMap<AccountId, Doing>")]
 pub struct StatusOf(pub Vec<AccountId>);
 
 /// Passes `notice` to every session `to` is signed in on. Answers whether
@@ -95,7 +122,7 @@ pub struct Deliver {
 struct Entry {
     session: PlayerId,
     notices: Recipient<Notice>,
-    status: Status,
+    doing: Doing,
 }
 
 /// Who's online here. In a cluster it also answers other servers about its
@@ -117,16 +144,16 @@ impl PresenceActor {
         }
     }
 
-    fn status(&self, account: AccountId) -> Option<Status> {
+    fn status(&self, account: AccountId) -> Option<Doing> {
         self.online
             .get(&account)?
             .iter()
             .filter(|e| e.notices.connected())
-            .map(|e| e.status)
-            .max()
+            .map(|e| e.doing)
+            .reduce(Doing::busier)
     }
 
-    fn statuses(&self, accounts: &[AccountId]) -> HashMap<AccountId, Status> {
+    fn statuses(&self, accounts: &[AccountId]) -> HashMap<AccountId, Doing> {
         accounts
             .iter()
             .filter_map(|&a| self.status(a).map(|s| (a, s)))
@@ -245,7 +272,10 @@ impl Handler<Online> for PresenceActor {
         entries.push(Entry {
             session: msg.session,
             notices: msg.notices,
-            status: msg.status,
+            doing: Doing {
+                status: msg.status,
+                room: None,
+            },
         });
         self.listen_for(msg.account, ctx);
     }
@@ -276,13 +306,13 @@ impl Handler<SetStatus> for PresenceActor {
             .get_mut(&msg.account)
             .and_then(|entries| entries.iter_mut().find(|e| e.session == msg.session))
         {
-            entry.status = msg.status;
+            entry.doing = msg.doing;
         }
     }
 }
 
 impl Handler<StatusOf> for PresenceActor {
-    type Result = ResponseFuture<HashMap<AccountId, Status>>;
+    type Result = ResponseFuture<HashMap<AccountId, Doing>>;
 
     fn handle(&mut self, StatusOf(accounts): StatusOf, _: &mut Self::Context) -> Self::Result {
         let mut statuses = self.statuses(&accounts);
@@ -297,9 +327,9 @@ impl Handler<StatusOf> for PresenceActor {
             let answers: Vec<StatusReply> = cluster
                 .ask_all(cluster.subject("presence.status"), &question)
                 .await;
-            for (account, status) in answers.into_iter().flat_map(|a| a.0) {
-                let busiest = statuses.entry(account).or_insert(status);
-                *busiest = (*busiest).max(status);
+            for (account, doing) in answers.into_iter().flat_map(|a| a.0) {
+                let busiest = statuses.entry(account).or_insert(doing);
+                *busiest = busiest.busier(doing);
             }
             statuses
         })
@@ -367,8 +397,8 @@ mod tests {
         }
         let statuses = presence.send(StatusOf(vec![7, 8])).await.unwrap();
         assert_eq!(
-            statuses.get(&7),
-            Some(&Status::Match),
+            statuses.get(&7).map(|d| d.status),
+            Some(Status::Match),
             "the busiest session"
         );
         assert_eq!(statuses.get(&8), None, "offline");
@@ -388,16 +418,34 @@ mod tests {
             })
             .await
             .unwrap();
+        let room = RoomRef { server: 0, room: 3 };
         presence
             .send(SetStatus {
                 account: 7,
                 session: 1,
-                status: Status::Queue,
+                doing: Doing {
+                    status: Status::Room,
+                    room: Some(room),
+                },
             })
             .await
             .unwrap();
         let statuses = presence.send(StatusOf(vec![7])).await.unwrap();
-        assert_eq!(statuses.get(&7), Some(&Status::Queue));
+        assert_eq!(statuses[&7].watchable(), Some(room), "in a room to watch");
+        presence
+            .send(SetStatus {
+                account: 7,
+                session: 1,
+                doing: Doing {
+                    status: Status::Watching,
+                    room: Some(room),
+                },
+            })
+            .await
+            .unwrap();
+        let statuses = presence.send(StatusOf(vec![7])).await.unwrap();
+        assert_eq!(statuses[&7].status, Status::Watching);
+        assert_eq!(statuses[&7].watchable(), None, "watchers aren't watched");
         presence
             .send(Offline {
                 account: 7,

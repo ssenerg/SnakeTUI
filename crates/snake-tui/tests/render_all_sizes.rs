@@ -240,6 +240,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
                         "last seen 12 days ago".into()
                     },
                     online: i % 2 == 0,
+                    watch: i % 4 == 0,
                 })
                 .collect(),
             incoming: vec!["someone-asking".into(), "another".into()],
@@ -332,6 +333,21 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         app.enter_room(2, Arc::new(view.clone()));
         apps.push(app);
     }
+    // Watching player 2 in each phase, with others watching too.
+    let mut phases = Vec::new();
+    for view in &views {
+        let phase = std::mem::discriminant(&view.phase);
+        if phases.contains(&phase) {
+            continue;
+        }
+        phases.push(phase);
+        let mut watched = view.clone();
+        watched.watchers = 3;
+        let mut app = account(Screen::JoiningToWatch);
+        app.watch_room(99, entrant(2).name, Arc::new(watched));
+        apps.push(app);
+    }
+    apps.push(account(Screen::JoiningToWatch));
     // Results of a rated match, with ratings up and down.
     let mut rated = views
         .iter()
@@ -663,4 +679,48 @@ fn bots_are_marked_and_offered() {
     let offer = shown(&waiting, 80, 24);
     assert!(offer.contains("Play bots now, unrated."), "{offer}");
     assert!(offer.contains("b play bots · Esc cancel"), "{offer}");
+}
+
+#[test]
+fn watchers_follow_their_friend_and_are_counted() {
+    let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+    let players = vec![
+        Entrant {
+            id: 1,
+            name: "~p1".into(),
+        },
+        Entrant {
+            id: 2,
+            name: "bob".into(),
+        },
+    ];
+    let mut round = Round::new_match(settings, 1, players);
+    while !matches!(round.view().phase, PhaseView::Running { .. }) {
+        round.advance(Duration::from_millis(100));
+    }
+    let mut view = round.view();
+    view.watchers = 2;
+    let mut app = App::online(
+        GameConfig::default(),
+        Records::default(),
+        "~me".into(),
+        true,
+    );
+    app.screen = Screen::JoiningToWatch;
+    app.watch_room(99, "bob".into(), Arc::new(view.clone()));
+    let watching = shown(&app, 80, 24);
+    assert!(watching.contains("Watching bob · Esc leave"), "{watching}");
+    assert!(watching.contains("2 watching"), "{watching}");
+    assert!(!watching.contains("←↑↓→ move"), "{watching}");
+
+    // Players see who's watching too.
+    let mut player = App::online(
+        GameConfig::default(),
+        Records::default(),
+        "~p1".into(),
+        true,
+    );
+    player.enter_room(1, Arc::new(view));
+    let playing = shown(&player, 80, 24);
+    assert!(playing.contains("2 watching"), "{playing}");
 }

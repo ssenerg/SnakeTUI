@@ -138,6 +138,11 @@ Guests can play everything except friends and ratings. To get those, pick
   in a new private room, or press `i` in a room you're already in. Your
   friend sees the invite on whatever screen they're on: Enter joins, Esc
   dismisses it. Invites last 2 minutes.
+- **Watching a friend.** In Friends, press `v` on a friend who's in a match
+  or a private room to watch their game live, with their snake in your
+  colors. You don't play and nothing you press moves anything; Esc takes you
+  back to Friends. Players see how many are watching. Up to 20 people can
+  watch one room, whichever servers they're on.
 - **Ratings.** Every account starts at 1000. Only quick play is rated: each
   match moves your rating by where you placed and whom you beat, and the
   results show by how much. Quick play looks for players of a close rating

@@ -40,6 +40,8 @@ pub type Presence = Weak<()>;
 const MAILBOX: usize = 256;
 /// A finished match closes this long after its results first show.
 const MATCH_LINGER: Duration = Duration::from_secs(60);
+/// People who may watch one room at once.
+const MAX_WATCHERS: usize = 20;
 const BROKEN: &str = "Something went wrong in this room, so it closed. Sorry!";
 const MATCH_OVER: &str = "The match is over.";
 const DRAINED: &str = "This room's server is restarting. Reconnect to keep playing.";
@@ -189,6 +191,30 @@ impl RoomHandle {
         }
     }
 
+    /// Lets `who` watch without a seat; `presence` shows they're still
+    /// there.
+    pub fn watch(
+        &self,
+        who: Entrant,
+        presence: Presence,
+    ) -> impl Future<Output = Result<ViewRx, JoinError>> + use<> {
+        let room = self.clone();
+        async move {
+            match room {
+                RoomHandle::Local { addr, .. } => addr
+                    .send(Watch {
+                        id: who.id,
+                        presence,
+                    })
+                    .await
+                    .unwrap_or(Err(JoinError::Closed)),
+                RoomHandle::Remote { at, cluster } => {
+                    cluster.join_remote(at, who, presence, true).await
+                }
+            }
+        }
+    }
+
     /// Takes a seat for `who`; `presence` shows the player is still there.
     pub fn join(
         &self,
@@ -202,7 +228,9 @@ impl RoomHandle {
                     .send(Join { who, presence })
                     .await
                     .unwrap_or(Err(JoinError::Closed)),
-                RoomHandle::Remote { at, cluster } => cluster.join_remote(at, who, presence).await,
+                RoomHandle::Remote { at, cluster } => {
+                    cluster.join_remote(at, who, presence, false).await
+                }
             }
         }
     }
@@ -337,6 +365,16 @@ pub struct Join {
     pub presence: Presence,
 }
 
+/// Watching without a seat. A full room of watchers says
+/// [`JoinError::Full`].
+#[derive(Message)]
+#[rtype(result = "Result<ViewRx, JoinError>")]
+pub struct Watch {
+    pub id: PlayerId,
+    pub presence: Presence,
+}
+
+/// Gives up a seat, or stops watching.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Leave(pub PlayerId);
@@ -389,6 +427,8 @@ pub struct RoomActor {
     view: watch::Sender<Arc<RoomView>>,
     lobby: Option<Addr<LobbyActor>>,
     present: HashMap<PlayerId, Presence>,
+    /// People watching without a seat.
+    watchers: HashMap<PlayerId, Presence>,
     /// Each player's round trip, as their session last measured it.
     pings: HashMap<PlayerId, Duration>,
     ratings: Option<Ratings>,
@@ -435,7 +475,7 @@ impl RoomActor {
         ratings: Option<Ratings>,
     ) -> (Self, ViewRx) {
         let pings = HashMap::new();
-        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[], &pings)));
+        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[], &pings, 0)));
         let now = Instant::now();
         let room = Self {
             registered: None,
@@ -444,6 +484,7 @@ impl RoomActor {
             view,
             lobby,
             present,
+            watchers: HashMap::new(),
             pings,
             ratings,
             changes: Vec::new(),
@@ -494,11 +535,13 @@ impl RoomActor {
         self.schedule(ctx);
     }
 
-    /// Players whose session is gone leave, as if they'd pressed Esc.
+    /// Players and watchers whose session is gone leave, as if they'd
+    /// pressed Esc.
     fn drop_absent(&mut self, ctx: &mut Context<Self>) {
         let gone: Vec<PlayerId> = self
             .present
             .iter()
+            .chain(&self.watchers)
             .filter(|(_, p)| p.strong_count() == 0)
             .map(|(id, _)| *id)
             .collect();
@@ -508,6 +551,9 @@ impl RoomActor {
     }
 
     fn leave(&mut self, id: PlayerId, ctx: &mut Context<Self>) {
+        if self.watchers.remove(&id).is_some() {
+            return self.publish_now();
+        }
         self.present.remove(&id);
         self.pings.remove(&id);
         if let Some(events) = self.guarded(ctx, |round| round.leave(id)) {
@@ -599,6 +645,7 @@ impl RoomActor {
             &self.code,
             &self.changes,
             &self.pings,
+            self.watchers.len(),
         )));
     }
 
@@ -617,9 +664,11 @@ fn view_of(
     code: &Option<String>,
     changes: &[RatingChange],
     pings: &HashMap<PlayerId, Duration>,
+    watchers: usize,
 ) -> RoomView {
     let mut view = round.view();
     view.code.clone_from(code);
+    view.watchers = watchers;
     if !view.placements.is_empty() {
         view.ratings = changes.to_vec();
     }
@@ -640,6 +689,20 @@ impl Handler<Join> for RoomActor {
         joined?;
         self.present.insert(id, msg.presence);
         self.publish();
+        Ok(self.view.subscribe())
+    }
+}
+
+impl Handler<Watch> for RoomActor {
+    type Result = Result<ViewRx, JoinError>;
+
+    fn handle(&mut self, Watch { id, presence }: Watch, _: &mut Self::Context) -> Self::Result {
+        if self.watchers.len() >= MAX_WATCHERS && !self.watchers.contains_key(&id) {
+            return Err(JoinError::Full);
+        }
+        self.watchers.insert(id, presence);
+        debug!(code = ?self.code, watchers = self.watchers.len(), "watching");
+        self.publish_now();
         Ok(self.view.subscribe())
     }
 }
@@ -725,5 +788,45 @@ impl Handler<Ready> for RoomActor {
     fn handle(&mut self, Ready(id): Ready, ctx: &mut Self::Context) {
         self.guarded(ctx, |round| round.toggle_ready(id));
         self.publish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use snake_core::round::{RoomKind, Round, RoundSettings, quick_rules};
+
+    use super::*;
+
+    #[actix_rt::test]
+    async fn watchers_have_no_seats_and_only_so_many_fit() {
+        let settings = RoundSettings::new(quick_rules(), RoomKind::Private).unwrap();
+        let round = Round::new(settings, 1);
+        let (room, view) = RoomActor::new(round, None, None, HashMap::new(), None);
+        let room = room.start();
+        let seat = Arc::new(());
+        let who = Entrant {
+            id: 1,
+            name: "~p1".into(),
+        };
+        let presence = Arc::downgrade(&seat);
+        room.send(Join { who, presence }).await.unwrap().unwrap();
+
+        let here: Vec<Arc<()>> = (0..=MAX_WATCHERS).map(|_| Arc::new(())).collect();
+        let watch = |i: usize| Watch {
+            id: 100 + i as PlayerId,
+            presence: Arc::downgrade(&here[i]),
+        };
+        for i in 0..MAX_WATCHERS {
+            room.send(watch(i)).await.unwrap().unwrap();
+        }
+        let full = room.send(watch(MAX_WATCHERS)).await.unwrap();
+        assert!(matches!(full, Err(JoinError::Full)));
+        assert_eq!(view.borrow().watchers, MAX_WATCHERS);
+        let seats: Vec<PlayerId> = view.borrow().seats.iter().map(|s| s.who.id).collect();
+        assert_eq!(seats, [1], "watchers have no seats");
+
+        room.send(Leave(100)).await.unwrap();
+        assert_eq!(view.borrow().watchers, MAX_WATCHERS - 1);
+        assert!(room.send(watch(MAX_WATCHERS)).await.unwrap().is_ok());
     }
 }

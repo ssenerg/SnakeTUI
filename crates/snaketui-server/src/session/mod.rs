@@ -30,7 +30,7 @@ use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::PINGS;
-use crate::presence::Status;
+use crate::presence::Doing;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData};
 use crate::{Shared, Stopping};
@@ -202,7 +202,7 @@ pub struct SessionActor {
     /// Counts friends-list refreshes; only the latest one's list is shown.
     friends_refresh: u64,
     /// What friends were last told this player is doing.
-    status: Option<Status>,
+    status: Option<Doing>,
     hangup: Option<Hangup>,
     out: Option<mpsc::Sender<Out>>,
     player: Option<Player>,
@@ -537,6 +537,7 @@ impl SessionActor {
                     }
                 }
                 Effect::PlayBots => self.shared.matchmaker.do_send(BotMatch(self.id)),
+                Effect::Watch(name) => self.watch(name, ctx),
                 Effect::LeaveRoom => self.leave_room(ctx),
                 Effect::SetNickname(name) => self.rename(&name, ctx),
                 Effect::SignUp { username, password } => self.sign_up(username, password, ctx),
@@ -676,6 +677,11 @@ impl SessionActor {
         if let Some(app) = self.app.as_mut() {
             app.enter_room(self.id, current);
         }
+        self.link(room, view, ctx);
+    }
+
+    /// Follows `room`'s views from now on.
+    fn link(&mut self, room: RoomHandle, view: ViewRx, ctx: &mut Context<Self>) {
         self.stays += 1;
         let stay = self.stays;
         let watch = self.watch_room(view, stay, ctx);
@@ -685,6 +691,30 @@ impl SessionActor {
         self.room = Some(RoomLink { room, watch, stay });
         self.report_status();
         self.render(ctx);
+    }
+
+    /// The player now watches `friend` in `room`, without a seat. If they've
+    /// stopped wanting to meanwhile, they let it go.
+    fn watching(
+        &mut self,
+        room: RoomHandle,
+        view: ViewRx,
+        friend: String,
+        ctx: &mut Context<Self>,
+    ) {
+        let wanted = self
+            .app
+            .as_ref()
+            .is_some_and(|a| a.screen == Screen::JoiningToWatch && !a.in_room());
+        if self.closing || !wanted || self.room.is_some() {
+            room.leave(self.id);
+            return;
+        }
+        let current = view.borrow().clone();
+        if let Some(app) = self.app.as_mut() {
+            app.watch_room(self.id, friend, current);
+        }
+        self.link(room, view, ctx);
     }
 
     /// Waits for the room's next view; each one re-arms the wait.

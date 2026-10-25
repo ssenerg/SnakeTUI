@@ -213,6 +213,8 @@ pub struct FriendRow {
     /// What they're doing, or when they were last seen.
     pub status: String,
     pub online: bool,
+    /// Playing in a room this player can watch.
+    pub watch: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -358,11 +360,22 @@ pub struct InRoom {
     pub view: Arc<RoomView>,
     /// Esc during a round asks first.
     pub confirm_leave: bool,
+    /// Only watching, without a seat: the friend this player follows.
+    pub watching: Option<String>,
 }
 
 impl InRoom {
     pub fn my_seat(&self) -> Option<&SeatView> {
         self.view.seat(self.me)
+    }
+
+    /// The seat this player's screen follows: their own, or the friend's
+    /// they watch.
+    pub fn followed(&self) -> Option<&SeatView> {
+        match &self.watching {
+            Some(friend) => self.view.seats.iter().find(|s| s.who.name == *friend),
+            None => self.my_seat(),
+        }
     }
 
     /// Whether this player sets the room's rules.
@@ -642,6 +655,22 @@ impl App {
         let Some(room) = online.room.as_mut() else {
             return;
         };
+        // Watching: Esc goes back to the friends list. The rules can be read.
+        if room.watching.is_some() {
+            match key {
+                Key::Esc | Key::Char('q') => {
+                    effects.extend([Effect::LeaveRoom, Effect::LoadFriends]);
+                    online.room = None;
+                    online.friends_from_room = false;
+                    self.screen = Screen::Friends { selected: 0 };
+                }
+                Key::Char('e') if matches!(room.view.phase, PhaseView::Waiting { .. }) => {
+                    self.screen = Screen::RoomRules { selected: 0 };
+                }
+                _ => {}
+            }
+            return;
+        }
         let leave = match &room.view.phase {
             PhaseView::Waiting { .. } => match key {
                 Key::Enter | Key::Char(' ' | 'r') => {
@@ -954,6 +983,19 @@ impl App {
                     }
                 }
             }
+            (FriendsRow::Friend(i), Key::Char('v')) => {
+                let friend = &online.friends.friends[i];
+                if friend.watch {
+                    if online.room.is_some() {
+                        effects.push(Effect::LeaveRoom);
+                        online.room = None;
+                    }
+                    effects.push(Effect::Watch(friend.name.clone()));
+                    self.screen = Screen::JoiningToWatch;
+                } else {
+                    online.notice = Some(format!("{} isn't playing a game to watch.", friend.name));
+                }
+            }
             (FriendsRow::Friend(i), Key::Char('x')) => {
                 let name = online.friends.friends[i].name.clone();
                 if confirm_remove.as_deref() == Some(&name) {
@@ -1024,8 +1066,26 @@ impl App {
             me,
             view,
             confirm_leave: false,
+            watching: None,
         });
         self.screen = Screen::Room;
+    }
+
+    /// This player now watches `friend` play, in a room with no seat for
+    /// them.
+    pub fn watch_room(&mut self, me: PlayerId, friend: String, view: Arc<RoomView>) {
+        self.enter_room(me, view);
+        if let Some(room) = self.online.as_mut().and_then(|o| o.room.as_mut()) {
+            room.watching = Some(friend);
+        }
+    }
+
+    /// Watching a friend didn't work: back to the friends list, saying why.
+    pub fn watch_failed(&mut self, why: String) {
+        if self.screen == Screen::JoiningToWatch {
+            self.screen = Screen::Friends { selected: 0 };
+            self.notify(why);
+        }
     }
 
     /// The room changed.
@@ -1063,9 +1123,14 @@ impl App {
     /// The room is gone; `reason` says why, if the room said.
     pub fn room_closed(&mut self, reason: Option<String>) {
         if self.in_room() {
+            let watching = self
+                .online
+                .as_ref()
+                .and_then(|o| o.room.as_ref())
+                .is_some_and(|r| r.watching.is_some());
             self.leave_room();
             if let Some(online) = &mut self.online {
-                online.notice = reason;
+                online.notice = reason.or_else(|| watching.then(|| "That game is over.".into()));
             }
         }
     }
@@ -1631,6 +1696,57 @@ mod tests {
     }
 
     #[test]
+    fn friends_in_a_game_can_be_watched_and_left() {
+        let mut app = signed_in();
+        choose(&mut app, HomeItem::Friends);
+        let friend = |name: &str, watch| FriendRow {
+            name: name.into(),
+            status: "in a match".into(),
+            online: true,
+            watch,
+        };
+        app.set_friends(FriendsView {
+            friends: vec![friend("bob", true), friend("cat", false)],
+            ..FriendsView::default()
+        });
+        // Add, then bob, then cat.
+        app.handle(Key::Down);
+        assert_eq!(app.handle(Key::Char('v')), [Effect::Watch("bob".into())]);
+        assert_eq!(app.screen, Screen::JoiningToWatch);
+        app.watch_failed("That game is over.".into());
+        assert_eq!(app.screen, Screen::Friends { selected: 0 });
+        assert_eq!(notice(&app), Some("That game is over."));
+        app.handle(Key::Down);
+        app.handle(Key::Down);
+        assert_eq!(app.handle(Key::Char('v')), []);
+        assert_eq!(notice(&app), Some("cat isn't playing a game to watch."));
+
+        // Watching bob, in a match without a seat: no keys play.
+        app.screen = Screen::JoiningToWatch;
+        let mut view = (*matched_view()).clone();
+        view.seats[0].who.name = "bob".into();
+        app.watch_room(9, "bob".into(), Arc::new(view));
+        assert_eq!(app.screen, Screen::Room);
+        let room = app.online.as_ref().unwrap().room.as_ref().unwrap();
+        assert_eq!(room.followed().map(|s| s.who.id), Some(1), "bob's seat");
+        for key in [Key::Up, Key::Enter, Key::Char('r')] {
+            assert_eq!(app.handle(key), []);
+        }
+        assert_eq!(
+            app.handle(Key::Esc),
+            [Effect::LeaveRoom, Effect::LoadFriends]
+        );
+        assert_eq!(app.screen, Screen::Friends { selected: 0 });
+        assert!(!app.in_room());
+
+        // A game that ends sends the watcher home, saying so.
+        app.screen = Screen::JoiningToWatch;
+        app.watch_room(9, "bob".into(), matched_view());
+        app.room_closed(None);
+        assert_eq!(notice(&app), Some("That game is over."));
+    }
+
+    #[test]
     fn friends_are_invited_removed_on_a_second_x_and_requests_answered() {
         let mut app = signed_in();
         assert_eq!(choose(&mut app, HomeItem::Friends), [Effect::LoadFriends]);
@@ -1640,11 +1756,13 @@ mod tests {
                     name: "bob".into(),
                     status: "online".into(),
                     online: true,
+                    watch: false,
                 },
                 FriendRow {
                     name: "cat".into(),
                     status: "last seen today".into(),
                     online: false,
+                    watch: false,
                 },
             ],
             incoming: vec!["dan".into()],
