@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::accept::counted_as;
 use crate::identity::GENERIC_USERS;
-use crate::store::{Counted, Store};
+use crate::store::{AccountId, Counted, Store};
 
 pub const MIN_USERNAME: usize = 3;
 pub const MAX_USERNAME: usize = 16;
@@ -141,6 +141,17 @@ pub const SIGNUP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// they come from.
 pub const CODE_TRIES: usize = 20;
 pub const CODE_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// Friend requests one account may send an hour, and how many a day to
+/// the same account, however often they're taken back.
+pub const FRIEND_ASKS: usize = 20;
+pub const FRIEND_ASK_WINDOW: Duration = Duration::from_secs(60 * 60);
+pub const SAME_ASKS: usize = 3;
+pub const SAME_ASK_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// Invites one account may send in 10 minutes, and how many to the same
+/// friend.
+pub const INVITES: usize = 20;
+pub const SAME_INVITES: usize = 3;
+pub const INVITE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Tries to make an account one IP address may make, taken names and all.
 pub const SIGNUP_TRIES: usize = 30;
 pub const SIGNUP_TRY_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -159,6 +170,14 @@ pub enum Refused {
     Busy,
     /// This address tried too many wrong room codes.
     TooManyCodes,
+    /// This account sent too many friend requests lately.
+    TooManyAsks,
+    /// This account asked the same one too often lately.
+    AskedThemLately,
+    /// This account sent too many invites lately.
+    TooManyInvites,
+    /// This account invited the same friend too often lately.
+    InvitedThemLately,
 }
 
 impl Refused {
@@ -174,6 +193,10 @@ impl Refused {
             }
             Refused::Busy => "Another try is still going. Try again in a moment.",
             Refused::TooManyCodes => "Too many wrong codes from your address. Try again later.",
+            Refused::TooManyAsks => "You've sent a lot of friend requests. Try again later.",
+            Refused::AskedThemLately => "You've asked them a lot today. Give them a while.",
+            Refused::TooManyInvites => "You've sent a lot of invites. Try again in a few minutes.",
+            Refused::InvitedThemLately => "You've invited them a lot. Give them a few minutes.",
         }
     }
 }
@@ -341,6 +364,81 @@ impl GuessLimits {
         self.store
             .note(Counted::WrongCode, &counted_as(from).to_string(), now)
             .await
+    }
+
+    /// Whether `from` may ask `to` to be friends; counts it if so.
+    pub async fn may_ask_friend(
+        &self,
+        from: AccountId,
+        to: AccountId,
+        now: i64,
+    ) -> Result<Result<(), Refused>> {
+        let limits = [
+            (
+                Counted::FriendAsk,
+                from.to_string(),
+                FRIEND_ASKS,
+                FRIEND_ASK_WINDOW,
+                Refused::TooManyAsks,
+            ),
+            (
+                Counted::FriendAskPair,
+                format!("{from}>{to}"),
+                SAME_ASKS,
+                SAME_ASK_WINDOW,
+                Refused::AskedThemLately,
+            ),
+        ];
+        self.within(&limits, now).await
+    }
+
+    /// Whether `from` may invite `to`; counts it if so.
+    pub async fn may_invite(
+        &self,
+        from: AccountId,
+        to: AccountId,
+        now: i64,
+    ) -> Result<Result<(), Refused>> {
+        let limits = [
+            (
+                Counted::Invite,
+                from.to_string(),
+                INVITES,
+                INVITE_WINDOW,
+                Refused::TooManyInvites,
+            ),
+            (
+                Counted::InvitePair,
+                format!("{from}>{to}"),
+                SAME_INVITES,
+                INVITE_WINDOW,
+                Refused::InvitedThemLately,
+            ),
+        ];
+        self.within(&limits, now).await
+    }
+
+    /// Whether each count is under its limit, noting one more of each if
+    /// they all are.
+    async fn within(
+        &self,
+        limits: &[(Counted, String, usize, Duration, Refused)],
+        now: i64,
+    ) -> Result<Result<(), Refused>> {
+        for (what, subject, most, window, refused) in limits {
+            if self
+                .store
+                .count(*what, subject, now - secs(*window))
+                .await?
+                >= *most as i64
+            {
+                return Ok(Err(*refused));
+            }
+        }
+        for (what, subject, ..) in limits {
+            self.store.note(*what, subject, now).await?;
+        }
+        Ok(Ok(()))
     }
 
     /// Forgets what no longer counts, so the tables stay small.
@@ -512,6 +610,44 @@ mod tests {
         );
         let other = IpAddr::from([0x2001, 0xdb8, 7, 8, 0, 0, 0, 1]);
         assert_eq!(limits.may_try_code(other, 0).await.unwrap(), Ok(()));
+    }
+
+    #[actix_rt::test]
+    async fn friend_requests_and_invites_are_limited() {
+        let limits = limits().await;
+        // Asking one account again and again, taking it back between.
+        for _ in 0..SAME_ASKS {
+            assert_eq!(limits.may_ask_friend(1, 2, 0).await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            limits.may_ask_friend(1, 2, 0).await.unwrap(),
+            Err(Refused::AskedThemLately)
+        );
+        // Asking everyone.
+        for to in 3..(3 + FRIEND_ASKS as i64 - SAME_ASKS as i64) {
+            assert_eq!(limits.may_ask_friend(1, to, 0).await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            limits.may_ask_friend(1, 999, 0).await.unwrap(),
+            Err(Refused::TooManyAsks)
+        );
+        assert_eq!(
+            limits.may_ask_friend(2, 1, 0).await.unwrap(),
+            Ok(()),
+            "others can"
+        );
+        let tomorrow = secs(SAME_ASK_WINDOW) + 1;
+        assert_eq!(limits.may_ask_friend(1, 2, tomorrow).await.unwrap(), Ok(()));
+
+        for _ in 0..SAME_INVITES {
+            assert_eq!(limits.may_invite(1, 2, 0).await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            limits.may_invite(1, 2, 0).await.unwrap(),
+            Err(Refused::InvitedThemLately)
+        );
+        let later = secs(INVITE_WINDOW) + 1;
+        assert_eq!(limits.may_invite(1, 2, later).await.unwrap(), Ok(()));
     }
 
     #[actix_rt::test]

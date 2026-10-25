@@ -525,12 +525,16 @@ impl SessionActor {
             return;
         };
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
+        let guesses = self.shared.guesses.clone();
         let asked = async move {
             let Some((them, _)) = store.find_account(&name).await? else {
                 return anyhow::Ok(format!("Nobody is called {name}."));
             };
             if them.id == me.id {
                 return Ok("That's you.".to_string());
+            }
+            if let Err(refused) = guesses.may_ask_friend(me.id, them.id, now()).await? {
+                return Ok(refused.message().to_string());
             }
             let who = them.username;
             Ok(match store.request_friend(me.id, them.id).await? {
@@ -688,6 +692,7 @@ impl SessionActor {
             .filter(|_| in_private);
         let rules = app.cfg.rules.clone();
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
+        let guesses = self.shared.guesses.clone();
         let new_room = self.room_maker(rules);
         let invited = async move {
             let Some((them, _)) = store.find_account(&name).await? else {
@@ -695,6 +700,9 @@ impl SessionActor {
             };
             if !store.are_friends(me.id, them.id).await? {
                 return Ok(Err("You can only invite friends.".to_string()));
+            }
+            if let Err(refused) = guesses.may_invite(me.id, them.id, now()).await? {
+                return Ok(Err(refused.message().to_string()));
             }
             let online = presence.send(StatusOf(vec![them.id])).await?;
             match online.get(&them.id).map(|d| d.status) {

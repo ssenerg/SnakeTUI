@@ -340,6 +340,14 @@ pub enum Counted {
     SignUpTry,
     /// A room code that matched no room, from an IP address.
     WrongCode,
+    /// A friend request from an account.
+    FriendAsk,
+    /// A friend request from one account to another.
+    FriendAskPair,
+    /// An invite from an account.
+    Invite,
+    /// An invite from one account to another.
+    InvitePair,
 }
 
 impl Counted {
@@ -350,6 +358,10 @@ impl Counted {
             Counted::SignUp => "signup",
             Counted::SignUpTry => "signup_try",
             Counted::WrongCode => "code",
+            Counted::FriendAsk => "ask",
+            Counted::FriendAskPair => "ask_pair",
+            Counted::Invite => "invite",
+            Counted::InvitePair => "invite_pair",
         }
     }
 }
@@ -792,6 +804,12 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         if theirs.rows_affected() > 0 {
+            // Both asked: friends, if both have room for one more.
+            if friend_count(&mut tx, from).await? >= MAX_FRIENDS
+                || friend_count(&mut tx, to).await? >= MAX_FRIENDS
+            {
+                return Ok(Requested::TooMany);
+            }
             make_friends(&mut tx, from, to).await?;
             tx.commit().await?;
             return Ok(Requested::NowFriends);
@@ -1151,6 +1169,7 @@ mod tests {
         friendship_needs_both_sides,
         the_leaderboard_ranks_accounts_with_enough_games,
         requests_waiting_for_an_answer_are_limited,
+        asking_back_respects_the_friend_limit,
         limits_count_recent_events_and_tidy_away_old_ones,
         room_codes_are_claimed_once_and_expire,
     );
@@ -1426,6 +1445,30 @@ mod tests {
         let lists = store.friend_lists(b.id).await.unwrap();
         assert!(lists.incoming.is_empty() && lists.friends.is_empty());
         assert!(store.friend_lists(c.id).await.unwrap().outgoing.is_empty());
+    }
+
+    async fn asking_back_respects_the_friend_limit(store: Store) {
+        let a = account(&store, "alice", None).await;
+        for i in 0..MAX_FRIENDS {
+            let other = account(&store, &format!("f{i}"), None).await;
+            store.request_friend(other.id, a.id).await.unwrap();
+            assert!(store.accept_friend(a.id, other.id).await.unwrap());
+        }
+        // Someone asks alice, and she asks them back: that would be one
+        // friend too many.
+        let late = account(&store, "late", None).await;
+        assert_eq!(
+            store.request_friend(late.id, a.id).await.unwrap(),
+            Requested::Sent
+        );
+        assert_eq!(
+            store.request_friend(a.id, late.id).await.unwrap(),
+            Requested::TooMany
+        );
+        assert!(!store.are_friends(a.id, late.id).await.unwrap());
+        let lists = store.friend_lists(a.id).await.unwrap();
+        let incoming: Vec<&str> = lists.incoming.iter().map(|f| f.username.as_str()).collect();
+        assert_eq!(incoming, ["late"], "their request still waits");
     }
 
     async fn requests_waiting_for_an_answer_are_limited(store: Store) {
