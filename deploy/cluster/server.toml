@@ -13,6 +13,6 @@ database = "postgres://snaketui:snaketui@postgres/snaketui"
 trusted_proxies = ["10.213.77.0/24"]
 
 [cluster]
-nats = "nats://nats:4222"
+nats = "nats://snaketui:snaketui@nats:4222"
 name = "snaketui"
 region = "local"

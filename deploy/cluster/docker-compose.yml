@@ -26,6 +26,8 @@ services:
 
   nats:
     image: nats:2.12-alpine
+    # This demo's own password, like Postgres's: it runs on one machine.
+    command: ["--user", "snaketui", "--pass", "snaketui"]
 
   # Makes the host key every server shares, once.
   host-key:

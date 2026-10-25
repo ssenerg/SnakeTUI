@@ -115,6 +115,13 @@ authorization {
 }
 ```
 
+Whoever has this password can do anything in the cluster: steer any
+player, seat anyone in any room, and make matches that are rated. Keep NATS
+on the private network, give the password only to the game servers and the
+matchmaker, and if servers in different regions reach NATS over the
+internet, turn on its TLS too. The servers refuse to start without a
+password in `cluster.nats`.
+
 Only the service should read the password. Then check the file and start
 NATS:
 

@@ -59,7 +59,7 @@ drain_timeout_secs = 200
 # CLUSTER.md. Leave this out on a server that plays on its own.
 #
 # [cluster]
-# nats = "nats://10.0.0.5:4222"
+# nats = "nats://snaketui:NATS_PASSWORD@10.0.0.5:4222"
 # # Keeps clusters sharing one NATS apart.
 # name = "snaketui"
 # # Where this server is, for matchmaking.

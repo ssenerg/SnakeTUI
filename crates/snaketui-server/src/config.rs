@@ -77,7 +77,8 @@ impl Default for ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// The NATS server(s) every server of the cluster connects to, for
-    /// example `nats://10.0.0.5:4222`. Credentials go in the URL.
+    /// example `nats://snaketui:PASSWORD@10.0.0.5:4222`. It needs the user
+    /// and password, or a token, in the URL.
     pub nats: String,
     /// Keeps clusters that share one NATS apart. Letters, digits, `_`
     /// and `-`.

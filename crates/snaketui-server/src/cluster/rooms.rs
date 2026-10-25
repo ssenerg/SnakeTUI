@@ -209,6 +209,17 @@ impl Cluster {
         let Some(addr) = self.rooms.get(room) else {
             return;
         };
+        // Only for players from other servers who are in this room: a
+        // message about anyone else, players here included, is ignored.
+        let guest = self
+            .exports
+            .lock()
+            .unwrap()
+            .get(&room)
+            .is_some_and(|e| e.guests.contains_key(&player));
+        if !guest {
+            return;
+        }
         match kind {
             InputKind::Steer(dir) => {
                 let _ = addr.try_send(Steer { id: player, dir });

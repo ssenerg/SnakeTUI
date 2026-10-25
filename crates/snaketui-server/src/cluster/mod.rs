@@ -73,7 +73,9 @@ pub fn prefix(name: &str) -> String {
 
 /// Options for connecting to the NATS at `url`, with the user and password
 /// (or token) the URL has, such as `nats://snaketui:PASSWORD@10.0.0.5`.
-/// async-nats reads the address from the URL but not those.
+/// async-nats reads the address from the URL but not those. A URL without
+/// them is refused: anyone who can talk to the cluster's NATS can steer
+/// any player and make matches, so it must want a password.
 pub fn nats_options(url: &str) -> Result<ConnectOptions> {
     let addr: async_nats::ServerAddr = url.parse().context("cluster.nats isn't a NATS URL")?;
     let decode = |part: &str| {
@@ -87,7 +89,10 @@ pub fn nats_options(url: &str) -> Result<ConnectOptions> {
             ConnectOptions::with_user_and_password(decode(user)?, decode(pass)?)
         }
         (Some(token), None) => ConnectOptions::with_token(decode(token)?),
-        _ => ConnectOptions::new(),
+        _ => anyhow::bail!(
+            "cluster.nats has no user and password: nats://USER:PASSWORD@HOST:4222. \
+             Set them on the NATS server too"
+        ),
     })
 }
 
@@ -303,5 +308,19 @@ impl Cluster {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nats_needs_a_password_or_token() {
+        assert!(nats_options("nats://snaketui:p%40ss@10.0.0.5:4222").is_ok());
+        assert!(nats_options("nats://TOKEN@10.0.0.5:4222").is_ok());
+        let refused = nats_options("nats://10.0.0.5:4222").err().unwrap();
+        assert!(refused.to_string().contains("no user and password"));
+        assert!(nats_options("not a url").is_err());
     }
 }
