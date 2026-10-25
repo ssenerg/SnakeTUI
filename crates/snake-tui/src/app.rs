@@ -71,6 +71,8 @@ pub enum Effect {
     JoinRoom(String),
     Steer(Direction),
     ToggleReady,
+    /// The host's pick for the room's next rounds: a tick, in milliseconds.
+    RoomSpeed(u64),
     LeaveRoom,
     /// Answer with [`App::set_name`].
     SetNickname(String),

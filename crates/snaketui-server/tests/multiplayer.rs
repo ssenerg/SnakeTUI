@@ -332,3 +332,43 @@ async fn two_hundred_players_keep_rooms_on_time() {
     );
     assert!(p99 < Duration::from_millis(5), "p99 tick lag {p99:?}");
 }
+
+/// The lobby line naming `who`.
+fn lobby_line(p: &Player, who: &str) -> String {
+    p.text()
+        .lines()
+        .find(|l| l.contains(who))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_host_sets_the_speed_for_everyone() {
+    let server = TestServer::start();
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    let mut ben = guest(server.addr, "ben", 100, 30).await;
+    let code = create_room(&mut ann).await;
+    join_room(&mut ben, &code).await;
+    ann.wait_for("◂ 150 ms ticks ▸").await;
+
+    // ben isn't the host: his arrows change nothing. He gets ready.
+    ben.send(RIGHT).await;
+    ben.send(ENTER).await;
+    ben.wait_until("ben ready", Duration::from_secs(5), |p| {
+        lobby_line(p, "~ben").contains('✓')
+    })
+    .await;
+    assert!(ben.text().contains("150 ms ticks"), "{}", ben.text());
+
+    // ann makes it faster, a step at a time.
+    ann.send(LEFT).await;
+    ann.wait_for("◂ 125 ms ticks ▸").await;
+    ann.send(LEFT).await;
+    ann.wait_for("◂ 100 ms ticks ▸").await;
+    ben.wait_for("100 ms ticks").await;
+    assert!(
+        !lobby_line(&ben, "~ben").contains('✓'),
+        "ben was ready for another speed:\n{}",
+        ben.text()
+    );
+}

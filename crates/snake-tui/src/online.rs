@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use snake_core::config::GameConfig;
+use snake_core::config::{GameConfig, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::records::Records;
 use snake_core::round::{PhaseView, PlayerId, RoomKind, RoomView, SeatView, quick_rules};
 use zeroize::{Zeroize, Zeroizing};
@@ -323,6 +323,11 @@ impl InRoom {
         self.view.seat(self.me)
     }
 
+    /// Whether this player sets the room's speed.
+    pub fn hosting(&self) -> bool {
+        self.view.host().is_some_and(|h| h.who.id == self.me)
+    }
+
     /// Whether this player has a snake in the round being played.
     pub fn playing(&self) -> bool {
         matches!(
@@ -562,6 +567,22 @@ impl App {
             PhaseView::Waiting { .. } => match key {
                 Key::Enter | Key::Char(' ' | 'r') => {
                     effects.push(Effect::ToggleReady);
+                    false
+                }
+                // The host makes the next round faster or slower, a step
+                // at a time on the settings' grid. The room decides; its
+                // next view shows the speed.
+                Key::Left | Key::Right | Key::Char('a' | 'h' | 'd' | 'l') if room.hosting() => {
+                    let now = room.view.rules.tick_ms;
+                    let next = if matches!(key, Key::Left | Key::Char('a' | 'h')) {
+                        now.saturating_sub(1) / TICK_MS_STEP * TICK_MS_STEP
+                    } else {
+                        (now / TICK_MS_STEP + 1) * TICK_MS_STEP
+                    }
+                    .clamp(TICK_MS_MIN, TICK_MS_MAX);
+                    if next != now {
+                        effects.push(Effect::RoomSpeed(next));
+                    }
                     false
                 }
                 Key::Char('i') if signed_in => {
@@ -1141,6 +1162,44 @@ mod tests {
         app.handle(Key::Esc);
         assert_eq!(app.handle(Key::Char('y')), [Effect::LeaveRoom]);
         assert_eq!(app.screen, Screen::Home { selected: 1 });
+    }
+
+    /// A private room's lobby with players 1 and 2, at `tick_ms`.
+    fn lobby(tick_ms: u64) -> Arc<RoomView> {
+        let rules = snake_core::config::Rules {
+            tick_ms,
+            ..Default::default()
+        };
+        let settings = RoundSettings::new(rules, RoomKind::Private).unwrap();
+        let mut round = Round::new(settings, 1);
+        for id in 1..=2 {
+            let name = format!("~p{id}");
+            round.join(Entrant { id, name }).unwrap();
+        }
+        Arc::new(round.view())
+    }
+
+    #[test]
+    fn the_host_changes_the_speed_a_step_at_a_time() {
+        let mut host = online();
+        host.enter_room(1, lobby(150));
+        assert_eq!(host.handle(Key::Right), [Effect::RoomSpeed(175)]);
+        // The room decides; until its next view, the speed here stays.
+        assert_eq!(host.handle(Key::Char('h')), [Effect::RoomSpeed(125)]);
+        host.update_room(lobby(160));
+        assert_eq!(
+            host.handle(Key::Left),
+            [Effect::RoomSpeed(150)],
+            "back onto the settings' grid"
+        );
+        host.update_room(lobby(TICK_MS_MIN));
+        assert_eq!(host.handle(Key::Left), [], "already the fastest");
+        host.update_room(lobby(TICK_MS_MAX));
+        assert_eq!(host.handle(Key::Right), [], "already the slowest");
+
+        let mut guest = online();
+        guest.enter_room(2, lobby(150));
+        assert_eq!(guest.handle(Key::Right), [], "only the host");
     }
 
     #[test]

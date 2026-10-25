@@ -521,6 +521,11 @@ impl SessionActor {
                         link.room.ready(self.id);
                     }
                 }
+                Effect::RoomSpeed(tick_ms) => {
+                    if let Some(link) = &self.room {
+                        link.room.set_speed(self.id, tick_ms);
+                    }
+                }
                 Effect::LeaveRoom => self.leave_room(ctx),
                 Effect::SetNickname(name) => self.rename(&name, ctx),
                 Effect::SignUp { username, password } => self.sign_up(username, password, ctx),

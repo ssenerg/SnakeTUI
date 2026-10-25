@@ -80,6 +80,11 @@ so in multiplayer turns are always queued for the next tick.
   code to share. Anyone with the code can join. A round starts 15 seconds
   after the second player arrives, or as soon as everyone presses Enter.
   Rounds keep going until everyone leaves.
+- **Room speed.** In a private room's lobby, the host (whoever has been in
+  the room longest) makes the next rounds faster or slower with ←→, in 25 ms
+  steps from 50 to 1000 ms a tick. Everyone sees the new speed. A change
+  un-readies everyone and restarts the 15 seconds, so nobody starts at a
+  speed they didn't see.
 - **Winning.** The last snake alive wins. If all the snakes still in play
   crash on the same tick, it's a draw. After 3 minutes, the longest snake
   still alive wins.

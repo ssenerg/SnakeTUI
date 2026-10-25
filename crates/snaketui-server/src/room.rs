@@ -234,6 +234,17 @@ impl RoomHandle {
         }
     }
 
+    pub fn set_speed(&self, id: PlayerId, tick_ms: u64) {
+        match self {
+            RoomHandle::Local { addr, .. } => {
+                let _ = addr.try_send(SetSpeed { id, tick_ms });
+            }
+            RoomHandle::Remote { at, cluster } => {
+                cluster.send_input(*at, id, InputKind::Speed(tick_ms))
+            }
+        }
+    }
+
     pub fn ping(&self, id: PlayerId, rtt: Duration) {
         match self {
             RoomHandle::Local { addr, .. } => {
@@ -322,6 +333,14 @@ pub struct Steer {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Ready(pub PlayerId);
+
+/// The host picks the next round's speed.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SetSpeed {
+    pub id: PlayerId,
+    pub tick_ms: u64,
+}
 
 /// A player's latest round trip, for everyone in the room to see.
 #[derive(Message)]
@@ -616,6 +635,17 @@ impl Handler<Steer> for RoomActor {
 
     fn handle(&mut self, msg: Steer, ctx: &mut Self::Context) {
         self.guarded(ctx, |round| round.steer(msg.id, msg.dir));
+    }
+}
+
+impl Handler<SetSpeed> for RoomActor {
+    type Result = ();
+
+    fn handle(&mut self, SetSpeed { id, tick_ms }: SetSpeed, ctx: &mut Self::Context) {
+        if self.guarded(ctx, |round| round.set_tick(id, tick_ms)) == Some(true) {
+            debug!(code = ?self.code, tick_ms, "speed changed");
+            self.publish();
+        }
     }
 }
 

@@ -445,3 +445,33 @@ fn round_trips_show_by_each_player() {
     let narrow = shown(&app, 80, 24);
     assert!(narrow.contains('●') && !narrow.contains("45ms"), "{narrow}");
 }
+
+#[test]
+fn only_the_host_sees_how_to_change_the_speed() {
+    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Round::new(settings, 1);
+    for id in 1..=2 {
+        let name = format!("~p{id}");
+        round.join(Entrant { id, name }).unwrap();
+    }
+    let lobby_of = |me| {
+        let mut app = App::online(
+            GameConfig::default(),
+            Records::default(),
+            format!("~p{me}"),
+            true,
+        );
+        app.screen = Screen::Room;
+        app.enter_room(me, Arc::new(round.view()));
+        shown(&app, 80, 24)
+    };
+    let host = lobby_of(1);
+    assert!(host.contains("◂ 150 ms ticks ▸"), "{host}");
+    assert!(host.contains("←→ speed"), "{host}");
+    let guest = lobby_of(2);
+    assert!(
+        guest.contains("150 ms ticks") && !guest.contains('◂'),
+        "{guest}"
+    );
+    assert!(!guest.contains("speed"), "{guest}");
+}

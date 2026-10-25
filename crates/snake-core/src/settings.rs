@@ -3,7 +3,7 @@
 
 use crate::config::{
     COLOR_NAMES, ColorSlot, GLYPHS, GameConfig, GrowthMode, IconSlot, InnerWalls, MoveTiming,
-    WallMode, color_name, glyph_name,
+    TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP, WallMode, color_name, glyph_name,
 };
 
 #[derive(Clone, Copy)]
@@ -115,9 +115,9 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Num {
             get: |c| c.rules.tick_ms,
             set: |c, v| c.rules.tick_ms = v,
-            min: 50,
-            max: 1000,
-            step: 25,
+            min: TICK_MS_MIN,
+            max: TICK_MS_MAX,
+            step: TICK_MS_STEP,
             fmt: NumFmt::Millis,
         },
     },

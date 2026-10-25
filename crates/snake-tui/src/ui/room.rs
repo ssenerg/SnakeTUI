@@ -87,17 +87,27 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         ]));
         lines.push(Line::from("Share it so friends can join.").style(dim()));
     }
-    lines.push(
-        Line::from(format!(
-            "{}×{} board · {} ms ticks · {}/{} players",
-            view.rules.width,
-            view.rules.height,
-            view.rules.tick_ms,
-            view.seats.len(),
-            view.max_players
-        ))
-        .style(dim()),
-    );
+    // The host can change the speed, so theirs stands out, with arrows.
+    let tick = format!("{} ms ticks", view.rules.tick_ms);
+    let tick = if room.hosting() {
+        Span::styled(
+            format!("◂ {tick} ▸"),
+            Style::default().fg(Color::LightYellow),
+        )
+    } else {
+        Span::styled(tick, dim())
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{}×{} board · ", view.rules.width, view.rules.height),
+            dim(),
+        ),
+        tick,
+        Span::styled(
+            format!(" · {}/{} players", view.seats.len(), view.max_players),
+            dim(),
+        ),
+    ]));
     lines.push(Line::default());
     for seat in &view.seats {
         let (mark, style) = if seat.ready {
@@ -135,10 +145,12 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         Some(notice) => Line::styled(notice.clone(), Style::default().fg(Color::LightYellow)),
         None => Line::default(),
     });
-    let hint = if online.is_some_and(|o| o.account.is_some()) {
-        "Enter ready · i invite friends · Esc leave"
-    } else {
-        "Enter ready · Esc leave"
+    let signed_in = online.is_some_and(|o| o.account.is_some());
+    let hint = match (room.hosting(), signed_in) {
+        (true, true) => "Enter ready · ←→ speed · i invite · Esc leave",
+        (true, false) => "Enter ready · ←→ speed · Esc leave",
+        (false, true) => "Enter ready · i invite friends · Esc leave",
+        (false, false) => "Enter ready · Esc leave",
     };
     lines.push(Line::from(hint).style(dim()));
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);

@@ -165,6 +165,20 @@ async fn players_on_two_servers_share_a_private_room() {
 }
 
 #[tokio::test]
+async fn a_host_on_another_server_sets_the_speed() {
+    let servers = cluster(2).await;
+    let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
+    let mut ben = guest(servers[1].addr, "ben", 100, 30).await;
+    let code = create_room(&mut ann).await;
+    join_room(&mut ben, &code).await;
+    // The room stays on ann's server; once she goes, ben hosts it from his.
+    ann.send(ESC).await;
+    ben.wait_for("◂ 150 ms ticks ▸").await;
+    ben.send(b"\x1b[D").await;
+    ben.wait_for("◂ 125 ms ticks ▸").await;
+}
+
+#[tokio::test]
 async fn when_a_players_server_dies_the_room_plays_on() {
     let mut servers = cluster(2).await;
     let mut ann = guest(servers[0].addr, "ann", 100, 30).await;

@@ -192,6 +192,13 @@ impl IconSlot {
 
 /// Everything that changes how a game plays. Two games with equal rules
 /// count toward the same record.
+/// The fastest tick the game allows, in milliseconds.
+pub const TICK_MS_MIN: u64 = 50;
+/// The slowest.
+pub const TICK_MS_MAX: u64 = 1000;
+/// Settings, and a room's host, change the tick in steps of this.
+pub const TICK_MS_STEP: u64 = 25;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rules {

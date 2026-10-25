@@ -10,7 +10,7 @@ use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use crate::config::{MoveTiming, Rules};
+use crate::config::{MoveTiming, Rules, TICK_MS_MAX, TICK_MS_MIN};
 use crate::geom::Direction;
 use crate::view::MatchView;
 use crate::world::World;
@@ -301,6 +301,33 @@ impl Round {
         if self.seats.len() >= MIN_PLAYERS && self.seats.iter().all(|s| s.ready) {
             self.begin_countdown();
         }
+    }
+
+    /// The room's host (whoever has been in it longest) sets how fast its
+    /// next round plays: in a private room's lobby only. Everyone is ready
+    /// no longer and the start timer starts again, so nobody plays at a
+    /// speed they didn't see. Says whether the speed changed.
+    pub fn set_tick(&mut self, id: PlayerId, tick_ms: u64) -> bool {
+        let host = self.seats.first().is_some_and(|s| s.who.id == id);
+        if self.settings.kind != RoomKind::Private
+            || !host
+            || !(TICK_MS_MIN..=TICK_MS_MAX).contains(&tick_ms)
+            || tick_ms == self.settings.rules.tick_ms
+        {
+            return false;
+        }
+        let Phase::Waiting { start_at } = &mut self.phase else {
+            return false;
+        };
+        if start_at.is_some() {
+            *start_at = Some(self.clock + self.settings.start_after);
+        }
+        self.settings.rules.tick_ms = tick_ms;
+        for seat in &mut self.seats {
+            seat.ready = false;
+        }
+        self.changed = true;
+        true
     }
 
     /// Queues a turn for this player's snake. Turns made during the
@@ -674,6 +701,11 @@ impl RoomView {
     pub fn seat(&self, id: PlayerId) -> Option<&SeatView> {
         self.seats.iter().find(|s| s.who.id == id && !s.left)
     }
+
+    /// Private rooms: who sets the speed, the player in it longest.
+    pub fn host(&self) -> Option<&SeatView> {
+        self.seats.first().filter(|s| !s.left)
+    }
 }
 
 #[cfg(test)]
@@ -781,6 +813,63 @@ mod tests {
         assert_eq!(view.seats[0].slot, Some(0));
         assert_eq!(view.seats[1].slot, Some(1));
         assert!(view.board.is_some(), "the board shows during the countdown");
+    }
+
+    #[test]
+    fn the_host_sets_the_speed_in_the_lobby() {
+        let mut round = private();
+        round.join(who(1)).unwrap();
+        round.join(who(2)).unwrap();
+        round.toggle_ready(2);
+        round.advance(Duration::from_secs(10));
+        assert_eq!(round.view().host().map(|s| s.who.id), Some(1));
+
+        assert!(!round.set_tick(2, 100), "only the host");
+        assert!(!round.set_tick(1, 25), "too fast");
+        assert!(!round.set_tick(1, 2000), "too slow");
+        assert!(
+            !round.set_tick(1, round.settings.rules.tick_ms),
+            "no change"
+        );
+        assert!(round.set_tick(1, 100));
+        let view = round.view();
+        assert_eq!(view.rules.tick_ms, 100);
+        assert!(
+            view.seats.iter().all(|s| !s.ready),
+            "ready again, at this speed"
+        );
+        assert_eq!(
+            view.phase,
+            PhaseView::Waiting {
+                starts_in: Some(Duration::from_secs(15))
+            },
+            "the start timer starts again"
+        );
+
+        // The round plays at that speed.
+        round.toggle_ready(1);
+        round.toggle_ready(2);
+        run_until(&mut round, |r| {
+            matches!(phase(r), PhaseView::Running { .. })
+        });
+        assert_eq!(tick(&round), Duration::from_millis(100));
+        assert!(!round.set_tick(1, 200), "not once the round is on");
+    }
+
+    #[test]
+    fn the_next_host_is_whoever_has_been_in_longest() {
+        let mut round = private();
+        for id in 1..=3 {
+            round.join(who(id)).unwrap();
+        }
+        round.leave(1);
+        assert_eq!(round.view().host().map(|s| s.who.id), Some(2));
+        assert!(round.set_tick(2, 200));
+        assert!(!round.set_tick(3, 75));
+
+        let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+        let mut matched = Round::new_match(settings, 1, vec![who(1), who(2)]);
+        assert!(!matched.set_tick(1, 100), "matches play at their own speed");
     }
 
     #[test]
