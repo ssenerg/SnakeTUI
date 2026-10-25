@@ -221,7 +221,10 @@ pub async fn serve(
     ));
 
     stop.await;
+    // The listener closes once the aborted loop is dropped: wait for that,
+    // so nobody gets in after players are told the server is stopping.
     accepting.abort();
+    let _ = accepting.await;
     tidying.abort();
     let drain = shared.cfg.drain_timeout();
     if !drain.is_zero() {
