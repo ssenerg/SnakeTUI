@@ -339,6 +339,11 @@ impl SessionActor {
         let Some(account) = self.account_id() else {
             return;
         };
+        // Only reloads are coalesced; forgetting a key always happens.
+        let reload = forget.is_none();
+        if reload && !self.loads.keys.start() {
+            return;
+        }
         let store = self.shared.store.clone();
         let mine = self.fingerprint();
         let keys = async move {
@@ -348,6 +353,9 @@ impl SessionActor {
             store.keys(account).await
         };
         ctx.spawn(keys.into_actor(self).map(move |keys, act, ctx| {
+            if reload && act.loads.keys.done() {
+                act.refresh_keys(None, ctx);
+            }
             let keys = keys.unwrap_or_else(|e| {
                 warn!(error = %e, "couldn't list keys");
                 Vec::new()
@@ -372,6 +380,9 @@ impl SessionActor {
         let Some(account) = self.account_id() else {
             return;
         };
+        if !self.loads.friends.start() {
+            return;
+        }
         self.friends_refresh += 1;
         let asked = self.friends_refresh;
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
@@ -405,6 +416,9 @@ impl SessionActor {
             })
         };
         ctx.spawn(lists.into_actor(self).map(move |lists, act, ctx| {
+            if act.loads.friends.done() {
+                act.refresh_friends(ctx);
+            }
             // Refreshes overlap, and one that started earlier can finish
             // later, with a list from before: say, read halfway through
             // accepting a request, so it has neither the request nor the
@@ -426,6 +440,9 @@ impl SessionActor {
 
     /// Loads the best players, and this player's place among everyone.
     pub(super) fn load_leaderboard(&mut self, ctx: &mut Context<Self>) {
+        if !self.loads.leaderboard.start() {
+            return;
+        }
         let (store, me) = (self.shared.store.clone(), self.account_id());
         let board = async move {
             let best = store.leaderboard(RANKED_AFTER, LEADERBOARD_SIZE).await?;
@@ -436,6 +453,9 @@ impl SessionActor {
             anyhow::Ok((best, place))
         };
         ctx.spawn(board.into_actor(self).map(|board, act, ctx| {
+            if act.loads.leaderboard.done() {
+                act.load_leaderboard(ctx);
+            }
             let (best, place) = match board {
                 Ok(board) => board,
                 Err(e) => {

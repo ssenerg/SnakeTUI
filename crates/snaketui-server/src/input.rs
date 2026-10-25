@@ -1,4 +1,7 @@
-//! Turns the bytes a player's terminal sends into [`Key`]s.
+//! Turns the bytes a player's terminal sends into [`Key`]s, and keeps how
+//! fast anyone sends them within reason.
+
+use std::time::Instant;
 
 use snake_tui::Key;
 
@@ -131,10 +134,60 @@ fn parse_escape(buf: &[u8]) -> Escape {
     }
 }
 
+/// Lets through at most `burst` at once, then `per_sec` a second: a token
+/// bucket. Whatever a player sends past it is dropped, so a flood of keys
+/// can't make the server do unbounded work.
+pub struct Budget {
+    burst: f64,
+    per_sec: f64,
+    left: f64,
+    at: Instant,
+}
+
+impl Budget {
+    pub fn new(burst: u32, per_sec: u32, now: Instant) -> Self {
+        Self {
+            burst: f64::from(burst),
+            per_sec: f64::from(per_sec),
+            left: f64::from(burst),
+            at: now,
+        }
+    }
+
+    /// How many of `wanted` may go ahead at `now`.
+    pub fn take(&mut self, wanted: usize, now: Instant) -> usize {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.at = now;
+        self.left = (self.left + elapsed * self.per_sec).min(self.burst);
+        let allowed = (self.left.floor() as usize).min(wanted);
+        self.left -= allowed as f64;
+        allowed
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use Key::*;
+
+    #[test]
+    fn budgets_let_a_burst_through_then_a_steady_rate() {
+        let start = Instant::now();
+        let mut budget = Budget::new(256, 50, start);
+        assert_eq!(budget.take(200, start), 200, "a pasted password");
+        assert_eq!(budget.take(16_000, start), 56, "the rest of the burst");
+        assert_eq!(budget.take(10, start), 0);
+        let later = start + Duration::from_millis(100);
+        assert_eq!(budget.take(10, later), 5, "50 a second");
+        let much_later = later + Duration::from_secs(3600);
+        assert_eq!(
+            budget.take(1000, much_later),
+            256,
+            "never more than a burst"
+        );
+    }
 
     fn parse(chunks: &[&[u8]]) -> Vec<Key> {
         let mut parser = KeyParser::default();

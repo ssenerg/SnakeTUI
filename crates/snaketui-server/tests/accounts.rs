@@ -266,6 +266,41 @@ fn rating_on_home(text: &str) -> Option<u32> {
 }
 
 #[tokio::test]
+async fn a_flood_of_keys_leaves_the_server_responsive() {
+    let server = TestServer::start();
+    let mut flood = connect_as(server.addr, Login::Guest).await;
+    pick(&flood, 0, GUEST_LEADERBOARD).await;
+    flood.wait_for("Sign up to get a rating.").await;
+    // Every Enter would open the leaderboard again, or go back home: a
+    // query each, without the server's limits.
+    let enters = vec![b'\r'; 16 * 1024];
+    let started = std::time::Instant::now();
+    for _ in 0..10 {
+        flood.send(&enters).await;
+    }
+    let mut other = connect_as(server.addr, Login::Guest).await;
+    pick(&other, 0, GUEST_LEADERBOARD).await;
+    other.wait_for("Sign up to get a rating.").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    // The flooder is still served too: Enter takes them home from the
+    // leaderboard, or back to it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = flood.text();
+    flood.send(ENTER).await;
+    flood
+        .wait_until(
+            "the flooder's screen to change",
+            Duration::from_secs(3),
+            |p| p.text() != before,
+        )
+        .await;
+}
+
+#[tokio::test]
 async fn friends_watch_each_others_games() {
     let server = TestServer::start();
     let (mut ann, _) = signed_up(server.addr, "ann").await;

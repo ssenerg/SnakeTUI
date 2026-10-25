@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use self::account::{JoinedRoom, PendingInvite};
 use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
-use crate::input::{KeyParser, STATUS_QUERY};
+use crate::input::{Budget, KeyParser, STATUS_QUERY};
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
@@ -63,6 +63,19 @@ const HANG_UP_AFTER: Duration = Duration::from_secs(2);
 const MAILBOX: usize = 64;
 /// Wrong room codes a connection may try. After that it can't join by code.
 const MAX_WRONG_CODES: u8 = 5;
+/// Keys a player may send at once, enough to paste a password, and then
+/// how many a second: faster than anyone types. A flood beyond is dropped.
+const KEY_BURST: u32 = 256;
+const KEYS_PER_SEC: u32 = 50;
+/// Actions that reach the database or the lobby (signing in, friends,
+/// rooms): a few at once, then a couple a second.
+const ACTION_BURST: u32 = 10;
+const ACTIONS_PER_SEC: u32 = 2;
+const TOO_FAST: &str = "Slow down a little, then try again.";
+/// Settings and nicknames are saved this long after their last change.
+const SAVE_AFTER: Duration = Duration::from_millis(500);
+/// Frames go out at most this often, however fast keys come.
+const FRAME: Duration = Duration::from_millis(15);
 /// The only region until there are several servers.
 const LOCAL_REGION: &str = "local";
 
@@ -150,6 +163,68 @@ pub struct Resized {
 #[rtype(result = "()")]
 pub struct Disconnected;
 
+/// Whether `effect` reaches the database or the lobby, and so spends one
+/// of the player's actions.
+fn costly(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SignUp { .. }
+            | Effect::SignIn { .. }
+            | Effect::SignOut
+            | Effect::ChangePassword(_)
+            | Effect::ForgetKey(_)
+            | Effect::AddFriend(_)
+            | Effect::AnswerFriend { .. }
+            | Effect::RemoveFriend(_)
+            | Effect::Invite(_)
+            | Effect::AcceptInvite
+            | Effect::Watch(_)
+            | Effect::CreateRoom(_)
+            | Effect::JoinRoom(_)
+            | Effect::PlayBots
+    )
+}
+
+/// A load from the store: one at a time, and once more if it was asked
+/// for again meanwhile, so a flood of requests makes one or two queries.
+#[derive(Default)]
+pub(super) struct Load {
+    running: bool,
+    again: bool,
+}
+
+impl Load {
+    /// Whether to start one now. While one runs, it's asked for again.
+    pub(super) fn start(&mut self) -> bool {
+        if self.running {
+            self.again = true;
+            return false;
+        }
+        self.running = true;
+        true
+    }
+
+    /// It finished: whether to run it once more.
+    pub(super) fn done(&mut self) -> bool {
+        self.running = false;
+        std::mem::take(&mut self.again)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Loads {
+    pub(super) friends: Load,
+    pub(super) leaderboard: Load,
+    pub(super) keys: Load,
+}
+
+/// What has changed since it was last saved.
+#[derive(Default)]
+struct Unsaved {
+    config: bool,
+    nick: bool,
+}
+
 /// The room a session's player is in.
 struct RoomLink {
     room: RoomHandle,
@@ -211,6 +286,16 @@ pub struct SessionActor {
     terminal: Option<Terminal<SshBackend>>,
     app: Option<App>,
     parser: KeyParser,
+    /// Keys this player may still send.
+    keys: Budget,
+    /// Actions this player may still take.
+    actions: Budget,
+    loads: Loads,
+    unsaved: Unsaved,
+    save_timer: Option<SpawnHandle>,
+    /// When the last frame went out, and the next one waiting its turn.
+    drawn_at: Option<Instant>,
+    redraw: Option<SpawnHandle>,
     last_tick: Instant,
     last_input: Instant,
     /// The round trip to the player's terminal, smoothed.
@@ -256,6 +341,7 @@ impl Actor for SessionActor {
 
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(peer = %self.peer, "session ended");
+        self.save_now();
         self.sign_off();
         if let Some(link) = self.room.take() {
             link.room.leave(self.id);
@@ -291,6 +377,13 @@ impl SessionActor {
             terminal: None,
             app: None,
             parser: KeyParser::default(),
+            keys: Budget::new(KEY_BURST, KEYS_PER_SEC, now),
+            actions: Budget::new(ACTION_BURST, ACTIONS_PER_SEC, now),
+            loads: Loads::default(),
+            unsaved: Unsaved::default(),
+            save_timer: None,
+            drawn_at: None,
+            redraw: None,
             last_tick: now,
             last_input: now,
             ping: None,
@@ -473,22 +566,14 @@ impl SessionActor {
         let account = self.account_id();
         let store = self.shared.store.clone();
         for effect in effects {
+            if costly(&effect) && self.actions.take(1, Instant::now()) == 0 {
+                self.too_fast(ctx);
+                continue;
+            }
             match effect {
                 Effect::SaveConfig => {
-                    let Some(cfg) = self.app.as_ref().map(|a| a.cfg.clone()) else {
-                        continue;
-                    };
-                    let (store, fp) = (store.clone(), fingerprint.clone());
-                    actix::spawn(async move {
-                        let saved = match (account, fp) {
-                            (Some(id), _) => store.save_account_config(id, &cfg).await,
-                            (None, Some(fp)) => store.save_config(&fp, &cfg).await,
-                            (None, None) => Ok(()),
-                        };
-                        if let Err(e) = saved {
-                            warn!(error = %e, "couldn't save settings");
-                        }
-                    });
+                    self.unsaved.config = true;
+                    self.save_soon(ctx);
                 }
                 Effect::RecordSet { key, best } => {
                     let (store, fp) = (store.clone(), fingerprint.clone());
@@ -793,24 +878,97 @@ impl SessionActor {
         let Some(player) = self.player.as_mut() else {
             return;
         };
-        player.nick = nickname(name, &player.tag);
+        let nick = nickname(name, &player.tag);
+        if nick != player.nick {
+            player.nick = nick;
+            self.unsaved.nick = true;
+        }
         let display = player.display_name();
-        if let Some(fp) = player.fingerprint().map(str::to_string) {
-            let (store, nick) = (self.shared.store.clone(), player.nick.clone());
+        if let Some(app) = self.app.as_mut() {
+            app.set_name(display);
+        }
+        self.save_soon(ctx);
+        self.render(ctx);
+    }
+
+    /// Saves the settings and nickname soon: once changes stop for a
+    /// moment, so a flood of them is one write.
+    fn save_soon(&mut self, ctx: &mut Context<Self>) {
+        if self.save_timer.is_none() {
+            self.save_timer = Some(ctx.run_later(SAVE_AFTER, |act, _| {
+                act.save_timer = None;
+                act.save_now();
+            }));
+        }
+    }
+
+    /// Writes whatever changed, without waiting: a session that ends
+    /// meanwhile still saves it.
+    fn save_now(&mut self) {
+        let unsaved = std::mem::take(&mut self.unsaved);
+        let store = self.shared.store.clone();
+        let (account, fingerprint) = (self.account_id(), self.fingerprint());
+        if unsaved.config
+            && let Some(cfg) = self.app.as_ref().map(|a| a.cfg.clone())
+        {
+            let (store, fingerprint) = (store.clone(), fingerprint.clone());
+            actix::spawn(async move {
+                let saved = match (account, fingerprint) {
+                    (Some(id), _) => store.save_account_config(id, &cfg).await,
+                    (None, Some(fp)) => store.save_config(&fp, &cfg).await,
+                    (None, None) => Ok(()),
+                };
+                if let Err(e) = saved {
+                    warn!(error = %e, "couldn't save settings");
+                }
+            });
+        }
+        if unsaved.nick
+            && let (Some(fp), Some(player)) = (fingerprint, self.player.as_ref())
+        {
+            let nick = player.nick.clone();
             actix::spawn(async move {
                 if let Err(e) = store.set_nick(&fp, &nick).await {
                     warn!(error = %e, "couldn't save a nickname");
                 }
             });
         }
+    }
+
+    /// Refuses an action: the player is going faster than anyone would.
+    fn too_fast(&mut self, ctx: &mut Context<Self>) {
         if let Some(app) = self.app.as_mut() {
-            app.set_name(display);
+            let why = TOO_FAST.to_string();
+            match app.screen {
+                Screen::Joining { .. } => app.join_failed(why),
+                Screen::JoiningToWatch => app.watch_failed(why),
+                Screen::Form(_) => app.form_failed(why),
+                _ => app.notify(why),
+            }
         }
         self.render(ctx);
     }
 
-    /// Draws the current screen and queues it for the client.
+    /// Draws the current screen soon: at once, unless a frame went out
+    /// under [`FRAME`] ago, so a flood of keys doesn't make a frame each.
     fn render(&mut self, ctx: &mut Context<Self>) {
+        if self.redraw.is_some() {
+            return;
+        }
+        let wait = self
+            .drawn_at
+            .map_or(Duration::ZERO, |at| FRAME.saturating_sub(at.elapsed()));
+        if wait.is_zero() {
+            return self.draw(ctx);
+        }
+        self.redraw = Some(ctx.run_later(wait, |act, ctx| {
+            act.redraw = None;
+            act.draw(ctx);
+        }));
+    }
+
+    /// Draws the current screen and queues it for the client.
+    fn draw(&mut self, ctx: &mut Context<Self>) {
         if self.closing {
             return;
         }
@@ -839,6 +997,7 @@ impl SessionActor {
             return;
         }
         self.stalled_since = None;
+        self.drawn_at = Some(Instant::now());
         let drawn = catch_unwind(AssertUnwindSafe(|| {
             terminal.draw(|frame| ui::draw(frame, app)).map(|_| ())
         }));
@@ -1081,6 +1240,8 @@ impl Handler<Input> for SessionActor {
         }
         let mut keys = Vec::new();
         self.parser.feed(&bytes, &mut keys);
+        let allowed = self.keys.take(keys.len(), Instant::now());
+        keys.truncate(allowed);
         let answers = self.parser.take_reports();
         // The terminal answering a status query isn't the player doing
         // anything: it mustn't keep an idle player connected.
@@ -1148,6 +1309,26 @@ impl Handler<Disconnected> for SessionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flood_of_loads_is_one_load_and_one_more() {
+        let mut load = Load::default();
+        assert!(load.start());
+        for _ in 0..1000 {
+            assert!(!load.start(), "one is running");
+        }
+        assert!(load.done(), "once more, for what was asked meanwhile");
+        assert!(load.start());
+        assert!(!load.done(), "nothing asked meanwhile");
+    }
+
+    #[test]
+    fn database_actions_are_costly_and_moves_are_not() {
+        assert!(costly(&Effect::AddFriend("ann".into())));
+        assert!(costly(&Effect::JoinRoom("ABCDEF".into())));
+        assert!(!costly(&Effect::Steer(snake_core::geom::Direction::Up)));
+        assert!(!costly(&Effect::LoadLeaderboard), "coalesced instead");
+    }
 
     #[test]
     fn pty_sizes_are_clamped() {

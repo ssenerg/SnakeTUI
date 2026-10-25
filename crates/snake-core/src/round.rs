@@ -5,6 +5,8 @@
 //! A [`Round`] only moves when told to ([`Round::advance`]), so tests drive
 //! its clock by hand, and a seed replays the same games.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use rand::rngs::Xoshiro256PlusPlus;
@@ -85,9 +87,8 @@ pub struct RoundSettings {
 impl RoundSettings {
     /// `rules` made fit for multiplayer: moves on the tick and no boost.
     /// `None` when the board can't fit two snakes.
-    pub fn new(mut rules: Rules, kind: RoomKind) -> Option<Self> {
-        rules.move_timing = MoveTiming::OnTick;
-        rules.boost_duration_s = 0;
+    pub fn new(rules: Rules, kind: RoomKind) -> Option<Self> {
+        let rules = multiplayer(rules);
         let max_players = max_players_for(&rules)?;
         Some(Self {
             rules,
@@ -101,12 +102,43 @@ impl RoundSettings {
     }
 }
 
+/// `rules` as multiplayer plays them: moves on the tick, and no boost.
+fn multiplayer(mut rules: Rules) -> Rules {
+    rules.move_timing = MoveTiming::OnTick;
+    rules.boost_duration_s = 0;
+    rules
+}
+
+/// A board's size and walls: all that decides how many snakes fit.
+type Board = (u16, u16, usize, usize);
+/// Answers [`max_players_for`] has worked out.
+static FITS: LazyLock<Mutex<HashMap<Board, Option<usize>>>> = LazyLock::new(Mutex::default);
+/// More boards than the settings can make; past this, answers are dropped.
+const FITS_KEPT: usize = 1 << 16;
+
 /// How many snakes boards with these rules have room for, found by placing
-/// them on a few boards. `None` if not even [`MIN_PLAYERS`] fit.
+/// them on a few boards. `None` if not even [`MIN_PLAYERS`] fit. Placing
+/// them builds up to 28 boards, so each answer is kept: only the board's
+/// size and walls decide it.
 pub fn max_players_for(rules: &Rules) -> Option<usize> {
-    (MIN_PLAYERS..=MAX_PLAYERS)
+    let board = (
+        rules.width,
+        rules.height,
+        rules.wall_mode.index(),
+        rules.inner_walls.index(),
+    );
+    if let Some(&fit) = FITS.lock().unwrap().get(&board) {
+        return fit;
+    }
+    let fit = (MIN_PLAYERS..=MAX_PLAYERS)
         .rev()
-        .find(|&n| (0..4).all(|seed| World::with_players(rules.clone(), seed, n).is_ok()))
+        .find(|&n| (0..4).all(|seed| World::with_players(rules.clone(), seed, n).is_ok()));
+    let mut fits = FITS.lock().unwrap();
+    if fits.len() >= FITS_KEPT {
+        fits.clear();
+    }
+    fits.insert(board, fit);
+    fit
 }
 
 /// A player as the room shows them.
@@ -411,13 +443,17 @@ impl Round {
     /// nobody plays by rules they didn't see. Says whether the rules
     /// changed.
     pub fn set_rules(&mut self, id: PlayerId, rules: Rules) -> bool {
-        if !self.lobby_by(id) || !rules_in_range(&rules) {
+        // The cheap checks first: a flood of the same change costs nothing.
+        if !self.lobby_by(id)
+            || multiplayer(rules.clone()) == self.settings.rules
+            || !rules_in_range(&rules)
+        {
             return false;
         }
         let Some(next) = RoundSettings::new(rules, self.settings.kind) else {
             return false;
         };
-        if next.rules == self.settings.rules || next.max_players < self.seats.len() {
+        if next.max_players < self.seats.len() {
             return false;
         }
         self.settings.rules = next.rules;
@@ -995,6 +1031,36 @@ mod tests {
         assert_eq!((board.width, board.height), (40, 24));
         let slower = rules_with(&round, |r| r.tick_ms = 200);
         assert!(!round.set_rules(1, slower), "not once the round is on");
+    }
+
+    #[test]
+    fn floods_of_rule_changes_cost_little() {
+        use crate::config::InnerWalls;
+        // The slowest board to work out: the largest, with the most walls.
+        let big = Rules {
+            width: 80,
+            height: 40,
+            inner_walls: InnerWalls::Many,
+            ..quick_rules()
+        };
+        let mut round = Round::new(
+            RoundSettings::new(big.clone(), RoomKind::Private).unwrap(),
+            1,
+        );
+        round.join(who(1)).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(!round.set_rules(1, big.clone()), "no change");
+            assert_eq!(max_players_for(&big), round.settings.max_players.into());
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        // Other rules don't change how many fit, so changing them is cheap too.
+        let faster = Rules {
+            tick_ms: 100,
+            ..big
+        };
+        assert!(round.set_rules(1, faster));
     }
 
     #[test]

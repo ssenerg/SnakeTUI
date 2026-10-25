@@ -193,10 +193,14 @@ async fn wrong_codes_are_refused_and_the_sixth_try_is_blocked() {
     p.wait_for("Join with a code").await;
     for i in 2..=6 {
         let code = format!("ZZZZZ{i}");
+        // Typing clears the last error, so each one seen is new.
         type_code(&p, &code).await;
-        p.wait_for(&format!("{code}▏")).await;
+        p.wait_until("the code typed", Duration::from_secs(5), |p| {
+            let text = p.text();
+            text.contains(&format!("{code}▏")) && !text.contains("No room has")
+        })
+        .await;
         p.send(ENTER).await;
-        p.wait_for("One moment").await;
         p.wait_for("No room has that code.").await;
     }
     p.send(ENTER).await;
