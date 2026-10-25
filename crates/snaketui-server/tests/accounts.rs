@@ -159,8 +159,12 @@ async fn only_friends_can_be_invited() {
     })
     .await;
 
-    // ben, still on ann's row, ends the friendship; ann's list hasn't
-    // caught up yet.
+    // ben, still on ann's row, ends the friendship once his list shows her
+    // as a friend; ann's list hasn't caught up yet.
+    ben.wait_until("ann as a friend", Duration::from_secs(5), |p| {
+        line_of(&p.text(), "ann").contains("online")
+    })
+    .await;
     ben.send(b"x").await;
     ben.wait_for("Press x again to remove ann").await;
     ben.send(b"x").await;

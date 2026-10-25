@@ -722,6 +722,18 @@ impl Store {
         Ok(true)
     }
 
+    /// Turns down `from`'s request to `me`, if it's still there. A
+    /// friendship made meanwhile stays: declining a request that was just
+    /// accepted mustn't end it.
+    pub async fn decline_friend(&self, me: AccountId, from: AccountId) -> Result<()> {
+        sqlx::query("DELETE FROM friend_requests WHERE from_id = $1 AND to_id = $2")
+            .bind(from)
+            .bind(me)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Ends a friendship, or drops a request either way.
     pub async fn unfriend(&self, me: AccountId, other: AccountId) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -1185,6 +1197,10 @@ mod tests {
             store.request_friend(b.id, a.id).await.unwrap(),
             Requested::AlreadyFriends
         );
+        // Declining the request after accepting it (from a screen that
+        // hadn't caught up) keeps the friendship.
+        store.decline_friend(b.id, a.id).await.unwrap();
+        assert!(store.are_friends(a.id, b.id).await.unwrap());
 
         // Asking someone who already asked you makes you friends.
         store.request_friend(c.id, a.id).await.unwrap();
@@ -1204,6 +1220,13 @@ mod tests {
 
         store.unfriend(a.id, b.id).await.unwrap();
         assert!(!store.are_friends(b.id, a.id).await.unwrap());
+
+        // Declining a request drops it, and only it.
+        store.request_friend(c.id, b.id).await.unwrap();
+        store.decline_friend(b.id, c.id).await.unwrap();
+        let lists = store.friend_lists(b.id).await.unwrap();
+        assert!(lists.incoming.is_empty() && lists.friends.is_empty());
+        assert!(store.friend_lists(c.id).await.unwrap().outgoing.is_empty());
     }
 
     async fn requests_waiting_for_an_answer_are_limited(store: Store) {

@@ -473,7 +473,7 @@ impl SessionActor {
                 return anyhow::Ok(None);
             };
             if !accept {
-                store.unfriend(me.id, them.id).await?;
+                store.decline_friend(me.id, them.id).await?;
                 return Ok(None);
             }
             if !store.accept_friend(me.id, them.id).await? {
