@@ -1,8 +1,9 @@
 //! Signing up and signing in: what usernames and passwords may be, hashing
 //! passwords, and how many wrong guesses anyone gets.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -135,6 +136,9 @@ pub const IP_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Accounts one IP address may make.
 pub const SIGNUPS: usize = 5;
 pub const SIGNUP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// Tries to make an account one IP address may make, taken names and all.
+pub const SIGNUP_TRIES: usize = 30;
+pub const SIGNUP_TRY_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -144,6 +148,10 @@ pub enum Refused {
     TooManyFromAddress,
     /// This address made too many accounts today.
     TooManySignUps,
+    /// This address tried to make too many accounts lately.
+    TooManySignUpTries,
+    /// Another try for this name, or from this address, is still going.
+    Busy,
 }
 
 impl Refused {
@@ -154,6 +162,10 @@ impl Refused {
                 "Too many wrong tries from your address. Try again later."
             }
             Refused::TooManySignUps => "Too many new accounts from your address today.",
+            Refused::TooManySignUpTries => {
+                "Too many tries to make an account from your address. Try again later."
+            }
+            Refused::Busy => "Another try is still going. Try again in a moment.",
         }
     }
 }
@@ -165,6 +177,26 @@ impl Refused {
 #[derive(Clone)]
 pub struct GuessLimits {
     store: Store,
+    /// Names and addresses with a try going on this server.
+    busy: Arc<Mutex<HashSet<String>>>,
+}
+
+/// A sign-in or sign-up going on. While it lasts, no other try for its
+/// name or from its address starts here, so each try is counted before
+/// the next one is judged: tries sent all at once can't slip past the
+/// limits together.
+pub struct Attempt {
+    held: [String; 2],
+    busy: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        let mut busy = self.busy.lock().unwrap();
+        for key in &self.held {
+            busy.remove(key);
+        }
+    }
 }
 
 fn secs(d: Duration) -> i64 {
@@ -173,7 +205,27 @@ fn secs(d: Duration) -> i64 {
 
 impl GuessLimits {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            busy: Arc::default(),
+        }
+    }
+
+    /// Starts a try for `name` from `from`, unless one is going already.
+    pub fn begin(&self, name: &str, from: IpAddr) -> Result<Attempt, Refused> {
+        let held = [
+            format!("name {}", name.to_ascii_lowercase()),
+            format!("address {from}"),
+        ];
+        let mut busy = self.busy.lock().unwrap();
+        if held.iter().any(|key| busy.contains(key)) {
+            return Err(Refused::Busy);
+        }
+        busy.extend(held.iter().cloned());
+        Ok(Attempt {
+            held,
+            busy: Arc::clone(&self.busy),
+        })
     }
 
     pub async fn may_sign_in(
@@ -228,14 +280,20 @@ impl GuessLimits {
             .await
     }
 
+    /// Whether `from` may try to make an account. Every try counts.
     pub async fn may_sign_up(&self, from: IpAddr, now: i64) -> Result<Result<(), Refused>> {
+        let address = from.to_string();
+        let tried = self
+            .store
+            .count(Counted::SignUpTry, &address, now - secs(SIGNUP_TRY_WINDOW))
+            .await?;
+        if tried >= SIGNUP_TRIES as i64 {
+            return Ok(Err(Refused::TooManySignUpTries));
+        }
+        self.store.note(Counted::SignUpTry, &address, now).await?;
         let made = self
             .store
-            .count(
-                Counted::SignUp,
-                &from.to_string(),
-                now - secs(SIGNUP_WINDOW),
-            )
+            .count(Counted::SignUp, &address, now - secs(SIGNUP_WINDOW))
             .await?;
         Ok(if made >= SIGNUPS as i64 {
             Err(Refused::TooManySignUps)
@@ -382,6 +440,41 @@ mod tests {
             limits.may_sign_in("someone", ip(1), later).await.unwrap(),
             Ok(())
         );
+    }
+
+    #[actix_rt::test]
+    async fn one_try_at_a_time_per_name_and_per_address() {
+        let limits = limits().await;
+        let first = limits.begin("Ann", ip(1)).unwrap();
+        assert_eq!(
+            limits.begin("ann", ip(2)).err(),
+            Some(Refused::Busy),
+            "the same name"
+        );
+        assert_eq!(
+            limits.begin("ben", ip(1)).err(),
+            Some(Refused::Busy),
+            "the same address"
+        );
+        let other = limits.begin("ben", ip(2)).unwrap();
+        drop(first);
+        assert!(limits.begin("ANN", ip(1)).is_ok(), "free again");
+        drop(other);
+    }
+
+    #[actix_rt::test]
+    async fn every_try_to_make_an_account_counts() {
+        let limits = limits().await;
+        for _ in 0..SIGNUP_TRIES {
+            assert_eq!(limits.may_sign_up(ip(1), 0).await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            limits.may_sign_up(ip(1), 0).await.unwrap(),
+            Err(Refused::TooManySignUpTries),
+            "taken names count too"
+        );
+        let later = secs(SIGNUP_TRY_WINDOW) + 1;
+        assert_eq!(limits.may_sign_up(ip(1), later).await.unwrap(), Ok(()));
     }
 
     #[actix_rt::test]

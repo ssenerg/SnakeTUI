@@ -164,8 +164,16 @@ impl SessionActor {
         let key = self.fingerprint();
         let ip = self.peer.ip();
         let made = async move {
+            let _attempt = match guesses.begin(&username, ip) {
+                Ok(attempt) => attempt,
+                Err(refused) => return anyhow::Ok(SignedUp::Refused(refused)),
+            };
             if let Err(refused) = guesses.may_sign_up(ip, now()).await? {
-                return anyhow::Ok(SignedUp::Refused(refused));
+                return Ok(SignedUp::Refused(refused));
+            }
+            // A taken name costs no hashing.
+            if store.find_account(&username).await?.is_some() {
+                return Ok(SignedUp::Taken);
             }
             let hash = hasher.hash(password.into_inner()).await?;
             let made = store
@@ -211,8 +219,12 @@ impl SessionActor {
         let key = self.fingerprint().filter(|_| remember);
         let ip = self.peer.ip();
         let checked = async move {
+            let _attempt = match guesses.begin(&username, ip) {
+                Ok(attempt) => attempt,
+                Err(refused) => return anyhow::Ok(SignedIn::Refused(refused)),
+            };
             if let Err(refused) = guesses.may_sign_in(&username, ip, now()).await? {
-                return anyhow::Ok(SignedIn::Refused(refused));
+                return Ok(SignedIn::Refused(refused));
             }
             let found = store.find_account(&username).await?;
             let (account, hash) = found.map_or((None, None), |(a, h)| (Some(a), Some(h)));

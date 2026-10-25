@@ -336,6 +336,8 @@ pub enum Counted {
     WrongFromAddress,
     /// A new account from an IP address.
     SignUp,
+    /// Trying to make an account from an IP address, made or not.
+    SignUpTry,
 }
 
 impl Counted {
@@ -344,6 +346,7 @@ impl Counted {
             Counted::WrongForName => "name",
             Counted::WrongFromAddress => "address",
             Counted::SignUp => "signup",
+            Counted::SignUpTry => "signup_try",
         }
     }
 }
