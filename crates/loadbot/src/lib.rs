@@ -13,6 +13,10 @@ use russh::keys::PublicKeyOrCertificate;
 use russh::{ChannelMsg, ChannelWriteHalf};
 
 const UP: &[u8] = b"\x1b[A";
+/// The server asks how the terminal is, to time the round trip; a terminal
+/// answers that it's fine.
+const STATUS_QUERY: &[u8] = b"\x1b[5n";
+const STATUS_OK: &[u8] = b"\x1b[0n";
 const DOWN: &[u8] = b"\x1b[B";
 const LEFT: &[u8] = b"\x1b[D";
 const RIGHT: &[u8] = b"\x1b[C";
@@ -100,6 +104,9 @@ async fn play(i: usize, server: SocketAddr, stats: &Stats, seed: &mut u64) -> an
         while let Some(msg) = rx.wait().await {
             if let ChannelMsg::Data { data } = msg {
                 stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                if data.windows(STATUS_QUERY.len()).any(|w| w == STATUS_QUERY) {
+                    let _ = tx.data_bytes(STATUS_OK.to_vec()).await;
+                }
             }
         }
     };

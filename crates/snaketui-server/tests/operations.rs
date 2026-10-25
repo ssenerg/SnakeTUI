@@ -84,6 +84,52 @@ async fn metrics_count_players_and_rooms() {
     assert_eq!(http_get(server.admin, "/nothing").await.0, 404);
 }
 
+/// Players listed with their round trip.
+fn timed_players(p: &Player) -> usize {
+    p.text()
+        .lines()
+        .filter(|l| l.contains('~') && l.contains(" ms"))
+        .count()
+}
+
+#[tokio::test]
+async fn players_see_each_others_round_trips() {
+    let server = TestServer::start();
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    let mut ben = guest(server.addr, "ben", 100, 30).await;
+    let code = create_room(&mut ann).await;
+    join_room(&mut ben, &code).await;
+    // Both terminals answer the server's status queries (while read, so
+    // both at once); each lobby shows both players' round trips.
+    let limit = Duration::from_secs(10);
+    tokio::join!(
+        ann.wait_until("both round trips", limit, |p| timed_players(p) == 2),
+        ben.wait_until("both round trips", limit, |p| timed_players(p) == 2),
+    );
+    let (_, metrics) = http_get(server.admin, "/metrics").await;
+    let count: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("snaketui_ping_seconds_count "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no ping count in:\n{metrics}"));
+    assert!(count >= 2, "{count} round trips counted");
+    assert!(metrics.contains("snaketui_ping_seconds_bucket{le=\"0.01\"}"));
+}
+
+#[tokio::test]
+async fn answering_round_trips_isnt_being_active() {
+    let server = TestServer::with(|c| c.idle_timeout_secs = 1);
+    let mut ann = guest(server.addr, "ann", 100, 30).await;
+    // The idle check runs every 15 s; meanwhile ann's terminal answers
+    // every status query, and that alone mustn't keep her in.
+    ann.wait_closed(Duration::from_secs(25)).await;
+    assert!(
+        ann.text().contains("Logged out after being idle"),
+        "{}",
+        ann.text()
+    );
+}
+
 /// A guest whose connection comes through a proxy saying they're at
 /// `client`; `None` if the server turns them away.
 async fn through_proxy(server: SocketAddr, client: &str) -> Option<Player> {

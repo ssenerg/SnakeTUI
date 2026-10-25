@@ -138,6 +138,20 @@ async fn players_on_two_servers_share_a_private_room() {
     for p in [&mut ann, &mut ben] {
         sees_all(p, &["~ann", "~ben"]).await;
     }
+    // ben's round trip reaches the room too, and both see both. (Their
+    // terminals answer only while read, so both wait at once.)
+    let timed = |p: &Player| {
+        p.text()
+            .lines()
+            .filter(|l| l.contains('~') && l.contains(" ms"))
+            .count()
+            == 2
+    };
+    let limit = Duration::from_secs(10);
+    tokio::join!(
+        ann.wait_until("both round trips", limit, timed),
+        ben.wait_until("both round trips", limit, timed),
+    );
     // ben's key reaches the room on the other server: with both ready, the
     // countdown starts now rather than after 15 seconds.
     ann.send(ENTER).await;

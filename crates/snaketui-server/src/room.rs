@@ -233,6 +233,15 @@ impl RoomHandle {
             RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Leave),
         }
     }
+
+    pub fn ping(&self, id: PlayerId, rtt: Duration) {
+        match self {
+            RoomHandle::Local { addr, .. } => {
+                let _ = addr.try_send(Ping { id, rtt });
+            }
+            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Ping(rtt)),
+        }
+    }
 }
 
 /// A player's new rating after a rated round, for their session.
@@ -314,6 +323,14 @@ pub struct Steer {
 #[rtype(result = "()")]
 pub struct Ready(pub PlayerId);
 
+/// A player's latest round trip, for everyone in the room to see.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct Ping {
+    pub id: PlayerId,
+    pub rtt: Duration,
+}
+
 /// The server is stopping: finish the round in play, if any, then close.
 #[derive(Clone, Copy, Message)]
 #[rtype(result = "()")]
@@ -327,6 +344,8 @@ pub struct RoomActor {
     view: watch::Sender<Arc<RoomView>>,
     lobby: Option<Addr<LobbyActor>>,
     present: HashMap<PlayerId, Presence>,
+    /// Each player's round trip, as their session last measured it.
+    pings: HashMap<PlayerId, Duration>,
     ratings: Option<Ratings>,
     /// The last rated round's changes, shown with its results.
     changes: Vec<RatingChange>,
@@ -370,7 +389,8 @@ impl RoomActor {
         present: HashMap<PlayerId, Presence>,
         ratings: Option<Ratings>,
     ) -> (Self, ViewRx) {
-        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[])));
+        let pings = HashMap::new();
+        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[], &pings)));
         let now = Instant::now();
         let room = Self {
             registered: None,
@@ -379,6 +399,7 @@ impl RoomActor {
             view,
             lobby,
             present,
+            pings,
             ratings,
             changes: Vec::new(),
             last: now,
@@ -443,6 +464,7 @@ impl RoomActor {
 
     fn leave(&mut self, id: PlayerId, ctx: &mut Context<Self>) {
         self.present.remove(&id);
+        self.pings.remove(&id);
         if let Some(events) = self.guarded(ctx, |round| round.leave(id)) {
             self.on_events(events);
         }
@@ -527,8 +549,12 @@ impl RoomActor {
     }
 
     fn publish_now(&mut self) {
-        self.view
-            .send_replace(Arc::new(view_of(&self.round, &self.code, &self.changes)));
+        self.view.send_replace(Arc::new(view_of(
+            &self.round,
+            &self.code,
+            &self.changes,
+            &self.pings,
+        )));
     }
 
     fn close(&mut self, reason: &str, ctx: &mut Context<Self>) {
@@ -541,11 +567,19 @@ impl RoomActor {
     }
 }
 
-fn view_of(round: &Round, code: &Option<String>, changes: &[RatingChange]) -> RoomView {
+fn view_of(
+    round: &Round,
+    code: &Option<String>,
+    changes: &[RatingChange],
+    pings: &HashMap<PlayerId, Duration>,
+) -> RoomView {
     let mut view = round.view();
     view.code.clone_from(code);
     if !view.placements.is_empty() {
         view.ratings = changes.to_vec();
+    }
+    for seat in &mut view.seats {
+        seat.ping = pings.get(&seat.who.id).copied();
     }
     view
 }
@@ -582,6 +616,21 @@ impl Handler<Steer> for RoomActor {
 
     fn handle(&mut self, msg: Steer, ctx: &mut Self::Context) {
         self.guarded(ctx, |round| round.steer(msg.id, msg.dir));
+    }
+}
+
+impl Handler<Ping> for RoomActor {
+    type Result = ();
+
+    fn handle(&mut self, Ping { id, rtt }: Ping, _: &mut Self::Context) {
+        if !self.present.contains_key(&id) {
+            return;
+        }
+        self.pings.insert(id, rtt);
+        // In play, the next tick's view carries it; otherwise show it now.
+        if !self.round.in_play() {
+            self.publish_now();
+        }
     }
 }
 

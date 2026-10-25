@@ -25,10 +25,11 @@ use tracing::{debug, info, warn};
 use self::account::{JoinedRoom, PendingInvite};
 use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
-use crate::input::KeyParser;
+use crate::input::{KeyParser, STATUS_QUERY};
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{Dequeue, Enqueue, Matched};
+use crate::metrics::PINGS;
 use crate::presence::Status;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData};
@@ -49,6 +50,13 @@ const QUEUE_WAKE: Duration = Duration::from_secs(1);
 /// How soon to retry drawing for a client that's behind.
 const RETRY_DRAW: Duration = Duration::from_millis(50);
 const IDLE_CHECK: Duration = Duration::from_secs(15);
+/// How often the terminal is asked for a status report, to time the round
+/// trip.
+const PING_EVERY: Duration = Duration::from_secs(2);
+/// An answer this late counts as none.
+const PING_WAIT: Duration = Duration::from_secs(10);
+/// Unanswered queries in a row before giving up: the client doesn't answer.
+const PING_MISSES: u8 = 3;
 /// After the game closes the channel, how long a client gets to hang up.
 const HANG_UP_AFTER: Duration = Duration::from_secs(2);
 /// Keys and window changes waiting in the mailbox; more are dropped.
@@ -203,6 +211,11 @@ pub struct SessionActor {
     parser: KeyParser,
     last_tick: Instant,
     last_input: Instant,
+    /// The round trip to the player's terminal, smoothed.
+    ping: Option<Duration>,
+    /// When the status query waiting for an answer went out.
+    ping_sent: Option<Instant>,
+    ping_misses: u8,
     wake: Option<SpawnHandle>,
     esc_timer: Option<SpawnHandle>,
     retry: Option<SpawnHandle>,
@@ -277,6 +290,9 @@ impl SessionActor {
             parser: KeyParser::default(),
             last_tick: now,
             last_input: now,
+            ping: None,
+            ping_sent: None,
+            ping_misses: 0,
             wake: None,
             esc_timer: None,
             retry: None,
@@ -385,6 +401,45 @@ impl SessionActor {
         self.terminal = Some(terminal);
         self.last_input = Instant::now();
         self.send(Out::Data(Bytes::from_static(ENTER_SCREEN)));
+        ctx.run_interval(PING_EVERY, |act, _| act.ping());
+    }
+
+    /// Asks the terminal for a status report: the wait for its answer is the
+    /// round trip.
+    fn ping(&mut self) {
+        if self.closing || self.ping_misses >= PING_MISSES {
+            return;
+        }
+        if let Some(sent) = self.ping_sent {
+            if sent.elapsed() < PING_WAIT {
+                return;
+            }
+            self.ping_sent = None;
+            self.ping_misses += 1;
+            if self.ping_misses == PING_MISSES {
+                debug!(peer = %self.peer, "no answers to status queries; not timing round trips");
+                return;
+            }
+        }
+        if self.send(Out::Data(Bytes::from_static(STATUS_QUERY))) {
+            self.ping_sent = Some(Instant::now());
+        }
+    }
+
+    /// The terminal answered: one more round trip to go by.
+    fn on_pong(&mut self) {
+        let Some(sent) = self.ping_sent.take() else {
+            return;
+        };
+        let rtt = sent.elapsed();
+        self.ping_misses = 0;
+        PINGS.record(rtt);
+        // Smoothed like TCP's: each new sample counts for a quarter.
+        let ping = self.ping.map_or(rtt, |old| (old * 3 + rtt) / 4);
+        self.ping = Some(ping);
+        if let Some(link) = &self.room {
+            link.room.ping(self.id, ping);
+        }
     }
 
     fn on_keys(&mut self, keys: Vec<Key>, ctx: &mut Context<Self>) {
@@ -604,6 +659,9 @@ impl SessionActor {
         self.stays += 1;
         let stay = self.stays;
         let watch = self.watch_room(view, stay, ctx);
+        if let Some(ping) = self.ping {
+            room.ping(self.id, ping);
+        }
         self.room = Some(RoomLink { room, watch, stay });
         self.report_status();
         self.render(ctx);
@@ -968,12 +1026,20 @@ impl Handler<Input> for SessionActor {
         if self.closing || self.app.is_none() {
             return;
         }
-        self.last_input = Instant::now();
         if let Some(timer) = self.esc_timer.take() {
             ctx.cancel_future(timer);
         }
         let mut keys = Vec::new();
         self.parser.feed(&bytes, &mut keys);
+        let answers = self.parser.take_reports();
+        // The terminal answering a status query isn't the player doing
+        // anything: it mustn't keep an idle player connected.
+        if answers == 0 || !keys.is_empty() || self.parser.pending_esc() {
+            self.last_input = Instant::now();
+        }
+        if answers > 0 {
+            self.on_pong();
+        }
         if self.parser.pending_esc() {
             self.esc_timer = Some(ctx.run_later(ESC_WAIT, |act, ctx| {
                 act.esc_timer = None;

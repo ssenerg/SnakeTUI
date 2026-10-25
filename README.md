@@ -91,6 +91,12 @@ so in multiplayer turns are always queued for the next tick.
   shows its player's number.
 - **Small terminals.** If the board doesn't fit, you see the part around
   your snake, with a warning.
+- **Round trips.** Every player's round trip to the server shows next to
+  their name: in green while turns feel instant, yellow from 80 ms, red from
+  200 ms. A turn shows up a round trip after the key, plus the wait for the
+  next tick. The scoreboard shows the number when it's wide enough, and a
+  colored dot otherwise. The server times it by asking the terminal for a
+  status report every 2 seconds, which every terminal answers.
 
 ### Accounts, friends and ratings
 

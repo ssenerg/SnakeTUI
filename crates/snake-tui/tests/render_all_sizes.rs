@@ -134,6 +134,20 @@ fn room_views(rules: &Rules) -> Vec<RoomView> {
         };
         views.push(view);
     }
+    // Every room screen again, with round trips from fast to awful, and
+    // some players not timed.
+    let timed: Vec<RoomView> = views
+        .iter()
+        .map(|view| {
+            let mut view = view.clone();
+            for (i, seat) in view.seats.iter_mut().enumerate() {
+                let ms = [1, 45, 120, 999, 1500, 0][i % 6];
+                seat.ping = (ms > 0).then(|| Duration::from_millis(ms));
+            }
+            view
+        })
+        .collect();
+    views.extend(timed);
     views
 }
 
@@ -370,4 +384,64 @@ fn smallest_and_largest_boards_draw() {
         ];
         draw_all(&screens(&rules), &sizes);
     }
+}
+
+/// What a `w`×`h` terminal shows of `app`.
+fn shown(app: &App, w: u16, h: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..h)
+        .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn round_trips_show_by_each_player() {
+    let ms = Duration::from_millis;
+    let short = |id| Entrant {
+        id,
+        name: format!("~p{id}"),
+    };
+    let timed = |mut view: RoomView| {
+        for seat in &mut view.seats {
+            seat.ping = match seat.who.id {
+                1 => Some(ms(45)),
+                2 => Some(ms(1500)),
+                _ => None,
+            };
+        }
+        Arc::new(view)
+    };
+    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Round::new(settings, 1);
+    for id in 1..=3 {
+        round.join(short(id)).unwrap();
+    }
+    let mut app = App::online(
+        GameConfig::default(),
+        Records::default(),
+        "~p1".into(),
+        true,
+    );
+    app.screen = Screen::Room;
+    app.enter_room(1, timed(round.view()));
+    let lobby = shown(&app, 80, 24);
+    assert!(lobby.contains("~p1 (you) · 45 ms"), "{lobby}");
+    assert!(lobby.contains("~p2 · 1.5 s"), "{lobby}");
+    assert!(!lobby.contains("~p3 ·"), "not timed yet:\n{lobby}");
+
+    for id in 1..=3 {
+        round.toggle_ready(id);
+    }
+    while !matches!(round.view().phase, PhaseView::Running { .. }) {
+        round.advance(ms(100));
+    }
+    app.update_room(timed(round.view()));
+    // A wide scoreboard has room for the numbers; at 80 columns, dots.
+    let wide = shown(&app, 100, 24);
+    assert!(wide.contains("45ms") && wide.contains("1.5s"), "{wide}");
+    let narrow = shown(&app, 80, 24);
+    assert!(narrow.contains('●') && !narrow.contains("45ms"), "{narrow}");
 }

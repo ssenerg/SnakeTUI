@@ -52,6 +52,27 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// A round trip as shown: "42 ms", or "1.2 s" from a second on. `tight`
+/// leaves out the space.
+fn ping_text(ping: Duration, tight: bool) -> String {
+    let gap = if tight { "" } else { " " };
+    match ping.as_millis() {
+        ms @ 0..1000 => format!("{}{gap}ms", ms.max(1)),
+        _ => format!("{:.1}{gap}s", ping.as_secs_f64()),
+    }
+}
+
+/// Green while turns feel instant, yellow once they lag, red when they lag
+/// badly.
+fn ping_style(ping: Duration) -> Style {
+    let color = match ping.as_millis() {
+        0..80 => Color::LightGreen,
+        80..200 => Color::Yellow,
+        _ => Color::LightRed,
+    };
+    Style::default().fg(color)
+}
+
 fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
     let view = &room.view;
     let online = app.online.as_ref();
@@ -94,6 +115,10 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         if seat.wins > 0 {
             let s = if seat.wins == 1 { "" } else { "s" };
             spans.push(Span::styled(format!(" · {} win{s}", seat.wins), dim()));
+        }
+        if let Some(ping) = seat.ping {
+            spans.push(Span::styled(" · ", dim()));
+            spans.push(Span::styled(ping_text(ping, false), ping_style(ping)));
         }
         lines.push(Line::from(spans));
     }
@@ -263,7 +288,13 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
 
     let mut seats: Vec<_> = room.view.seats.iter().collect();
     seats.sort_by_key(|s| std::cmp::Reverse((s.slot.is_some(), s.alive, s.length)));
-    let name_w = (inner.width as usize).saturating_sub(8);
+    // Round trips go last, as numbers if names keep 8 columns, or else as
+    // a dot in their color.
+    let (ping_w, name_w) = match (inner.width as usize).saturating_sub(8) {
+        w if w >= 8 + 6 => (6, w - 6),
+        w if w >= 6 + 2 => (2, w - 2),
+        w => (0, w),
+    };
     let lines: Vec<Line> = seats
         .iter()
         .map(|seat| {
@@ -292,6 +323,17 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
             spans.push(Span::styled(format!(" {name:<name_w$}"), style));
             if seat.slot.is_some() {
                 spans.push(Span::styled(format!("{:>4}", seat.length), style));
+            } else if ping_w > 0 {
+                spans.push(Span::raw("    "));
+            }
+            match (ping_w, seat.ping) {
+                (0, _) => {}
+                (2, Some(ping)) => spans.push(Span::styled(" ●", ping_style(ping))),
+                (_, Some(ping)) => spans.push(Span::styled(
+                    format!("{:>ping_w$}", ping_text(ping, true)),
+                    ping_style(ping),
+                )),
+                (_, None) => {}
             }
             Line::from(spans)
         })

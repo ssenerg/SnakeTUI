@@ -82,6 +82,71 @@ impl Default for LagHistogram {
     }
 }
 
+/// Players' round trips, in a few buckets from 10 ms to a second.
+pub struct PingHistogram {
+    /// One per bound in [`Self::BOUNDS`], then one for anything slower.
+    buckets: [AtomicU64; PingHistogram::BOUNDS.len() + 1],
+    total_us: AtomicU64,
+}
+
+/// Every player's round trips, server-wide.
+pub static PINGS: PingHistogram = PingHistogram::new();
+
+impl PingHistogram {
+    /// Each bucket's upper bound.
+    pub const BOUNDS: [Duration; 8] = [
+        Duration::from_millis(10),
+        Duration::from_millis(25),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+        Duration::from_millis(300),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+    ];
+
+    pub const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; Self::BOUNDS.len() + 1],
+            total_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, rtt: Duration) {
+        let i = Self::BOUNDS
+            .iter()
+            .position(|&bound| rtt <= bound)
+            .unwrap_or(Self::BOUNDS.len());
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        self.total_us
+            .fetch_add(rtt.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Samples at or under `limit`, one of [`Self::BOUNDS`].
+    pub fn at_or_under(&self, limit: Duration) -> u64 {
+        Self::BOUNDS
+            .iter()
+            .zip(&self.buckets)
+            .take_while(|(bound, _)| **bound <= limit)
+            .map(|(_, b)| b.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn sum(&self) -> Duration {
+        Duration::from_micros(self.total_us.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for PingHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +174,21 @@ mod tests {
         assert_eq!(lag.sum(), Duration::from_micros(98 * 50 + 3050 + 50_050));
         lag.reset();
         assert_eq!(lag.count(), 0);
+    }
+
+    #[test]
+    fn pings_land_in_buckets_up_to_a_second() {
+        let pings = PingHistogram::new();
+        for ms in [3, 10, 11, 180, 450, 2500] {
+            pings.record(Duration::from_millis(ms));
+        }
+        let ms = Duration::from_millis;
+        assert_eq!(pings.count(), 6);
+        assert_eq!(pings.at_or_under(ms(10)), 2, "a bound is in its bucket");
+        assert_eq!(pings.at_or_under(ms(25)), 3);
+        assert_eq!(pings.at_or_under(ms(200)), 4);
+        assert_eq!(pings.at_or_under(ms(500)), 5);
+        assert_eq!(pings.at_or_under(ms(1000)), 5, "2.5 s is past every bound");
+        assert_eq!(pings.sum(), ms(3 + 10 + 11 + 180 + 450 + 2500));
     }
 }

@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::debug;
 
 use crate::accept::Limits;
-use crate::metrics::TICK_LAG;
+use crate::metrics::{PINGS, PingHistogram, TICK_LAG};
 use crate::{Shared, Stopping};
 
 /// A request has this long to arrive whole.
@@ -110,18 +110,41 @@ fn metrics(shared: &Shared, limits: &Limits) -> String {
             cluster.peers().len() as f64,
         );
     }
-    let name = "snaketui_tick_lag_seconds";
-    let _ = writeln!(
-        out,
-        "# HELP {name} How late rooms' ticks ran.\n# TYPE {name} histogram"
+    histogram(
+        &mut out,
+        "snaketui_tick_lag_seconds",
+        "How late rooms' ticks ran.",
+        LAG_BOUNDS.map(Duration::from_secs_f64),
+        |bound| TICK_LAG.at_or_under(bound),
+        (TICK_LAG.count(), TICK_LAG.sum()),
     );
-    for bound in LAG_BOUNDS {
-        let n = TICK_LAG.at_or_under(Duration::from_secs_f64(bound));
-        let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {n}");
-    }
-    let count = TICK_LAG.count();
-    let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
-    let _ = writeln!(out, "{name}_sum {}", TICK_LAG.sum().as_secs_f64());
-    let _ = writeln!(out, "{name}_count {count}");
+    histogram(
+        &mut out,
+        "snaketui_ping_seconds",
+        "Players' round trips to this server, measured every few seconds.",
+        PingHistogram::BOUNDS,
+        |bound| PINGS.at_or_under(bound),
+        (PINGS.count(), PINGS.sum()),
+    );
     out
+}
+
+/// A histogram in Prometheus's text format: how many samples were at or
+/// under each bound, then their count and sum.
+fn histogram<const N: usize>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    bounds: [Duration; N],
+    at_or_under: impl Fn(Duration) -> u64,
+    (count, sum): (u64, Duration),
+) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
+    for bound in bounds {
+        let le = bound.as_secs_f64();
+        let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {}", at_or_under(bound));
+    }
+    let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
+    let _ = writeln!(out, "{name}_sum {}", sum.as_secs_f64());
+    let _ = writeln!(out, "{name}_count {count}");
 }

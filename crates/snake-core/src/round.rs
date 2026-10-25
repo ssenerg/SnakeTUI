@@ -566,6 +566,7 @@ impl Round {
                     length: racer.map_or(0, |r| r.length),
                     wins: s.wins,
                     left: false,
+                    ping: None,
                 }
             })
             .collect();
@@ -580,6 +581,7 @@ impl Round {
                     length: racer.length,
                     wins: 0,
                     left: true,
+                    ping: None,
                 });
             }
         }
@@ -662,6 +664,9 @@ pub struct SeatView {
     pub wins: u32,
     /// Left during this round; listed until it's over.
     pub left: bool,
+    /// The player's round trip to the server, once measured. The server
+    /// fills it in; a round knows nothing about networks.
+    pub ping: Option<Duration>,
 }
 
 impl RoomView {

@@ -20,6 +20,7 @@ use russh::client::{self, KeyboardInteractiveAuthResponse, Msg};
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{Channel, ChannelMsg};
 use snaketui_server::config::ServerConfig;
+use snaketui_server::input::STATUS_QUERY;
 use snaketui_server::{serve, ssh};
 use tokio::time::{Instant, timeout};
 
@@ -219,6 +220,20 @@ impl Player {
         self.screen.screen().contents()
     }
 
+    /// Shows what the server sent, and answers its status queries the way
+    /// a terminal does.
+    async fn take(&mut self, data: &[u8]) {
+        self.received += data.len();
+        self.screen.process(data);
+        let asked = data
+            .windows(STATUS_QUERY.len())
+            .filter(|w| *w == STATUS_QUERY)
+            .count();
+        for _ in 0..asked {
+            let _ = self.channel.data(&b"\x1b[0n"[..]).await;
+        }
+    }
+
     /// Reads from the server until `done`, failing after `limit`.
     pub async fn wait_until(&mut self, what: &str, limit: Duration, done: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + limit;
@@ -236,10 +251,7 @@ impl Player {
                 );
             };
             match msg {
-                Some(ChannelMsg::Data { data }) => {
-                    self.received += data.len();
-                    self.screen.process(&data)
-                }
+                Some(ChannelMsg::Data { data }) => self.take(&data).await,
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     self.exit_status = Some(exit_status)
                 }
@@ -261,10 +273,7 @@ impl Player {
                 return false;
             };
             match msg {
-                Some(ChannelMsg::Data { data }) => {
-                    self.received += data.len();
-                    self.screen.process(&data)
-                }
+                Some(ChannelMsg::Data { data }) => self.take(&data).await,
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     self.exit_status = Some(exit_status)
                 }

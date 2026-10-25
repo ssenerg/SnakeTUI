@@ -5,6 +5,10 @@ use snake_tui::Key;
 const ESC: u8 = 0x1b;
 /// A sequence longer than this is garbage, not a key.
 const MAX_SEQUENCE: usize = 32;
+/// Asks the terminal how it is (device status report). Every terminal since
+/// the VT100 answers at once with `ESC [ 0 n`, which no key sends, so the
+/// wait for the answer is the player's round trip.
+pub const STATUS_QUERY: &[u8] = b"\x1b[5n";
 
 /// Parses terminal input. Packets can end in the middle of an escape
 /// sequence, so an unfinished one is kept until the rest arrives.
@@ -17,6 +21,8 @@ pub struct KeyParser {
     pending: Vec<u8>,
     /// The last byte was CR, so a following LF is part of the same Enter.
     after_cr: bool,
+    /// Answers to [`STATUS_QUERY`] since [`Self::take_reports`].
+    reports: u32,
 }
 
 impl KeyParser {
@@ -34,6 +40,10 @@ impl KeyParser {
                     }
                     Escape::Key(key, len) => {
                         out.extend(key);
+                        i += len;
+                    }
+                    Escape::Report(len) => {
+                        self.reports += 1;
                         i += len;
                     }
                 }
@@ -61,6 +71,11 @@ impl KeyParser {
         self.pending == [ESC]
     }
 
+    /// How many answers to [`STATUS_QUERY`] arrived since the last call.
+    pub fn take_reports(&mut self) -> u32 {
+        std::mem::take(&mut self.reports)
+    }
+
     /// Nothing followed a lone ESC in time: it was the Esc key.
     pub fn flush(&mut self, out: &mut Vec<Key>) {
         if self.pending_esc() {
@@ -75,6 +90,8 @@ enum Escape {
     Incomplete,
     /// A key (or nothing, for sequences the game ignores) and the bytes used.
     Key(Option<Key>, usize),
+    /// The terminal's answer to [`STATUS_QUERY`], and the bytes used.
+    Report(usize),
 }
 
 /// Parses an escape sequence at the start of `buf`, which begins with ESC.
@@ -93,6 +110,11 @@ fn parse_escape(buf: &[u8]) -> Escape {
         Some(b'[') => match buf[2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
             Some(end) => {
                 let fin = buf[2 + end];
+                // "0n" is all well; "3n", a terminal that's unwell, is an
+                // answer too.
+                if fin == b'n' && matches!(&buf[2..2 + end], b"0" | b"3") {
+                    return Escape::Report(3 + end);
+                }
                 let key = if end == 0 { arrow(fin) } else { None };
                 Escape::Key(key, 3 + end)
             }
@@ -187,6 +209,29 @@ mod tests {
         let mut junk = b"\x1b[".to_vec();
         junk.extend([b'1'; 40]);
         assert_eq!(parse(&[&junk, b"q"]), [Char('q')]);
+    }
+
+    #[test]
+    fn status_reports_are_counted_and_never_keys() {
+        let mut parser = KeyParser::default();
+        let mut keys = Vec::new();
+        parser.feed(b"\x1b[A\x1b[0nq\x1b[3n", &mut keys);
+        assert_eq!(keys, [Up, Char('q')]);
+        assert_eq!(parser.take_reports(), 2);
+        assert_eq!(parser.take_reports(), 0, "taken");
+
+        // Split anywhere, still one answer and no Esc.
+        for at in 1..4 {
+            let (a, b) = b"\x1b[0n".split_at(at);
+            parser.feed(a, &mut keys);
+            parser.feed(b, &mut keys);
+            parser.flush(&mut keys);
+            assert_eq!(keys, [Up, Char('q')], "split at {at}");
+            assert_eq!(parser.take_reports(), 1, "split at {at}");
+        }
+        // Other status-like sequences are ignored, not counted.
+        parser.feed(b"\x1b[6n\x1b[1n", &mut keys);
+        assert_eq!(parser.take_reports(), 0);
     }
 
     #[test]
