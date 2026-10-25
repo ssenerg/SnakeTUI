@@ -14,13 +14,16 @@ pub const PASSWORD: &str = "correct horse 7";
 pub const WRONG: &str = "Wrong username or password.";
 
 // A guest's home menu: Single player, Quick play, Create, Join, Nickname,
-// Sign up, Sign in, Quit. An account's: ..., Join, Friends, Account, Quit.
-// Signing up or in leaves the cursor on Quick play.
+// Sign up, Sign in, Leaderboard, Quit. An account's: ..., Join, Friends,
+// Account, Leaderboard, Quit. Signing up or in leaves the cursor on Quick
+// play.
 pub const QUICK_PLAY: usize = 1;
 pub const SIGN_UP: usize = 5;
 pub const SIGN_IN: usize = 6;
+pub const GUEST_LEADERBOARD: usize = 7;
 pub const FRIENDS: usize = 4;
 pub const ACCOUNT: usize = 5;
+pub const LEADERBOARD: usize = 6;
 
 /// The home menu, guest or signed in, waiting for it to show.
 pub async fn connect_as(addr: SocketAddr, login: Login<'_>) -> Player {

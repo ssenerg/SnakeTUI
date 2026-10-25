@@ -46,6 +46,8 @@ pub enum Screen {
     Friends {
         selected: usize,
     },
+    /// Online: the best players by rating.
+    Leaderboard,
 }
 
 /// Work the app leaves to whoever runs it, in the order given.
@@ -99,6 +101,8 @@ pub enum Effect {
     LoadAccount,
     /// Answer with [`App::set_friends`].
     LoadFriends,
+    /// Answer with [`App::set_leaderboard`].
+    LoadLeaderboard,
     AddFriend(String),
     AnswerFriend {
         name: String,
@@ -341,6 +345,7 @@ impl App {
             Screen::Form(kind) => self.form_key(kind, key, effects),
             Screen::Account { selected } => self.account_key(selected, key, effects),
             Screen::Friends { selected } => self.friends_key(selected, key, effects),
+            Screen::Leaderboard => self.leaderboard_key(key),
         }
     }
 }

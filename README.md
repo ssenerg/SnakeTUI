@@ -130,6 +130,8 @@ Guests can play everything except friends and ratings. To get those, pick
   results show by how much. Quick play looks for players of a close rating
   first, and widens the range the longer you wait. Guests can join rated
   matches; they count as 1000, and nothing is saved for them.
+- **Leaderboard**, on the home screen, lists the top 20 accounts by rating,
+  and your own place. You're listed after 5 rated games.
 - **Passwords** are typed into the game's own masked form, never into ssh's
   password prompt, which stays off. The server keeps only an Argon2id hash.
   A connection closes after 5 wrong tries, and 5 wrong tries for one username

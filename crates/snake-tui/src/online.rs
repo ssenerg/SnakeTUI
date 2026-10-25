@@ -17,6 +17,10 @@ use crate::ui;
 /// Longest password, in characters; they're all ASCII.
 pub const MAX_SECRET: usize = 128;
 
+/// Rated games an account needs before the leaderboard lists it: new
+/// ratings swing a lot.
+pub const RANKED_AFTER: u32 = 5;
+
 /// A password while it's typed and sent: wiped from memory when dropped,
 /// and never shown by `Debug`.
 #[derive(Clone, PartialEq, Eq)]
@@ -105,6 +109,7 @@ pub enum HomeItem {
     Nickname,
     SignUp,
     SignIn,
+    Leaderboard,
     Quit,
 }
 
@@ -120,6 +125,7 @@ impl HomeItem {
             HomeItem::Nickname => "Nickname",
             HomeItem::SignUp => "Sign up",
             HomeItem::SignIn => "Sign in",
+            HomeItem::Leaderboard => "Leaderboard",
             HomeItem::Quit => "Quit",
         }
     }
@@ -230,6 +236,32 @@ impl FriendsView {
     }
 }
 
+/// One player on the leaderboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderRow {
+    /// 1 for the best.
+    pub place: u32,
+    pub name: String,
+    pub rating: u32,
+    pub games: u32,
+    pub wins: u32,
+}
+
+/// Where this player stands on the leaderboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MyPlace {
+    Guest,
+    Unranked { games_left: u32 },
+    Ranked(LeaderRow),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderboardView {
+    /// The best players, best first.
+    pub rows: Vec<LeaderRow>,
+    pub me: MyPlace,
+}
+
 /// One selectable row of the account screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccountRow {
@@ -265,6 +297,8 @@ pub struct Online {
     pub has_key: bool,
     pub keys: Vec<KeyRow>,
     pub friends: FriendsView,
+    /// `None` until it loads.
+    pub leaderboard: Option<LeaderboardView>,
     /// Who's inviting this player to their room, waiting for Enter or Esc.
     pub invite: Option<String>,
     /// Friend requests waiting for this player's answer.
@@ -291,6 +325,7 @@ impl Online {
             has_key,
             keys: Vec::new(),
             friends: FriendsView::default(),
+            leaderboard: None,
             invite: None,
             requests: 0,
             confirm_small: false,
@@ -348,7 +383,8 @@ fn step(selected: usize, len: usize, key: Key) -> Option<usize> {
 
 impl App {
     /// The home menu's entries: guests can sign up or in, accounts see
-    /// their friends.
+    /// their friends. New entries go near the end, so the old ones keep
+    /// their places.
     pub fn home_items(&self) -> Vec<HomeItem> {
         let mut items = vec![
             HomeItem::SinglePlayer,
@@ -361,7 +397,7 @@ impl App {
         } else {
             items.extend([HomeItem::Nickname, HomeItem::SignUp, HomeItem::SignIn]);
         }
-        items.push(HomeItem::Quit);
+        items.extend([HomeItem::Leaderboard, HomeItem::Quit]);
         items
     }
 
@@ -489,6 +525,12 @@ impl App {
             }
             HomeItem::SignUp => self.start_form(FormKind::SignUp),
             HomeItem::SignIn => self.start_form(FormKind::SignIn),
+            HomeItem::Leaderboard => {
+                // Fresh every time, so it never shows old places.
+                online.leaderboard = None;
+                self.screen = Screen::Leaderboard;
+                effects.push(Effect::LoadLeaderboard);
+            }
             HomeItem::Quit => effects.push(Effect::Quit),
         }
     }
@@ -761,6 +803,12 @@ impl App {
         }
     }
 
+    pub(crate) fn leaderboard_key(&mut self, key: Key) {
+        if matches!(key, Key::Esc | Key::Enter | Key::Char('q')) {
+            self.go_home(HomeItem::Leaderboard, None);
+        }
+    }
+
     pub(crate) fn friends_key(&mut self, selected: usize, key: Key, effects: &mut Vec<Effect>) {
         let Some(online) = &mut self.online else {
             return;
@@ -1009,6 +1057,12 @@ impl App {
         }
     }
 
+    pub fn set_leaderboard(&mut self, view: LeaderboardView) {
+        if let Some(online) = &mut self.online {
+            online.leaderboard = Some(view);
+        }
+    }
+
     /// `from` invites this player to their room.
     pub fn invited(&mut self, from: String) {
         if let Some(online) = &mut self.online {
@@ -1232,6 +1286,41 @@ mod tests {
             "alice",
             "no ~ for accounts"
         );
+    }
+
+    #[test]
+    fn the_leaderboard_sits_above_quit_and_loads_fresh_each_time() {
+        for mut app in [online(), signed_in()] {
+            let items = app.home_items();
+            assert_eq!(
+                items[items.len() - 2..],
+                [HomeItem::Leaderboard, HomeItem::Quit]
+            );
+            assert_eq!(
+                choose(&mut app, HomeItem::Leaderboard),
+                [Effect::LoadLeaderboard]
+            );
+            assert_eq!(app.screen, Screen::Leaderboard);
+            app.set_leaderboard(LeaderboardView {
+                rows: Vec::new(),
+                me: MyPlace::Guest,
+            });
+            assert!(app.online.as_ref().unwrap().leaderboard.is_some());
+            assert_eq!(app.handle(Key::Esc), []);
+            let at = items.len() - 2;
+            assert_eq!(app.screen, Screen::Home { selected: at });
+
+            choose(&mut app, HomeItem::Leaderboard);
+            assert_eq!(
+                app.online.as_ref().unwrap().leaderboard,
+                None,
+                "the old list is gone until the new one loads"
+            );
+            assert_eq!(app.handle(Key::Char('x')), []);
+            assert_eq!(app.screen, Screen::Leaderboard);
+            app.handle(Key::Enter);
+            assert_eq!(app.screen, Screen::Home { selected: at });
+        }
     }
 
     #[test]

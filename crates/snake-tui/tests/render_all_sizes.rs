@@ -14,8 +14,35 @@ use snake_core::round::{
     Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
-use snake_tui::online::{Field, FormKind, FriendRow, FriendsView, KeyRow, Profile, QueueRegion};
+use snake_tui::online::{
+    Field, FormKind, FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile,
+    QueueRegion,
+};
 use snake_tui::{App, Screen, ui};
+
+/// A leaderboard of `len` players with long names, and `me`.
+fn leaderboard(len: u32, me: MyPlace) -> LeaderboardView {
+    let rows = (1..=len)
+        .map(|place| LeaderRow {
+            place,
+            name: format!("player-number-{place:02}"),
+            rating: 1500 - place * 10,
+            games: 100 + place,
+            wins: 50,
+        })
+        .collect();
+    LeaderboardView { rows, me }
+}
+
+fn ranked(place: u32) -> MyPlace {
+    MyPlace::Ranked(LeaderRow {
+        place,
+        name: "player0123456789".into(),
+        rating: 988,
+        games: 6,
+        wins: 1,
+    })
+}
 
 /// One app per screen worth drawing, on a board of `rules`.
 fn screens(rules: &Rules) -> Vec<App> {
@@ -212,6 +239,22 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     }
     for selected in [0, 2, 5, 23] {
         apps.push(account(Screen::Friends { selected }));
+    }
+    apps.push(account(Screen::Leaderboard));
+    for (signed_in, view) in [
+        (false, leaderboard(0, MyPlace::Guest)),
+        (false, leaderboard(20, MyPlace::Guest)),
+        (true, leaderboard(20, ranked(3))),
+        (true, leaderboard(20, ranked(37))),
+        (true, leaderboard(4, MyPlace::Unranked { games_left: 1 })),
+    ] {
+        let mut app = if signed_in {
+            account(Screen::Leaderboard)
+        } else {
+            new_app(Screen::Leaderboard)
+        };
+        app.set_leaderboard(view);
+        apps.push(app);
     }
     for kind in [FormKind::SignUp, FormKind::SignIn, FormKind::ChangePassword] {
         let mut app = if kind == FormKind::ChangePassword {
@@ -474,4 +517,49 @@ fn only_the_host_sees_how_to_change_the_speed() {
         "{guest}"
     );
     assert!(!guest.contains("speed"), "{guest}");
+}
+
+#[test]
+fn the_leaderboard_shows_what_fits_and_always_your_place() {
+    let app = |view: Option<LeaderboardView>| {
+        let mut app = App::online(
+            GameConfig::default(),
+            Records::default(),
+            "~guest".into(),
+            true,
+        );
+        app.screen = Screen::Leaderboard;
+        if let Some(view) = view {
+            app.set_leaderboard(view);
+        }
+        app
+    };
+    let loading = shown(&app(None), 80, 24);
+    assert!(loading.contains("Loading…"), "{loading}");
+
+    let empty = shown(&app(Some(leaderboard(0, MyPlace::Guest))), 80, 24);
+    assert!(
+        empty.contains("Nobody has played 5 rated games yet."),
+        "{empty}"
+    );
+    assert!(empty.contains("Sign up to get a rating."), "{empty}");
+
+    let full = shown(&app(Some(leaderboard(20, ranked(37)))), 80, 24);
+    assert!(full.contains("#  Player"), "{full}");
+    assert!(
+        full.contains(" 1  player-number-01    1490    101    50"),
+        "{full}"
+    );
+    assert!(full.contains("player-number-19"), "19 rows fit: {full}");
+    assert!(!full.contains("player-number-20"), "{full}");
+    assert!(full.contains("You: 37th · 988 · 6 games"), "{full}");
+    let tall = shown(&app(Some(leaderboard(20, ranked(37)))), 80, 26);
+    assert!(tall.contains("player-number-20"), "{tall}");
+
+    let unranked = MyPlace::Unranked { games_left: 2 };
+    let unranked = shown(&app(Some(leaderboard(3, unranked))), 80, 24);
+    assert!(
+        unranked.contains("2 more rated games to be ranked."),
+        "{unranked}"
+    );
 }

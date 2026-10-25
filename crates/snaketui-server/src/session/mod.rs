@@ -539,6 +539,7 @@ impl SessionActor {
                 Effect::ForgetKey(key) => self.refresh_keys(Some(key), ctx),
                 Effect::LoadAccount => self.refresh_keys(None, ctx),
                 Effect::LoadFriends => self.refresh_friends(ctx),
+                Effect::LoadLeaderboard => self.load_leaderboard(ctx),
                 Effect::AddFriend(name) => self.add_friend(name, ctx),
                 Effect::AnswerFriend { name, accept } => self.answer_friend(name, accept, ctx),
                 Effect::RemoveFriend(name) => self.remove_friend(name, ctx),

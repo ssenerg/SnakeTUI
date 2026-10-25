@@ -5,6 +5,7 @@ mod forms;
 mod friends;
 mod game;
 mod home;
+mod leaderboard;
 mod menu;
 mod room;
 
@@ -54,6 +55,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
         Screen::Account { selected } => account::draw(frame, app, selected),
         Screen::Friends { selected } => friends::draw(frame, app, selected),
+        Screen::Leaderboard => leaderboard::draw(frame, app),
         Screen::Finding => {
             home::draw(frame, app, home(HomeItem::QuickPlay));
             dialogs::draw_finding(frame, app);

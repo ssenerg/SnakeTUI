@@ -241,6 +241,15 @@ pub struct Friend {
     pub last_seen: i64,
 }
 
+/// An account as the leaderboard shows it.
+#[derive(Clone, Debug)]
+pub struct Ranked {
+    pub username: String,
+    pub rating: Rating,
+    pub games: u32,
+    pub wins: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FriendLists {
     pub friends: Vec<Friend>,
@@ -648,6 +657,61 @@ impl Store {
         Ok(())
     }
 
+    /// The best accounts with at least `min_games` rated games, best first:
+    /// by rating, then games played, then name.
+    pub async fn leaderboard(&self, min_games: u32, limit: u32) -> Result<Vec<Ranked>> {
+        let rows = sqlx::query(
+            "SELECT username, rating_mu, rating_sigma, games, wins FROM accounts
+             WHERE games >= $1
+             ORDER BY rating_mu DESC, games DESC, lower(username)
+             LIMIT $2",
+        )
+        .bind(i64::from(min_games))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(Ranked {
+                    username: row.try_get(0)?,
+                    rating: Rating {
+                        mu: row.try_get(1)?,
+                        sigma: row.try_get(2)?,
+                    },
+                    games: row.try_get::<i64, _>(3)? as u32,
+                    wins: row.try_get::<i64, _>(4)? as u32,
+                })
+            })
+            .collect()
+    }
+
+    /// Where `account` stands on [`Self::leaderboard`], 1 for the best;
+    /// `None` until it has `min_games` rated games.
+    pub async fn place_of(&self, account: AccountId, min_games: u32) -> Result<Option<u32>> {
+        let min_games = i64::from(min_games);
+        let ahead = sqlx::query(
+            "SELECT COUNT(*) FROM accounts o, accounts me
+             WHERE me.id = $1 AND me.games >= $2 AND o.games >= $2
+               AND (o.rating_mu > me.rating_mu
+                    OR (o.rating_mu = me.rating_mu
+                        AND (o.games > me.games
+                             OR (o.games = me.games
+                                 AND lower(o.username) < lower(me.username)))))",
+        )
+        .bind(account)
+        .bind(min_games)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get::<i64, _>(0)?;
+        let ranked = sqlx::query("SELECT 1 FROM accounts WHERE id = $1 AND games >= $2")
+            .bind(account)
+            .bind(min_games)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        Ok(ranked.then_some(ahead as u32 + 1))
+    }
+
     // Friends.
 
     pub async fn are_friends(&self, a: AccountId, b: AccountId) -> Result<bool> {
@@ -1028,6 +1092,7 @@ mod tests {
         keys_move_between_accounts_and_only_the_latest_ten_are_kept,
         rated_rounds_count_games_wins_and_new_ratings,
         friendship_needs_both_sides,
+        the_leaderboard_ranks_accounts_with_enough_games,
         requests_waiting_for_an_answer_are_limited,
         limits_count_recent_events_and_tidy_away_old_ones,
         room_codes_are_claimed_once_and_expire,
@@ -1170,6 +1235,54 @@ mod tests {
             .unwrap();
         let after = store.load_account(a.id).await.unwrap().account;
         assert_eq!((after.games, after.wins, after.rating), (1, 1, better));
+    }
+
+    async fn the_leaderboard_ranks_accounts_with_enough_games(store: Store) {
+        // Plays `games` rated rounds for `who`, ending at rating `mu`.
+        let rated = |who: AccountId, mu: f64, games: u32| {
+            let store = store.clone();
+            async move {
+                for i in 0..games {
+                    let rating = Rating { mu, sigma: 4.0 };
+                    let won = i % 2 == 0;
+                    let results = [RatedResult {
+                        account: who,
+                        rating,
+                        won,
+                    }];
+                    store.save_rated_round(&results).await.unwrap();
+                }
+            }
+        };
+        let ann = account(&store, "ann", None).await;
+        let ben = account(&store, "ben", None).await;
+        let cat = account(&store, "cat", None).await;
+        let dan = account(&store, "Dan", None).await;
+        rated(ann.id, 26.0, 5).await;
+        rated(ben.id, 27.0, 6).await;
+        rated(cat.id, 30.0, 4).await; // best, but not enough games
+        rated(dan.id, 26.0, 7).await; // ann's rating, more games
+
+        let names = |board: Vec<Ranked>| board.into_iter().map(|r| r.username).collect::<Vec<_>>();
+        let board = store.leaderboard(5, 20).await.unwrap();
+        assert_eq!(names(board.clone()), ["ben", "Dan", "ann"]);
+        assert_eq!((board[0].games, board[0].wins), (6, 3));
+        assert_eq!(board[0].rating.mu, 27.0);
+        assert_eq!(
+            names(store.leaderboard(5, 2).await.unwrap()),
+            ["ben", "Dan"]
+        );
+        assert_eq!(names(store.leaderboard(4, 1).await.unwrap()), ["cat"]);
+
+        assert_eq!(store.place_of(ben.id, 5).await.unwrap(), Some(1));
+        assert_eq!(store.place_of(dan.id, 5).await.unwrap(), Some(2));
+        assert_eq!(
+            store.place_of(ann.id, 5).await.unwrap(),
+            Some(3),
+            "as listed"
+        );
+        assert_eq!(store.place_of(cat.id, 5).await.unwrap(), None);
+        assert_eq!(store.place_of(cat.id, 4).await.unwrap(), Some(1));
     }
 
     async fn friendship_needs_both_sides(store: Store) {

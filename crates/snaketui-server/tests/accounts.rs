@@ -10,6 +10,8 @@ use common::*;
 use snake_core::round::{
     Entrant, Outcome, RoomKind, Round, RoundEvent, RoundSettings, quick_rules,
 };
+use snaketui_server::rating::Rating;
+use snaketui_server::store::{RatedResult, Store};
 
 #[tokio::test]
 async fn a_new_account_signs_in_by_itself_from_the_same_key() {
@@ -201,6 +203,56 @@ fn first_player_wins_seed() -> u64 {
             false
         })
         .expect("some seed works")
+}
+
+#[tokio::test]
+async fn the_leaderboard_lists_players_after_five_rated_games() {
+    let server = TestServer::start();
+    let mut keys = Vec::new();
+    for name in ["ann", "ben", "cat"] {
+        let (_, key) = signed_up(server.addr, name).await;
+        keys.push(key);
+    }
+    // What their rated rounds would have left, written behind the
+    // server's back; they sign in again below to see it.
+    let store = Store::open(&format!(
+        "sqlite://{}",
+        server.dir.join("db.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    for (name, mu, games) in [("ann", 26.0, 5), ("ben", 27.5, 6), ("cat", 30.0, 3)] {
+        let (account, _) = store.find_account(name).await.unwrap().unwrap();
+        for _ in 0..games {
+            let results = [RatedResult {
+                account: account.id,
+                rating: Rating { mu, sigma: 4.0 },
+                won: true,
+            }];
+            store.save_rated_round(&results).await.unwrap();
+        }
+    }
+    store.close().await;
+
+    let mut guest = connect_as(server.addr, Login::Guest).await;
+    pick(&guest, 0, GUEST_LEADERBOARD).await;
+    guest.wait_for("Sign up to get a rating.").await;
+    let text = guest.text();
+    let row = |place: &str, name: &str, rating: &str| {
+        text.lines()
+            .any(|l| l.contains(&format!("{place}  {name} ")) && l.contains(rating))
+    };
+    assert!(row("1", "ben", "1100") && row("2", "ann", "1040"), "{text}");
+    assert!(!text.contains("cat"), "3 games aren't enough: {text}");
+
+    let mut ben = connect_as(server.addr, Login::Key(&keys[1])).await;
+    pick(&ben, 0, LEADERBOARD).await;
+    ben.wait_for("You: 1st · 1100 · 6 games").await;
+    let mut cat = connect_as(server.addr, Login::Key(&keys[2])).await;
+    pick(&cat, 0, LEADERBOARD).await;
+    cat.wait_for("2 more rated games to be ranked.").await;
+    cat.send(ESC).await;
+    cat.wait_for("Signed in as cat").await;
 }
 
 /// The rating in the home menu's "Signed in as … · rating N".

@@ -8,7 +8,10 @@ use snake_core::config::GameConfig;
 use snake_core::records::Records;
 use snake_core::round::{JoinError, RoomKind};
 use snake_tui::Screen;
-use snake_tui::online::{FriendRow, FriendsView, KeyRow, Profile, Secret};
+use snake_tui::online::{
+    FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile, RANKED_AFTER,
+    Secret,
+};
 use tracing::{debug, warn};
 
 use super::SessionActor;
@@ -20,6 +23,8 @@ use crate::store::{Account, AccountData, AccountId, Requested, now};
 
 /// Wrong passwords one connection may try before it's disconnected.
 const MAX_SIGN_IN_TRIES: u8 = 5;
+/// Players the leaderboard lists.
+const LEADERBOARD_SIZE: u32 = 20;
 /// How long an invite waits for an answer.
 const INVITE_LIFETIME: Duration = Duration::from_secs(120);
 const TRY_AGAIN: &str = "Something went wrong. Try again.";
@@ -402,6 +407,63 @@ impl SessionActor {
                     }
                 }
                 Err(e) => warn!(error = %e, "couldn't list friends"),
+            }
+            act.render(ctx);
+        }));
+    }
+
+    /// Loads the best players, and this player's place among everyone.
+    pub(super) fn load_leaderboard(&mut self, ctx: &mut Context<Self>) {
+        let (store, me) = (self.shared.store.clone(), self.account_id());
+        let board = async move {
+            let best = store.leaderboard(RANKED_AFTER, LEADERBOARD_SIZE).await?;
+            let place = match me {
+                Some(id) => store.place_of(id, RANKED_AFTER).await?,
+                None => None,
+            };
+            anyhow::Ok((best, place))
+        };
+        ctx.spawn(board.into_actor(self).map(|board, act, ctx| {
+            let (best, place) = match board {
+                Ok(board) => board,
+                Err(e) => {
+                    warn!(error = %e, "couldn't load the leaderboard");
+                    return act.notify(TRY_AGAIN.to_string(), ctx);
+                }
+            };
+            let rows: Vec<LeaderRow> = best
+                .into_iter()
+                .zip(1..)
+                .map(|(r, place)| LeaderRow {
+                    place,
+                    name: r.username,
+                    rating: r.rating.shown(),
+                    games: r.games,
+                    wins: r.wins,
+                })
+                .collect();
+            let me = match (&act.account, place) {
+                (None, _) => MyPlace::Guest,
+                // Listed, so it shows the same numbers as the list.
+                (Some(account), Some(place)) => {
+                    MyPlace::Ranked(rows.get(place as usize - 1).cloned().unwrap_or_else(|| {
+                        LeaderRow {
+                            place,
+                            name: account.username.clone(),
+                            rating: account.rating.shown(),
+                            games: account.games,
+                            wins: account.wins,
+                        }
+                    }))
+                }
+                // Saving a round's ratings can lag a moment behind the
+                // session hearing about it.
+                (Some(account), None) => MyPlace::Unranked {
+                    games_left: RANKED_AFTER.saturating_sub(account.games).max(1),
+                },
+            };
+            if let Some(app) = act.app.as_mut() {
+                app.set_leaderboard(LeaderboardView { rows, me });
             }
             act.render(ctx);
         }));
