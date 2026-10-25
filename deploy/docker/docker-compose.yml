@@ -20,8 +20,10 @@ services:
     restart: unless-stopped
     ports:
       # Docker keeps players' own addresses, which the per-IP limits count.
-      # It also opens the port past ufw.
-      - "${SNAKETUI_PORT:-22}:2222"
+      # It also opens the port past ufw. IPv4 only: this network has no
+      # IPv6, so Docker would pass every IPv6 player on from one address,
+      # and they'd all share one player's limits.
+      - "0.0.0.0:${SNAKETUI_PORT:-22}:2222"
       - "127.0.0.1:${SNAKETUI_ADMIN_PORT:-9022}:9022"
     volumes:
       # The host key and the database.

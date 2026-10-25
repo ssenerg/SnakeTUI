@@ -1,7 +1,7 @@
 //! Takes new connections and hands each one to a worker thread.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -42,9 +42,14 @@ impl Limits {
 
     /// Lets a connection from `ip` in, if neither limit is reached.
     fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<Admission> {
+        let ip = counted_as(ip);
         let mut per_ip = self.per_ip.lock().unwrap();
+        // Full: turned away without keeping its address.
+        if self.open() >= self.max_total {
+            return None;
+        }
         let from_ip = per_ip.entry(ip).or_default();
-        if *from_ip >= self.max_per_ip || self.open() >= self.max_total {
+        if *from_ip >= self.max_per_ip {
             return None;
         }
         *from_ip += 1;
@@ -54,6 +59,16 @@ impl Limits {
             ip,
             worker: None,
         })
+    }
+}
+
+/// The address the per-address limits count `ip` as: an IPv4 address
+/// itself, but an IPv6 address's whole /64, since anyone with IPv6 usually
+/// has a /64 to pick addresses from.
+pub fn counted_as(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u128::MAX >> 64))),
+        v4 => v4,
     }
 }
 
@@ -226,5 +241,31 @@ mod tests {
         drop(first);
         assert_eq!(limits.open(), 2);
         assert!(limits.admit(a).is_some(), "a slot came back");
+    }
+
+    #[test]
+    fn ipv6_counts_by_64_and_the_turned_away_leave_nothing_behind() {
+        let limits = Limits::new(3, 2);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let _a = limits.admit(ip("2001:db8:1:2::1")).unwrap();
+        let _b = limits.admit(ip("2001:db8:1:2:ffff::9")).unwrap();
+        assert!(
+            limits.admit(ip("2001:db8:1:2:abcd::7")).is_none(),
+            "one /64, one limit"
+        );
+        let _c = limits.admit(ip("2001:db8:1:3::1")).unwrap();
+        for last in 0..100 {
+            assert!(
+                limits.admit(ip(&format!("2001:db8:9:{last}::1"))).is_none(),
+                "full"
+            );
+        }
+        assert_eq!(
+            limits.per_ip.lock().unwrap().len(),
+            2,
+            "no entries for them"
+        );
+        assert_eq!(counted_as(ip("::ffff:10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(counted_as(ip("10.0.0.1")), ip("10.0.0.1"));
     }
 }

@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use self::account::{JoinedRoom, PendingInvite};
+use crate::auth::Refused;
 use crate::backend::SshBackend;
 use crate::identity::{Player, nickname};
 use crate::input::{Budget, KeyParser, STATUS_QUERY};
@@ -32,7 +33,7 @@ use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::PINGS;
 use crate::presence::Doing;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
-use crate::store::{Account, AccountData};
+use crate::store::{Account, AccountData, now};
 use crate::{Shared, Stopping};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
@@ -238,6 +239,7 @@ struct RoomLink {
 enum JoinFail {
     NoSuchCode,
     TooManyCodes,
+    CodesFromAddress,
     BoardTooSmall,
     Full,
     Closed,
@@ -249,6 +251,7 @@ impl JoinFail {
         match self {
             JoinFail::NoSuchCode => "No room has that code.",
             JoinFail::TooManyCodes => "Too many wrong codes. Reconnect to try again.",
+            JoinFail::CodesFromAddress => Refused::TooManyCodes.message(),
             JoinFail::BoardTooSmall => {
                 "Your board is too small for two snakes. Make it bigger in Single player."
             }
@@ -719,12 +722,24 @@ impl SessionActor {
             (Some(rules), _) => Box::pin(self.room_maker(rules)),
             (None, Some(code)) => {
                 let lobby = self.shared.lobby.clone();
+                let guesses = self.shared.guesses.clone();
+                let ip = self.peer.ip();
                 let who = self.entrant();
                 let presence = Arc::downgrade(&self.presence);
                 Box::pin(async move {
+                    // Wrong codes count per address too, or reconnecting
+                    // would give a fresh five each time.
+                    match guesses.may_try_code(ip, now()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(JoinFail::CodesFromAddress),
+                        Err(_) => return Err(JoinFail::Unavailable),
+                    }
                     match lobby.send(FindRoom(code)).await {
                         Ok(Some(room)) => seat(room, who, presence).await,
-                        Ok(None) => Err(JoinFail::NoSuchCode),
+                        Ok(None) => {
+                            let _ = guesses.wrong_code(ip, now()).await;
+                            Err(JoinFail::NoSuchCode)
+                        }
                         Err(_) => Err(JoinFail::Closed),
                     }
                 })

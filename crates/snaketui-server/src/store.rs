@@ -338,6 +338,8 @@ pub enum Counted {
     SignUp,
     /// Trying to make an account from an IP address, made or not.
     SignUpTry,
+    /// A room code that matched no room, from an IP address.
+    WrongCode,
 }
 
 impl Counted {
@@ -347,6 +349,7 @@ impl Counted {
             Counted::WrongFromAddress => "address",
             Counted::SignUp => "signup",
             Counted::SignUpTry => "signup_try",
+            Counted::WrongCode => "code",
         }
     }
 }

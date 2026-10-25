@@ -14,6 +14,7 @@ use snake_core::round::bot_names;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
+use crate::accept::counted_as;
 use crate::identity::GENERIC_USERS;
 use crate::store::{Counted, Store};
 
@@ -136,6 +137,10 @@ pub const IP_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Accounts one IP address may make.
 pub const SIGNUPS: usize = 5;
 pub const SIGNUP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// Wrong room codes allowed from one IP address, however many connections
+/// they come from.
+pub const CODE_TRIES: usize = 20;
+pub const CODE_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Tries to make an account one IP address may make, taken names and all.
 pub const SIGNUP_TRIES: usize = 30;
 pub const SIGNUP_TRY_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -152,6 +157,8 @@ pub enum Refused {
     TooManySignUpTries,
     /// Another try for this name, or from this address, is still going.
     Busy,
+    /// This address tried too many wrong room codes.
+    TooManyCodes,
 }
 
 impl Refused {
@@ -166,6 +173,7 @@ impl Refused {
                 "Too many tries to make an account from your address. Try again later."
             }
             Refused::Busy => "Another try is still going. Try again in a moment.",
+            Refused::TooManyCodes => "Too many wrong codes from your address. Try again later.",
         }
     }
 }
@@ -215,7 +223,7 @@ impl GuessLimits {
     pub fn begin(&self, name: &str, from: IpAddr) -> Result<Attempt, Refused> {
         let held = [
             format!("name {}", name.to_ascii_lowercase()),
-            format!("address {from}"),
+            format!("address {}", counted_as(from)),
         ];
         let mut busy = self.busy.lock().unwrap();
         if held.iter().any(|key| busy.contains(key)) {
@@ -247,7 +255,7 @@ impl GuessLimits {
             .store
             .count(
                 Counted::WrongFromAddress,
-                &from.to_string(),
+                &counted_as(from).to_string(),
                 now - secs(IP_WINDOW),
             )
             .await?;
@@ -261,7 +269,11 @@ impl GuessLimits {
         let name = name.to_ascii_lowercase();
         let store = &self.store;
         store
-            .note(Counted::WrongFromAddress, &from.to_string(), now)
+            .note(
+                Counted::WrongFromAddress,
+                &counted_as(from).to_string(),
+                now,
+            )
             .await?;
         store.note(Counted::WrongForName, &name, now).await?;
         let tries = store
@@ -282,7 +294,7 @@ impl GuessLimits {
 
     /// Whether `from` may try to make an account. Every try counts.
     pub async fn may_sign_up(&self, from: IpAddr, now: i64) -> Result<Result<(), Refused>> {
-        let address = from.to_string();
+        let address = counted_as(from).to_string();
         let tried = self
             .store
             .count(Counted::SignUpTry, &address, now - secs(SIGNUP_TRY_WINDOW))
@@ -304,7 +316,30 @@ impl GuessLimits {
 
     pub async fn signed_up(&self, from: IpAddr, now: i64) -> Result<()> {
         self.store
-            .note(Counted::SignUp, &from.to_string(), now)
+            .note(Counted::SignUp, &counted_as(from).to_string(), now)
+            .await
+    }
+
+    /// Whether `from` may try another room code.
+    pub async fn may_try_code(&self, from: IpAddr, now: i64) -> Result<Result<(), Refused>> {
+        let wrong = self
+            .store
+            .count(
+                Counted::WrongCode,
+                &counted_as(from).to_string(),
+                now - secs(CODE_WINDOW),
+            )
+            .await?;
+        Ok(if wrong >= CODE_TRIES as i64 {
+            Err(Refused::TooManyCodes)
+        } else {
+            Ok(())
+        })
+    }
+
+    pub async fn wrong_code(&self, from: IpAddr, now: i64) -> Result<()> {
+        self.store
+            .note(Counted::WrongCode, &counted_as(from).to_string(), now)
             .await
     }
 
@@ -460,6 +495,23 @@ mod tests {
         drop(first);
         assert!(limits.begin("ANN", ip(1)).is_ok(), "free again");
         drop(other);
+    }
+
+    #[actix_rt::test]
+    async fn one_ipv6_network_gets_twenty_wrong_room_codes_an_hour() {
+        let limits = limits().await;
+        let host = |n: u16| IpAddr::from([0x2001, 0xdb8, 7, 7, n, 0, 0, 1]);
+        for n in 0..CODE_TRIES as u16 {
+            assert_eq!(limits.may_try_code(host(n), 0).await.unwrap(), Ok(()));
+            limits.wrong_code(host(n), 0).await.unwrap();
+        }
+        assert_eq!(
+            limits.may_try_code(host(999), 0).await.unwrap(),
+            Err(Refused::TooManyCodes),
+            "any address in the same /64"
+        );
+        let other = IpAddr::from([0x2001, 0xdb8, 7, 8, 0, 0, 0, 1]);
+        assert_eq!(limits.may_try_code(other, 0).await.unwrap(), Ok(()));
     }
 
     #[actix_rt::test]
