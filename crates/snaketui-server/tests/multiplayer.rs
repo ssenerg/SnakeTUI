@@ -343,7 +343,7 @@ fn lobby_line(p: &Player, who: &str) -> String {
 }
 
 #[tokio::test]
-async fn the_host_sets_the_speed_for_everyone() {
+async fn the_host_sets_the_rules_for_everyone() {
     let server = TestServer::start();
     let mut ann = guest(server.addr, "ann", 100, 30).await;
     let mut ben = guest(server.addr, "ben", 100, 30).await;
@@ -371,4 +371,17 @@ async fn the_host_sets_the_speed_for_everyone() {
         "ben was ready for another speed:\n{}",
         ben.text()
     );
+
+    // Any rule: board width, height, tick speed, then edge walls.
+    ann.send(b"e").await;
+    ann.wait_for("Room rules").await;
+    for _ in 0..3 {
+        ann.send(DOWN).await;
+    }
+    ann.send(RIGHT).await;
+    ann.wait_for("◂ none (wrap) ▸").await;
+    ben.wait_for("~ann set edge walls to none (wrap).").await;
+    ben.send(b"e").await;
+    ben.wait_for("Only ~ann can change these.").await;
+    assert!(ben.text().contains("none (wrap)"), "{}", ben.text());
 }

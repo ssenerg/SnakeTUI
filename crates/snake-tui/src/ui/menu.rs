@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
+use snake_core::config::GameConfig;
 use snake_core::settings::{Kind, SETTINGS};
 
 use super::centered_rect;
@@ -17,10 +18,12 @@ enum Row {
     Blank,
 }
 
-fn rows() -> Vec<Row> {
+/// `items`, indexes into [`SETTINGS`], under their sections' headings.
+fn rows(items: &[usize]) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut section = None;
-    for (i, setting) in SETTINGS.iter().enumerate() {
+    for &i in items {
+        let setting = &SETTINGS[i];
         if section != Some(setting.section) {
             if section.is_some() {
                 rows.push(Row::Blank);
@@ -70,11 +73,49 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .title_alignment(Alignment::Center);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    let all: Vec<usize> = (0..SETTINGS.len()).collect();
+    draw_settings(frame, inner, &app.cfg, &all, app.selected, true);
 
-    let rows = rows();
+    let record = app.records.get(&app.cfg.rules.record_key());
+    let hint = if app.confirm_reset {
+        Line::from("press r again to reset all settings · any other key cancels").style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        let back = if app.online.is_some() { "back" } else { "quit" };
+        Line::from(format!(
+            "↑↓ select · ←→ adjust · Enter play · r reset · q {back}"
+        ))
+        .style(Style::default().fg(Color::DarkGray))
+    };
+    let footer = vec![
+        Line::from(format!("★ best for this setup: {record}"))
+            .style(Style::default().fg(Color::Cyan)),
+        hint,
+    ];
+    frame.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
+/// The settings `items` (indexes into [`SETTINGS`]) and their values in
+/// `cfg`, scrolled to keep `selected` in view. With `editable`, arrows
+/// around its value say ←→ change it.
+pub(super) fn draw_settings(
+    frame: &mut Frame,
+    inner: Rect,
+    cfg: &GameConfig,
+    items: &[usize],
+    selected: usize,
+    editable: bool,
+) {
+    let rows = rows(items);
     let sel_row = rows
         .iter()
-        .position(|r| matches!(r, Row::Item(i) if *i == app.selected))
+        .position(|r| matches!(r, Row::Item(i) if *i == selected))
         .unwrap_or(0);
     let visible = inner.height as usize;
     let offset = if visible == 0 || sel_row < visible {
@@ -104,20 +145,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 ),
             ]),
             &Row::Item(i) => {
-                let selected = i == app.selected;
-                let label_style = if selected {
+                let active = i == selected;
+                let label_style = if active {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                let marker = if selected { " ❯ " } else { "   " };
+                let marker = if active { " ❯ " } else { "   " };
                 let mut spans = vec![Span::styled(
                     format!("{marker}{:<26}", SETTINGS[i].label),
                     label_style,
                 )];
-                let theme = &app.cfg.theme;
+                let theme = &cfg.theme;
                 match SETTINGS[i].kind {
                     Kind::Color(slot) => {
                         let color = theme_color(theme, slot);
@@ -133,8 +174,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     }
                     _ => {}
                 }
-                let value = app.cfg.value_str(i);
-                if selected {
+                let value = cfg.value_str(i);
+                if active && editable {
                     spans.push(Span::styled(format!("◂ {value} ▸"), label_style));
                 } else {
                     spans.push(Span::styled(
@@ -147,28 +188,4 @@ pub fn draw(frame: &mut Frame, app: &App) {
         });
     }
     frame.render_widget(Paragraph::new(lines), inner);
-
-    let record = app.records.get(&app.cfg.rules.record_key());
-    let hint = if app.confirm_reset {
-        Line::from("press r again to reset all settings · any other key cancels").style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        let back = if app.online.is_some() { "back" } else { "quit" };
-        Line::from(format!(
-            "↑↓ select · ←→ adjust · Enter play · r reset · q {back}"
-        ))
-        .style(Style::default().fg(Color::DarkGray))
-    };
-    let footer = vec![
-        Line::from(format!("★ best for this setup: {record}"))
-            .style(Style::default().fg(Color::Cyan)),
-        hint,
-    ];
-    frame.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center),
-        footer_area,
-    );
 }

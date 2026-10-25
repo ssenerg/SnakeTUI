@@ -8,6 +8,7 @@ mod home;
 mod leaderboard;
 mod menu;
 mod room;
+mod room_rules;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -70,6 +71,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             dialogs::draw_joining(frame);
         }
         Screen::Room => room::draw(frame, app),
+        Screen::RoomRules { selected } => room_rules::draw(frame, app, selected),
         Screen::Menu => menu::draw(frame, app),
         Screen::Playing => game::draw(frame, app),
         Screen::Paused { selected } => {

@@ -48,6 +48,11 @@ pub enum Screen {
     },
     /// Online: the best players by rating.
     Leaderboard,
+    /// Online: a private room's rules, at [`snake_core::settings::room_settings`]
+    /// entry `selected`. The host changes them.
+    RoomRules {
+        selected: usize,
+    },
 }
 
 /// Work the app leaves to whoever runs it, in the order given.
@@ -73,8 +78,8 @@ pub enum Effect {
     JoinRoom(String),
     Steer(Direction),
     ToggleReady,
-    /// The host's pick for the room's next rounds: a tick, in milliseconds.
-    RoomSpeed(u64),
+    /// The host's rules for the room's next rounds.
+    RoomRules(Rules),
     LeaveRoom,
     /// Answer with [`App::set_name`].
     SetNickname(String),
@@ -346,6 +351,7 @@ impl App {
             Screen::Account { selected } => self.account_key(selected, key, effects),
             Screen::Friends { selected } => self.friends_key(selected, key, effects),
             Screen::Leaderboard => self.leaderboard_key(key),
+            Screen::RoomRules { selected } => self.room_rules_key(selected, key, effects),
         }
     }
 }

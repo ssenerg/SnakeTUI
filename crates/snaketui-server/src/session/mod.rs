@@ -521,9 +521,9 @@ impl SessionActor {
                         link.room.ready(self.id);
                     }
                 }
-                Effect::RoomSpeed(tick_ms) => {
+                Effect::RoomRules(rules) => {
                     if let Some(link) = &self.room {
-                        link.room.set_speed(self.id, tick_ms);
+                        link.room.set_rules(self.id, rules);
                     }
                 }
                 Effect::LeaveRoom => self.leave_room(ctx),

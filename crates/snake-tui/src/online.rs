@@ -5,9 +5,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use snake_core::config::{GameConfig, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
+use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::records::Records;
-use snake_core::round::{PhaseView, PlayerId, RoomKind, RoomView, SeatView, quick_rules};
+use snake_core::round::{
+    PhaseView, PlayerId, RoomKind, RoomView, SeatView, max_players_for, quick_rules,
+};
+use snake_core::settings::{SETTINGS, room_settings};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{App, Effect, Input, Screen, direction};
@@ -358,7 +361,7 @@ impl InRoom {
         self.view.seat(self.me)
     }
 
-    /// Whether this player sets the room's speed.
+    /// Whether this player sets the room's rules.
     pub fn hosting(&self) -> bool {
         self.view.host().is_some_and(|h| h.who.id == self.me)
     }
@@ -369,6 +372,30 @@ impl InRoom {
             self.view.phase,
             PhaseView::Countdown { .. } | PhaseView::Running { .. }
         ) && self.my_seat().is_some_and(|s| s.slot.is_some() && s.alive)
+    }
+}
+
+/// What the host changed, going from `old` to the rules in `room`.
+fn rules_changed(old: &Rules, room: &RoomView) -> String {
+    let host = room.host().map_or("The host", |h| h.who.name.as_str());
+    let value = |rules: &Rules, i: usize| {
+        GameConfig {
+            rules: rules.clone(),
+            ..GameConfig::default()
+        }
+        .value_str(i)
+    };
+    let changed: Vec<usize> = room_settings()
+        .into_iter()
+        .filter(|&i| value(old, i) != value(&room.rules, i))
+        .collect();
+    match changed[..] {
+        [i] => format!(
+            "{host} set {} to {}.",
+            SETTINGS[i].label,
+            value(&room.rules, i)
+        ),
+        _ => format!("{host} changed the rules."),
     }
 }
 
@@ -623,8 +650,17 @@ impl App {
                     }
                     .clamp(TICK_MS_MIN, TICK_MS_MAX);
                     if next != now {
-                        effects.push(Effect::RoomSpeed(next));
+                        let rules = Rules {
+                            tick_ms: next,
+                            ..room.view.rules.clone()
+                        };
+                        effects.push(Effect::RoomRules(rules));
                     }
+                    false
+                }
+                // Everyone can read the rules; the host changes them there.
+                Key::Char('e') => {
+                    self.screen = Screen::RoomRules { selected: 0 };
                     false
                 }
                 Key::Char('i') if signed_in => {
@@ -803,6 +839,47 @@ impl App {
         }
     }
 
+    /// The room's rules, in the lobby: the host changes them with ←→.
+    pub(crate) fn room_rules_key(&mut self, selected: usize, key: Key, effects: &mut Vec<Effect>) {
+        let Some(online) = self.online.as_mut() else {
+            return;
+        };
+        online.notice = None;
+        let Some(room) = online.room.as_ref() else {
+            return;
+        };
+        let items = room_settings();
+        if let Some(selected) = step(selected, items.len(), key) {
+            self.screen = Screen::RoomRules { selected };
+            return;
+        }
+        match key {
+            Key::Left | Key::Right | Key::Char('a' | 'h' | 'd' | 'l') if room.hosting() => {
+                let delta = if matches!(key, Key::Left | Key::Char('a' | 'h')) {
+                    -1
+                } else {
+                    1
+                };
+                let mut cfg = GameConfig {
+                    rules: room.view.rules.clone(),
+                    ..GameConfig::default()
+                };
+                cfg.adjust(items[selected.min(items.len() - 1)], delta);
+                if cfg.rules == room.view.rules {
+                    return;
+                }
+                // The room would refuse these too, without a word.
+                let players = room.view.seats.len();
+                match max_players_for(&cfg.rules) {
+                    Some(fit) if fit >= players => effects.push(Effect::RoomRules(cfg.rules)),
+                    _ => online.notice = Some(format!("{players} snakes don't fit on that board.")),
+                }
+            }
+            Key::Esc | Key::Enter | Key::Char('q' | 'e') => self.screen = Screen::Room,
+            _ => {}
+        }
+    }
+
     pub(crate) fn leaderboard_key(&mut self, key: Key) {
         if matches!(key, Key::Esc | Key::Enter | Key::Char('q')) {
             self.go_home(HomeItem::Leaderboard, None);
@@ -939,12 +1016,22 @@ impl App {
             return;
         };
         let lobby = matches!(view.phase, PhaseView::Waiting { .. });
-        room.view = view;
+        let old = std::mem::replace(&mut room.view, view);
         if !room.playing() {
             room.confirm_leave = false;
         }
-        // A round starting pulls the player back from the friends list.
-        if !lobby && matches!(self.screen, Screen::Friends { .. } | Screen::Input(_)) {
+        // Everyone but the host hears what the host changed.
+        if lobby && old.rules != room.view.rules && !room.hosting() {
+            online.notice = Some(rules_changed(&old.rules, &room.view));
+        }
+        // A round starting pulls the player back from the friends list and
+        // the rules.
+        if !lobby
+            && matches!(
+                self.screen,
+                Screen::Friends { .. } | Screen::Input(_) | Screen::RoomRules { .. }
+            )
+        {
             self.screen = Screen::Room;
         }
     }
@@ -1235,15 +1322,22 @@ mod tests {
 
     #[test]
     fn the_host_changes_the_speed_a_step_at_a_time() {
+        let speed = |tick_ms| {
+            let rules = Rules {
+                tick_ms,
+                ..lobby(150).rules.clone()
+            };
+            [Effect::RoomRules(rules)]
+        };
         let mut host = online();
         host.enter_room(1, lobby(150));
-        assert_eq!(host.handle(Key::Right), [Effect::RoomSpeed(175)]);
+        assert_eq!(host.handle(Key::Right), speed(175));
         // The room decides; until its next view, the speed here stays.
-        assert_eq!(host.handle(Key::Char('h')), [Effect::RoomSpeed(125)]);
+        assert_eq!(host.handle(Key::Char('h')), speed(125));
         host.update_room(lobby(160));
         assert_eq!(
             host.handle(Key::Left),
-            [Effect::RoomSpeed(150)],
+            speed(150),
             "back onto the settings' grid"
         );
         host.update_room(lobby(TICK_MS_MIN));
@@ -1254,6 +1348,88 @@ mod tests {
         let mut guest = online();
         guest.enter_room(2, lobby(150));
         assert_eq!(guest.handle(Key::Right), [], "only the host");
+    }
+
+    fn notice(app: &App) -> Option<&str> {
+        app.online.as_ref().unwrap().notice.as_deref()
+    }
+
+    #[test]
+    fn everyone_reads_the_rules_and_only_the_host_changes_them() {
+        let mut host = online();
+        host.enter_room(1, lobby(150));
+        assert_eq!(host.handle(Key::Char('e')), []);
+        assert_eq!(host.screen, Screen::RoomRules { selected: 0 });
+        // Board width, height, tick speed, then edge walls.
+        for _ in 0..3 {
+            host.handle(Key::Down);
+        }
+        let open = Rules {
+            wall_mode: snake_core::config::WallMode::Open,
+            ..lobby(150).rules.clone()
+        };
+        assert_eq!(host.handle(Key::Right), [Effect::RoomRules(open.clone())]);
+        let mut changed = (*lobby(150)).clone();
+        changed.rules = open;
+        host.update_room(Arc::new(changed.clone()));
+        assert_eq!(notice(&host), None, "the host knows what they did");
+        assert_eq!(host.handle(Key::Esc), []);
+        assert_eq!(host.screen, Screen::Room);
+
+        let mut guest = online();
+        guest.enter_room(2, lobby(150));
+        guest.handle(Key::Char('e'));
+        assert_eq!(guest.handle(Key::Right), [], "only the host");
+        guest.handle(Key::Down);
+        assert_eq!(guest.screen, Screen::RoomRules { selected: 1 });
+        guest.update_room(Arc::new(changed.clone()));
+        assert_eq!(notice(&guest), Some("~p1 set edge walls to none (wrap)."));
+        changed.rules.width = 40;
+        changed.rules.poison_interval_s = 0;
+        guest.update_room(Arc::new(changed.clone()));
+        assert_eq!(notice(&guest), Some("~p1 changed the rules."));
+
+        // The round starting closes the rules.
+        changed.phase = PhaseView::Countdown {
+            left: Duration::from_secs(3),
+        };
+        guest.update_room(Arc::new(changed));
+        assert_eq!(guest.screen, Screen::Room);
+    }
+
+    #[test]
+    fn the_host_cant_shrink_the_board_under_the_players() {
+        let rules = Rules {
+            width: 20,
+            height: 12,
+            ..Rules::default()
+        };
+        let mut round = Round::new(RoundSettings::new(rules, RoomKind::Private).unwrap(), 1);
+        for id in 1..=4 {
+            let name = format!("~p{id}");
+            round.join(Entrant { id, name }).unwrap();
+        }
+        let mut host = online();
+        host.enter_room(1, Arc::new(round.view()));
+        host.handle(Key::Char('e'));
+        // Narrower and narrower, as the room allows.
+        for _ in 0..20 {
+            match &host.handle(Key::Left)[..] {
+                [Effect::RoomRules(rules)] => {
+                    assert!(round.set_rules(1, rules.clone()));
+                    host.update_room(Arc::new(round.view()));
+                }
+                [] => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(notice(&host), Some("4 snakes don't fit on that board."));
+        let narrower = Rules {
+            width: round.view().rules.width - 1,
+            ..round.view().rules
+        };
+        assert!(max_players_for(&narrower).is_none_or(|n| n < 4));
+        assert_eq!(round.view().max_players, 4);
     }
 
     #[test]

@@ -335,8 +335,22 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         .expect("a private lobby")
         .clone();
     let mut app = account(Screen::Room);
-    app.enter_room(1, Arc::new(lobby));
+    app.enter_room(1, Arc::new(lobby.clone()));
     app.notify("Invited friend-number-00.".into());
+    apps.push(app);
+    // Its rules: the host's, at the top, the bottom and in between, and
+    // someone else's, told what the host changed.
+    let host = lobby.host().expect("a host").who.id;
+    for selected in [0, 7, 13] {
+        let mut app = new_app(Screen::Room);
+        app.enter_room(host, Arc::new(lobby.clone()));
+        app.screen = Screen::RoomRules { selected };
+        apps.push(app);
+    }
+    let mut app = account(Screen::Room);
+    app.enter_room(host + 1000, Arc::new(lobby.clone()));
+    app.screen = Screen::RoomRules { selected: 13 };
+    app.notify("~player-0123456789 set super food lifetime to 120 s.".into());
     apps.push(app);
     // While a round runs: as one who left, as someone watching, and asking
     // to leave.
@@ -510,13 +524,44 @@ fn only_the_host_sees_how_to_change_the_speed() {
     };
     let host = lobby_of(1);
     assert!(host.contains("◂ 150 ms ticks ▸"), "{host}");
-    assert!(host.contains("←→ speed"), "{host}");
+    assert!(host.contains("←→ speed · e rules"), "{host}");
     let guest = lobby_of(2);
     assert!(
         guest.contains("150 ms ticks") && !guest.contains('◂'),
         "{guest}"
     );
     assert!(!guest.contains("speed"), "{guest}");
+    assert!(guest.contains("e rules"), "everyone can read them: {guest}");
+
+    let rules_of = |me| {
+        let mut app = App::online(
+            GameConfig::default(),
+            Records::default(),
+            format!("~p{me}"),
+            true,
+        );
+        app.enter_room(me, Arc::new(round.view()));
+        app.screen = Screen::RoomRules { selected: 0 };
+        shown(&app, 80, 24)
+    };
+    let host = rules_of(1);
+    assert!(host.contains("Room rules"), "{host}");
+    assert!(host.contains("◂ 30 ▸"), "the width, to change: {host}");
+    assert!(
+        host.contains("super food growth"),
+        "every rule fits: {host}"
+    );
+    assert!(
+        !host.contains("move timing") && !host.contains("icon"),
+        "{host}"
+    );
+    assert!(host.contains("Room for 8 players"), "{host}");
+    let guest = rules_of(2);
+    assert!(
+        guest.contains("❯ board width") && !guest.contains('◂'),
+        "{guest}"
+    );
+    assert!(guest.contains("Only ~p1 can change these."), "{guest}");
 }
 
 #[test]

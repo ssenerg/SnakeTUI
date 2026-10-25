@@ -10,8 +10,9 @@ use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use crate::config::{MoveTiming, Rules, TICK_MS_MAX, TICK_MS_MIN};
+use crate::config::{MoveTiming, Rules};
 use crate::geom::Direction;
+use crate::settings::rules_in_range;
 use crate::view::MatchView;
 use crate::world::World;
 
@@ -303,26 +304,31 @@ impl Round {
         }
     }
 
-    /// The room's host (whoever has been in it longest) sets how fast its
-    /// next round plays: in a private room's lobby only. Everyone is ready
-    /// no longer and the start timer starts again, so nobody plays at a
-    /// speed they didn't see. Says whether the speed changed.
-    pub fn set_tick(&mut self, id: PlayerId, tick_ms: u64) -> bool {
+    /// The room's host (whoever has been in it longest) changes the rules
+    /// of its next rounds: in a private room's lobby only, to rules the
+    /// settings menu could set, on a board with room for everyone already
+    /// in. Everyone is ready no longer and the start timer starts again, so
+    /// nobody plays by rules they didn't see. Says whether the rules
+    /// changed.
+    pub fn set_rules(&mut self, id: PlayerId, rules: Rules) -> bool {
         let host = self.seats.first().is_some_and(|s| s.who.id == id);
-        if self.settings.kind != RoomKind::Private
-            || !host
-            || !(TICK_MS_MIN..=TICK_MS_MAX).contains(&tick_ms)
-            || tick_ms == self.settings.rules.tick_ms
-        {
+        if self.settings.kind != RoomKind::Private || !host || !rules_in_range(&rules) {
             return false;
         }
         let Phase::Waiting { start_at } = &mut self.phase else {
             return false;
         };
+        let Some(next) = RoundSettings::new(rules, self.settings.kind) else {
+            return false;
+        };
+        if next.rules == self.settings.rules || next.max_players < self.seats.len() {
+            return false;
+        }
         if start_at.is_some() {
             *start_at = Some(self.clock + self.settings.start_after);
         }
-        self.settings.rules.tick_ms = tick_ms;
+        self.settings.rules = next.rules;
+        self.settings.max_players = next.max_players;
         for seat in &mut self.seats {
             seat.ready = false;
         }
@@ -702,7 +708,7 @@ impl RoomView {
         self.seats.iter().find(|s| s.who.id == id && !s.left)
     }
 
-    /// Private rooms: who sets the speed, the player in it longest.
+    /// Private rooms: who sets the rules, the player in it longest.
     pub fn host(&self) -> Option<&SeatView> {
         self.seats.first().filter(|s| !s.left)
     }
@@ -713,8 +719,12 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::config::WallMode;
     use crate::geom::Point;
     use crate::snake::Snake;
+
+    /// The smallest board: room for two snakes and no more.
+    const SMALL: (u16, u16) = (10, 8);
 
     fn who(id: PlayerId) -> Entrant {
         Entrant {
@@ -815,8 +825,15 @@ mod tests {
         assert!(view.board.is_some(), "the board shows during the countdown");
     }
 
+    /// The room's rules, with `change` made.
+    fn rules_with(round: &Round, change: impl FnOnce(&mut Rules)) -> Rules {
+        let mut rules = round.settings.rules.clone();
+        change(&mut rules);
+        rules
+    }
+
     #[test]
-    fn the_host_sets_the_speed_in_the_lobby() {
+    fn the_host_changes_the_rules_in_the_lobby() {
         let mut round = private();
         round.join(who(1)).unwrap();
         round.join(who(2)).unwrap();
@@ -824,19 +841,20 @@ mod tests {
         round.advance(Duration::from_secs(10));
         assert_eq!(round.view().host().map(|s| s.who.id), Some(1));
 
-        assert!(!round.set_tick(2, 100), "only the host");
-        assert!(!round.set_tick(1, 25), "too fast");
-        assert!(!round.set_tick(1, 2000), "too slow");
-        assert!(
-            !round.set_tick(1, round.settings.rules.tick_ms),
-            "no change"
-        );
-        assert!(round.set_tick(1, 100));
+        let faster = rules_with(&round, |r| r.tick_ms = 100);
+        assert!(!round.set_rules(2, faster.clone()), "only the host");
+        let too_fast = rules_with(&round, |r| r.tick_ms = 25);
+        assert!(!round.set_rules(1, too_fast), "out of the settings' range");
+        let too_wide = rules_with(&round, |r| r.width = 200);
+        assert!(!round.set_rules(1, too_wide), "out of the settings' range");
+        let same = round.settings.rules.clone();
+        assert!(!round.set_rules(1, same), "no change");
+        assert!(round.set_rules(1, faster));
         let view = round.view();
         assert_eq!(view.rules.tick_ms, 100);
         assert!(
             view.seats.iter().all(|s| !s.ready),
-            "ready again, at this speed"
+            "ready again, by these rules"
         );
         assert_eq!(
             view.phase,
@@ -846,14 +864,58 @@ mod tests {
             "the start timer starts again"
         );
 
-        // The round plays at that speed.
+        let open = rules_with(&round, |r| {
+            r.width = 40;
+            r.height = 24;
+            r.wall_mode = WallMode::Open;
+            r.poison_interval_s = 0;
+        });
+        assert!(round.set_rules(1, open.clone()));
+        assert_eq!(round.view().rules, open);
+
+        // The next round plays by them.
         round.toggle_ready(1);
         round.toggle_ready(2);
         run_until(&mut round, |r| {
             matches!(phase(r), PhaseView::Running { .. })
         });
         assert_eq!(tick(&round), Duration::from_millis(100));
-        assert!(!round.set_tick(1, 200), "not once the round is on");
+        let board = round.view().board.unwrap();
+        assert_eq!((board.width, board.height), (40, 24));
+        let slower = rules_with(&round, |r| r.tick_ms = 200);
+        assert!(!round.set_rules(1, slower), "not once the round is on");
+    }
+
+    #[test]
+    fn a_room_keeps_multiplayer_timing_and_room_for_its_players() {
+        let mut round = private();
+        for id in 1..=3 {
+            round.join(who(id)).unwrap();
+        }
+        let solo = rules_with(&round, |r| {
+            r.move_timing = MoveTiming::Instant;
+            r.boost_duration_s = 5;
+        });
+        assert!(!round.set_rules(1, solo), "multiplayer overrides both");
+        let boosted = rules_with(&round, |r| {
+            r.boost_duration_s = 5;
+            r.super_growth = 4;
+        });
+        assert!(round.set_rules(1, boosted));
+        assert_eq!(round.view().rules.boost_duration_s, 0);
+        assert_eq!(round.view().rules.super_growth, 4);
+
+        // A board too small for the three of them is refused.
+        let small = rules_with(&round, |r| {
+            r.width = SMALL.0;
+            r.height = SMALL.1;
+        });
+        assert_eq!(max_players_for(&small), Some(2));
+        assert!(!round.set_rules(1, small.clone()));
+        round.leave(3);
+        assert!(round.set_rules(1, small), "two fit");
+        assert_eq!(round.view().max_players, 2);
+        assert_eq!(round.join(who(3)), Err(JoinError::Full));
     }
 
     #[test]
@@ -864,12 +926,13 @@ mod tests {
         }
         round.leave(1);
         assert_eq!(round.view().host().map(|s| s.who.id), Some(2));
-        assert!(round.set_tick(2, 200));
-        assert!(!round.set_tick(3, 75));
+        assert!(round.set_rules(2, rules_with(&round, |r| r.tick_ms = 200)));
+        assert!(!round.set_rules(3, rules_with(&round, |r| r.tick_ms = 75)));
 
         let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
         let mut matched = Round::new_match(settings, 1, vec![who(1), who(2)]);
-        assert!(!matched.set_tick(1, 100), "matches play at their own speed");
+        let faster = rules_with(&matched, |r| r.tick_ms = 100);
+        assert!(!matched.set_rules(1, faster), "matches keep theirs");
     }
 
     #[test]

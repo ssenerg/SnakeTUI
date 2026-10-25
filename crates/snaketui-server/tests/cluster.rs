@@ -165,7 +165,7 @@ async fn players_on_two_servers_share_a_private_room() {
 }
 
 #[tokio::test]
-async fn a_host_on_another_server_sets_the_speed() {
+async fn a_host_on_another_server_sets_the_rules() {
     let servers = cluster(2).await;
     let mut ann = guest(servers[0].addr, "ann", 100, 30).await;
     let mut ben = guest(servers[1].addr, "ben", 100, 30).await;
@@ -176,6 +176,10 @@ async fn a_host_on_another_server_sets_the_speed() {
     ben.wait_for("◂ 150 ms ticks ▸").await;
     ben.send(b"\x1b[D").await;
     ben.wait_for("◂ 125 ms ticks ▸").await;
+    ben.send(b"e").await;
+    ben.wait_for("Room rules").await;
+    ben.send(b"\x1b[D").await;
+    ben.wait_for("◂ 29 ▸").await;
 }
 
 #[tokio::test]

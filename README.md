@@ -71,7 +71,8 @@ no account on the machine, and quitting the game ends their connection at once.
 ### Multiplayer
 
 Rooms hold 2 to 8 players on one board. Every snake moves on the same tick,
-so in multiplayer turns are always queued for the next tick.
+so in multiplayer turns are always queued for the next tick, and super food
+gives no speed boost.
 
 - **Quick play** puts you in a queue. A match starts as soon as 8 players
   are waiting, or after 10 seconds with at least 2. It plays one round on a
@@ -80,11 +81,14 @@ so in multiplayer turns are always queued for the next tick.
   code to share. Anyone with the code can join. A round starts 15 seconds
   after the second player arrives, or as soon as everyone presses Enter.
   Rounds keep going until everyone leaves.
-- **Room speed.** In a private room's lobby, the host (whoever has been in
-  the room longest) makes the next rounds faster or slower with ←→, in 25 ms
-  steps from 50 to 1000 ms a tick. Everyone sees the new speed. A change
-  un-readies everyone and restarts the 15 seconds, so nobody starts at a
-  speed they didn't see.
+- **Room rules.** In a private room's lobby, press `e` to see the room's
+  rules: the board, food and gameplay settings. The host (whoever has been in
+  the room longest) changes any of them there with ←→, and makes the next
+  rounds faster or slower with ←→ right in the lobby. Everyone else is told
+  what changed. A change un-readies everyone and restarts the 15 seconds, so
+  nobody starts by rules they didn't see. A board too small for everyone
+  already in the room is refused. The changes belong to the room; the host's
+  own settings stay as they were.
 - **Winning.** The last snake alive wins. If all the snakes still in play
   crash on the same tick, it's a draw. After 3 minutes, the longest snake
   still alive wins.

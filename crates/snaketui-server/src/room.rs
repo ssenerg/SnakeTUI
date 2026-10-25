@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use actix::prelude::*;
 use actix_rt::ArbiterHandle;
 use serde::{Deserialize, Serialize};
+use snake_core::config::Rules;
 use snake_core::geom::Direction;
 use snake_core::round::{
     Entrant, JoinError, Outcome, PhaseView, Placement, PlayerId, RatingChange, RoomKind, RoomView,
@@ -234,13 +235,13 @@ impl RoomHandle {
         }
     }
 
-    pub fn set_speed(&self, id: PlayerId, tick_ms: u64) {
+    pub fn set_rules(&self, id: PlayerId, rules: Rules) {
         match self {
             RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(SetSpeed { id, tick_ms });
+                let _ = addr.try_send(SetRules { id, rules });
             }
             RoomHandle::Remote { at, cluster } => {
-                cluster.send_input(*at, id, InputKind::Speed(tick_ms))
+                cluster.send_input(*at, id, InputKind::Rules(rules))
             }
         }
     }
@@ -334,12 +335,12 @@ pub struct Steer {
 #[rtype(result = "()")]
 pub struct Ready(pub PlayerId);
 
-/// The host picks the next round's speed.
+/// The host changes the rules of the room's next rounds.
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct SetSpeed {
+pub struct SetRules {
     pub id: PlayerId,
-    pub tick_ms: u64,
+    pub rules: Rules,
 }
 
 /// A player's latest round trip, for everyone in the room to see.
@@ -638,12 +639,12 @@ impl Handler<Steer> for RoomActor {
     }
 }
 
-impl Handler<SetSpeed> for RoomActor {
+impl Handler<SetRules> for RoomActor {
     type Result = ();
 
-    fn handle(&mut self, SetSpeed { id, tick_ms }: SetSpeed, ctx: &mut Self::Context) {
-        if self.guarded(ctx, |round| round.set_tick(id, tick_ms)) == Some(true) {
-            debug!(code = ?self.code, tick_ms, "speed changed");
+    fn handle(&mut self, SetRules { id, rules }: SetRules, ctx: &mut Self::Context) {
+        if self.guarded(ctx, |round| round.set_rules(id, rules)) == Some(true) {
+            debug!(code = ?self.code, "rules changed");
             self.publish();
         }
     }

@@ -8,6 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use snake_core::config::Rules;
 use snake_core::geom::Direction;
 use snake_core::round::{Entrant, JoinError, PlayerId, RoomView};
 
@@ -16,7 +17,7 @@ use crate::rating::Rating;
 use crate::room::{RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -123,15 +124,15 @@ pub struct Input {
     pub kind: InputKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputKind {
     Steer(Direction),
     Ready,
     Leave,
     /// The player's round trip, measured by their session.
     Ping(Duration),
-    /// The host picks the next round's tick, in milliseconds.
-    Speed(u64),
+    /// The host changes the rules of the room's next rounds.
+    Rules(Rules),
 }
 
 /// What are these accounts doing? Every other server answers for its own

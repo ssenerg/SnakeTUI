@@ -77,7 +77,7 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
     let view = &room.view;
     let online = app.online.as_ref();
     let height = 12 + view.seats.len() as u16;
-    let inner = dialog(frame, " Private room ", Color::Cyan, 52, height);
+    let inner = dialog(frame, " Private room ", Color::Cyan, 60, height);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::default()];
     if let Some(code) = &view.code {
@@ -147,10 +147,10 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
     });
     let signed_in = online.is_some_and(|o| o.account.is_some());
     let hint = match (room.hosting(), signed_in) {
-        (true, true) => "Enter ready · ←→ speed · i invite · Esc leave",
-        (true, false) => "Enter ready · ←→ speed · Esc leave",
-        (false, true) => "Enter ready · i invite friends · Esc leave",
-        (false, false) => "Enter ready · Esc leave",
+        (true, true) => "Enter ready · ←→ speed · e rules · i invite · Esc leave",
+        (true, false) => "Enter ready · ←→ speed · e rules · Esc leave",
+        (false, true) => "Enter ready · e rules · i invite friends · Esc leave",
+        (false, false) => "Enter ready · e rules · Esc leave",
     };
     lines.push(Line::from(hint).style(dim()));
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);

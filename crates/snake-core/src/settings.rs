@@ -3,7 +3,7 @@
 
 use crate::config::{
     COLOR_NAMES, ColorSlot, GLYPHS, GameConfig, GrowthMode, IconSlot, InnerWalls, MoveTiming,
-    TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP, WallMode, color_name, glyph_name,
+    Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP, WallMode, color_name, glyph_name,
 };
 
 #[derive(Clone, Copy)]
@@ -79,6 +79,37 @@ pub struct Setting {
     /// Menu section. Settings of one section must be next to each other.
     pub section: Section,
     pub kind: Kind,
+}
+
+impl Setting {
+    /// Whether a private room's host can change it in the lobby: every
+    /// rule but the two multiplayer always overrides (see
+    /// `RoundSettings::new`). Icons and colors are each player's own.
+    pub fn in_rooms(&self) -> bool {
+        matches!(
+            self.section,
+            Section::Board | Section::Food | Section::Gameplay
+        ) && !matches!(self.key, "move_timing" | "boost_duration_s")
+    }
+}
+
+/// Indexes into [`SETTINGS`] of the rules a room's host can change.
+pub fn room_settings() -> Vec<usize> {
+    (0..SETTINGS.len())
+        .filter(|&i| SETTINGS[i].in_rooms())
+        .collect()
+}
+
+/// Whether the settings menu could have set every one of these rules.
+pub fn rules_in_range(rules: &Rules) -> bool {
+    let cfg = GameConfig {
+        rules: rules.clone(),
+        ..GameConfig::default()
+    };
+    SETTINGS.iter().all(|s| match s.kind {
+        Kind::Num { get, min, max, .. } => (min..=max).contains(&get(&cfg)),
+        _ => true,
+    })
 }
 
 pub const SETTINGS: &[Setting] = &[
@@ -442,6 +473,46 @@ impl GameConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rooms_change_the_rules_multiplayer_keeps() {
+        let in_rooms: Vec<&str> = SETTINGS
+            .iter()
+            .filter(|s| s.in_rooms())
+            .map(|s| s.key)
+            .collect();
+        assert!(in_rooms.contains(&"width") && in_rooms.contains(&"poison_ttl_s"));
+        assert!(!in_rooms.contains(&"move_timing") && !in_rooms.contains(&"boost_duration_s"));
+        assert!(
+            !in_rooms
+                .iter()
+                .any(|k| k.starts_with("icon") || k.starts_with("color"))
+        );
+    }
+
+    #[test]
+    fn rules_in_range_are_those_the_menu_can_set() {
+        let mut cfg = GameConfig::default();
+        assert!(rules_in_range(&cfg.rules));
+        for i in 0..SETTINGS.len() {
+            cfg.adjust(i, -1000);
+        }
+        assert!(rules_in_range(&cfg.rules), "the menu's smallest");
+        for i in 0..SETTINGS.len() {
+            cfg.adjust(i, 1000);
+        }
+        assert!(rules_in_range(&cfg.rules), "the menu's largest");
+        let rules = Rules {
+            width: 200,
+            ..Rules::default()
+        };
+        assert!(!rules_in_range(&rules));
+        let rules = Rules {
+            tick_ms: 1,
+            ..Rules::default()
+        };
+        assert!(!rules_in_range(&rules));
+    }
 
     #[test]
     fn save_and_load_round_trip() {

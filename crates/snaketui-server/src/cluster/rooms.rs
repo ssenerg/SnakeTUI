@@ -23,7 +23,7 @@ use tokio::task::AbortHandle;
 
 use super::Cluster;
 use super::wire::{Input, InputKind, JoinReply, JoinRequest, decode};
-use crate::room::{Join, Leave, Ping, Ready, RoomId, RoomRef, ServerId, SetSpeed, Steer, ViewRx};
+use crate::room::{Join, Leave, Ping, Ready, RoomId, RoomRef, ServerId, SetRules, Steer, ViewRx};
 
 pub const ROOM_LOST: &str = "The server running this room went away.";
 
@@ -207,11 +207,8 @@ impl Cluster {
             InputKind::Ping(rtt) => {
                 let _ = addr.try_send(Ping { id: player, rtt });
             }
-            InputKind::Speed(tick_ms) => {
-                let _ = addr.try_send(SetSpeed {
-                    id: player,
-                    tick_ms,
-                });
+            InputKind::Rules(rules) => {
+                let _ = addr.try_send(SetRules { id: player, rules });
             }
             InputKind::Leave => {
                 addr.do_send(Leave(player));
