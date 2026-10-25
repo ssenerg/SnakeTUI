@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "snake-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "proptest",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "snake-tui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ratatui",
  "snake-core",
@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "snaketui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ratatui",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "snaketui-loadbot"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "snaketui-server"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "actix",
  "actix-rt",
@@ -3418,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "snaketui-test-services"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "sqlx",
  "tokio",
