@@ -30,7 +30,7 @@ impl Trusted {
                     .parse()
                     .with_context(|| format!("{entry:?} isn't an address or network"))?;
                 let max = if ip.is_ipv4() { 32 } else { 128 };
-                let bits = match bits {
+                let bits: u8 = match bits {
                     Some(bits) => bits
                         .parse()
                         .ok()
@@ -38,7 +38,17 @@ impl Trusted {
                         .with_context(|| format!("{entry:?} has a bad network size"))?,
                     None => max,
                 };
-                Ok((ip.to_canonical(), bits))
+                // `::ffff:a.b.c.d/n`, as some tools show IPv4 addresses, is
+                // the IPv4 network a.b.c.d/(n - 96).
+                match ip {
+                    IpAddr::V6(v6) if let Some(v4) = v6.to_ipv4_mapped() => {
+                        let bits = bits
+                            .checked_sub(96)
+                            .with_context(|| format!("{entry:?} is wider than any IPv4 network"))?;
+                        Ok((IpAddr::V4(v4), bits))
+                    }
+                    ip => Ok((ip, bits)),
+                }
             })
             .collect::<Result<_>>()
             .map(Self)
@@ -50,14 +60,20 @@ impl Trusted {
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();
+        // A /0 shifts the whole mask out: it matches everything, as it
+        // should. Sizes too big for the address never match.
         self.0.iter().any(|&(net, bits)| match (net, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0);
-                u32::from(net) & mask == u32::from(ip) & mask
+                32u32.checked_sub(u32::from(bits)).is_some_and(|shift| {
+                    let mask = u32::MAX.checked_shl(shift).unwrap_or(0);
+                    u32::from(net) & mask == u32::from(ip) & mask
+                })
             }
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = u128::MAX.checked_shl(128 - u32::from(bits)).unwrap_or(0);
-                u128::from(net) & mask == u128::from(ip) & mask
+                128u32.checked_sub(u32::from(bits)).is_some_and(|shift| {
+                    let mask = u128::MAX.checked_shl(shift).unwrap_or(0);
+                    u128::from(net) & mask == u128::from(ip) & mask
+                })
             }
             _ => false,
         })
@@ -189,6 +205,23 @@ mod tests {
         assert_eq!(rest, b"SSH-");
         let (got, _) = read(b"PROXY UNKNOWN\r\n").await;
         assert_eq!(got.unwrap(), None);
+    }
+
+    #[test]
+    fn ipv4_written_as_ipv6_trusts_only_that_network() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let one = Trusted::parse(&["::ffff:10.0.0.5".into()]).unwrap();
+        assert!(one.contains(ip("10.0.0.5")));
+        assert!(one.contains(ip("::ffff:10.0.0.5")));
+        assert!(!one.contains(ip("8.8.8.8")), "not everyone");
+        let net = Trusted::parse(&["::ffff:10.0.0.0/120".into()]).unwrap();
+        assert!(net.contains(ip("10.0.0.200")) && !net.contains(ip("10.0.1.1")));
+        assert!(Trusted::parse(&["::ffff:10.0.0.0/64".into()]).is_err());
+        let all = Trusted::parse(&["0.0.0.0/0".into()]).unwrap();
+        assert!(
+            all.contains(ip("8.8.8.8")),
+            "a /0 is everything, when asked for"
+        );
     }
 
     #[actix_rt::test]
