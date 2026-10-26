@@ -305,6 +305,15 @@ impl Player {
 }
 
 /// `GET path` from a server's admin port: the status code and the body.
+/// The value of `name` in /metrics.
+pub fn number(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{metrics}"))
+}
+
 pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();

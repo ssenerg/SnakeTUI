@@ -362,6 +362,12 @@ async fn a_client_that_falls_behind_gets_the_newest_screen() {
     let frame = p.received - before;
     assert!(frame > 1000, "a whole screen is bigger than that: {frame}");
 
+    let holds = || async {
+        let (_, metrics) = http_get(server.admin, "/metrics").await;
+        number(&metrics, "snaketui_frame_holds_total")
+    };
+    let held_before = holds().await;
+
     // 100 whole-screen redraws while not reading.
     paused.store(true, Ordering::SeqCst);
     let mut cols = 239;
@@ -388,6 +394,7 @@ async fn a_client_that_falls_behind_gets_the_newest_screen() {
         caught_up < 10 * frame,
         "{caught_up} bytes to catch up, with screens of {frame}"
     );
+    assert!(holds().await > held_before, "falling behind is counted");
     p.channel.window_change(200, 60, 0, 0).await.unwrap();
     p.wait_for("press an arrow key").await;
 }

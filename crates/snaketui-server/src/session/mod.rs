@@ -96,6 +96,33 @@ pub const NO_COMMANDS: &str =
     "This server only runs SnakeTUI and can't run commands. Connect with: ssh <host>\r\n";
 const SHUTTING_DOWN: &str = "The SnakeTUI server is restarting. Please reconnect in a minute.\r\n";
 
+/// Frames held back for a client that's behind.
+struct Hold {
+    since: Instant,
+    /// Whether /metrics has counted it.
+    counted: bool,
+}
+
+impl Hold {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            counted: false,
+        }
+    }
+
+    /// Whether to count this hold for /metrics now: once, when it has
+    /// outlasted a retry. A moment's wait, such as drawing right after
+    /// queueing other output, isn't falling behind.
+    fn count(&mut self, now: Instant) -> bool {
+        if self.counted || now.saturating_duration_since(self.since) < RETRY_DRAW {
+            return false;
+        }
+        self.counted = true;
+        true
+    }
+}
+
 /// What the writer task sends down the channel, in order.
 enum Out {
     Data(Bytes),
@@ -323,7 +350,7 @@ pub struct SessionActor {
     wake: Option<SpawnHandle>,
     esc_timer: Option<SpawnHandle>,
     retry: Option<SpawnHandle>,
-    stalled_since: Option<Instant>,
+    held: Option<Hold>,
     /// The connection's sent and resent bytes, as far as /metrics has
     /// counted them.
     tcp_counted: (u64, u64),
@@ -414,7 +441,7 @@ impl SessionActor {
             wake: None,
             esc_timer: None,
             retry: None,
-            stalled_since: None,
+            held: None,
             tcp_counted: (0, 0),
             shell_requested: false,
             closing: false,
@@ -1049,12 +1076,14 @@ impl SessionActor {
             // The client is behind: output is still waiting here, or on its
             // way. Its screen will match what ratatui last sent, so just
             // draw again once that's through, from the screen as it is then.
-            let since = *self.stalled_since.get_or_insert_with(|| {
+            let now = Instant::now();
+            let hold = self.held.get_or_insert_with(|| Hold::new(now));
+            let since = hold.since;
+            if hold.count(now) {
                 debug!(peer = %self.peer, unacked, "client is behind; holding frames");
                 FRAME_HOLDS.fetch_add(1, Ordering::Relaxed);
-                Instant::now()
-            });
-            if since.elapsed() > self.shared.cfg.stall_timeout() {
+            }
+            if now.saturating_duration_since(since) > self.shared.cfg.stall_timeout() {
                 info!(peer = %self.peer, "client stopped reading; disconnecting");
                 self.save_unfinished_game(ctx);
                 return self.close(1, None, ctx);
@@ -1067,7 +1096,7 @@ impl SessionActor {
             }
             return;
         }
-        self.stalled_since = None;
+        self.held = None;
         self.drawn_at = Some(Instant::now());
         let drawn = catch_unwind(AssertUnwindSafe(|| {
             terminal.draw(|frame| ui::draw(frame, app)).map(|_| ())
@@ -1390,6 +1419,16 @@ impl Handler<Disconnected> for SessionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holds_count_once_they_outlast_a_retry() {
+        let start = Instant::now();
+        let mut hold = Hold::new(start);
+        assert!(!hold.count(start), "a moment's wait isn't falling behind");
+        assert!(!hold.count(start + RETRY_DRAW / 2));
+        assert!(hold.count(start + RETRY_DRAW));
+        assert!(!hold.count(start + RETRY_DRAW * 5), "counted once");
+    }
 
     #[test]
     fn a_flood_of_loads_is_one_load_and_one_more() {

@@ -134,7 +134,7 @@ fn metrics(shared: &Shared, limits: &Limits) -> String {
     counter(
         "snaketui_frame_holds_total",
         "Times a player's connection fell behind and the server held frames \
-         back, to send the newest screen once it caught up.",
+         back for over 10 ms, to send the newest screen once it caught up.",
         FRAME_HOLDS.load(Ordering::Relaxed),
     );
     histogram(

@@ -87,21 +87,18 @@ async fn metrics_count_players_and_rooms() {
     ] {
         assert!(metrics.contains(line), "no {line:?} in:\n{metrics}");
     }
+    // Opening a game makes the first frame wait a moment for the switch to
+    // the game's screen to go out: that isn't falling behind.
+    assert!(
+        number(&metrics, "snaketui_frame_holds_total") < 2.0,
+        "two games opening counted as held:\n{metrics}"
+    );
     // The kernel's numbers, read as each game opened.
     if cfg!(target_os = "linux") {
         assert!(number(&metrics, "snaketui_tcp_rtt_seconds_count") >= 2.0);
         assert!(number(&metrics, "snaketui_tcp_sent_bytes_total") > 0.0);
     }
     assert_eq!(http_get(server.admin, "/nothing").await.0, 404);
-}
-
-/// The value of `name` in /metrics.
-fn number(metrics: &str, name: &str) -> f64 {
-    metrics
-        .lines()
-        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no {name} in:\n{metrics}"))
 }
 
 /// Players listed with their round trip.

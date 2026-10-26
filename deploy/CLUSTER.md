@@ -412,7 +412,7 @@ format:
 | `snaketui_tcp_unacked_bytes` | A histogram of the bytes written to a player that they hadn't acknowledged yet, read every 2 seconds. Mostly under 4096 is normal; the server holds frames back past 8 KiB. |
 | `snaketui_tcp_sent_bytes_total` | Bytes sent to players, sent-again bytes included. |
 | `snaketui_tcp_resent_bytes_total` | Bytes sent to players again because they were lost. Divided by `snaketui_tcp_sent_bytes_total`, it's the share of data lost. |
-| `snaketui_frame_holds_total` | Times a player's connection fell behind and the server held frames back, to send the newest screen once it caught up instead of every one in between. |
+| `snaketui_frame_holds_total` | Times a player's connection fell behind and the server held frames back for over 10 ms, to send the newest screen once it caught up instead of every one in between. |
 
 For Prometheus on the private network:
 
