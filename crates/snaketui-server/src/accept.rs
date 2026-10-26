@@ -139,6 +139,7 @@ pub async fn accept_loop(
             continue;
         };
         let _ = stream.set_nodelay(true);
+        let _ = crate::tcp::thin_stream(&stream);
         let worker = workers
             .iter()
             .min_by_key(|w| w.sessions.load(Ordering::Relaxed))

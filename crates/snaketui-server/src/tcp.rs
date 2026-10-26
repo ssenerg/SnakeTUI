@@ -1,6 +1,6 @@
 //! What the kernel knows about a player's connection: its round trip, what
-//! it sent and sent again, and what the player hasn't got yet. Only Linux
-//! says; elsewhere there's nothing to read.
+//! it sent and sent again, and what the player hasn't got yet; and how to
+//! make it resend sooner. Only Linux has these; elsewhere they do nothing.
 
 use std::net::TcpStream;
 use std::time::Duration;
@@ -67,6 +67,37 @@ pub fn state(_: &TcpStream) -> Option<TcpState> {
     None
 }
 
+/// Tells the kernel `socket` is a thin stream, as a game's is: with little
+/// in flight, waiting for a lost packet to be acknowledged before sending
+/// it again doesn't double each time it's lost again, for the first 6
+/// tries. Linux only; elsewhere it does nothing.
+#[cfg(target_os = "linux")]
+pub fn thin_stream(socket: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let on: libc::c_int = 1;
+    // SAFETY: the option takes a c_int, and gets a pointer to one and its
+    // size.
+    let failed = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_THIN_LINEAR_TIMEOUTS,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } != 0;
+    if failed {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn thin_stream(_: &TcpStream) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// The start of Linux's `struct tcp_info` (`linux/tcp.h`), up to the last
 /// field read here; libc's copy ends before most of them.
 #[cfg(target_os = "linux")]
@@ -126,6 +157,34 @@ mod tests {
         assert!(0 < state.acked && state.acked <= state.sent, "{state:?}");
         assert_eq!(state.unacked(), written - state.acked);
         assert!(state.rtt < Duration::from_secs(1), "{state:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thin_streams_are_marked() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let read = || {
+            let mut value: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: as in `thin_stream`, the other way round.
+            let got = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_THIN_LINEAR_TIMEOUTS,
+                    (&mut value as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(got, 0);
+            value
+        };
+        assert_eq!(read(), 0);
+        thin_stream(&socket).unwrap();
+        assert_eq!(read(), 1);
     }
 
     #[cfg(not(target_os = "linux"))]
