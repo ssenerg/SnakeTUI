@@ -30,10 +30,11 @@ use crate::input::{Budget, KeyParser, STATUS_QUERY};
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
-use crate::metrics::PINGS;
+use crate::metrics::{PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData, now};
+use crate::tcp::TcpState;
 use crate::{Shared, Stopping};
 
 /// Largest terminal served. Bigger requests are clamped, so a client can't
@@ -101,7 +102,8 @@ enum Out {
 
 /// Cuts a connection at its socket. This works even when the SSH session
 /// is stuck behind a client that stopped reading, where a polite SSH
-/// disconnect would queue up behind the frames it isn't taking.
+/// disconnect would queue up behind the frames it isn't taking. It also
+/// reads what the kernel knows about the connection.
 #[derive(Clone)]
 pub struct Hangup(Arc<std::net::TcpStream>);
 
@@ -113,6 +115,10 @@ impl Hangup {
 
     pub fn now(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub fn tcp(&self) -> Option<TcpState> {
+        crate::tcp::state(&self.0)
     }
 }
 
@@ -310,6 +316,9 @@ pub struct SessionActor {
     esc_timer: Option<SpawnHandle>,
     retry: Option<SpawnHandle>,
     stalled_since: Option<Instant>,
+    /// The connection's sent and resent bytes, as far as /metrics has
+    /// counted them.
+    tcp_counted: (u64, u64),
     shell_requested: bool,
     closing: bool,
     /// The server is stopping: this player goes once they're not in a
@@ -344,6 +353,7 @@ impl Actor for SessionActor {
 
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(peer = %self.peer, "session ended");
+        self.count_tcp();
         self.save_now();
         self.sign_off();
         if let Some(link) = self.room.take() {
@@ -396,6 +406,7 @@ impl SessionActor {
             esc_timer: None,
             retry: None,
             stalled_since: None,
+            tcp_counted: (0, 0),
             shell_requested: false,
             closing: false,
             draining: false,
@@ -500,7 +511,31 @@ impl SessionActor {
         self.terminal = Some(terminal);
         self.last_input = Instant::now();
         self.send(Out::Data(Bytes::from_static(ENTER_SCREEN)));
-        ctx.run_interval(PING_EVERY, |act, _| act.ping());
+        self.sample_tcp();
+        ctx.run_interval(PING_EVERY, |act, _| {
+            act.ping();
+            act.sample_tcp();
+        });
+    }
+
+    /// Notes the connection's round trip and what's on its way for
+    /// /metrics, and counts what it sent.
+    fn sample_tcp(&mut self) {
+        if let Some(state) = self.count_tcp() {
+            TCP_RTTS.record(state.rtt);
+            UNACKED.record(state.unacked().try_into().unwrap_or(u32::MAX));
+        }
+    }
+
+    /// Adds what the connection sent and resent since last time to
+    /// /metrics.
+    fn count_tcp(&mut self) -> Option<TcpState> {
+        let state = self.hangup.as_ref()?.tcp()?;
+        let (sent, resent) = self.tcp_counted;
+        TCP_SENT.fetch_add(state.sent.saturating_sub(sent), Ordering::Relaxed);
+        TCP_RESENT.fetch_add(state.resent.saturating_sub(resent), Ordering::Relaxed);
+        self.tcp_counted = (state.sent, state.resent);
+        Some(state)
     }
 
     /// Asks the terminal for a status report: the wait for its answer is the

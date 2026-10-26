@@ -91,6 +91,13 @@ pub struct PingHistogram {
 
 /// Every player's round trips, server-wide.
 pub static PINGS: PingHistogram = PingHistogram::new();
+/// The kernel's round trips for players' connections.
+pub static TCP_RTTS: PingHistogram = PingHistogram::new();
+/// Bytes written to players that they haven't acknowledged.
+pub static UNACKED: SizeHistogram = SizeHistogram::new();
+/// Bytes sent to players, and how many of them were sent again.
+pub static TCP_SENT: AtomicU64 = AtomicU64::new(0);
+pub static TCP_RESENT: AtomicU64 = AtomicU64::new(0);
 
 impl PingHistogram {
     /// Each bucket's upper bound.
@@ -147,6 +154,58 @@ impl Default for PingHistogram {
     }
 }
 
+/// Byte counts, in buckets from none to a megabyte.
+pub struct SizeHistogram {
+    /// One per bound in [`Self::BOUNDS`], then one for anything bigger.
+    buckets: [AtomicU64; SizeHistogram::BOUNDS.len() + 1],
+    total: AtomicU64,
+}
+
+impl SizeHistogram {
+    /// Each bucket's upper bound.
+    pub const BOUNDS: [u32; 7] = [0, 1 << 10, 4 << 10, 16 << 10, 64 << 10, 256 << 10, 1 << 20];
+
+    pub const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; Self::BOUNDS.len() + 1],
+            total: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, bytes: u32) {
+        let i = Self::BOUNDS
+            .iter()
+            .position(|&bound| bytes <= bound)
+            .unwrap_or(Self::BOUNDS.len());
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(bytes.into(), Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Samples at or under `limit`, one of [`Self::BOUNDS`].
+    pub fn at_or_under(&self, limit: u32) -> u64 {
+        Self::BOUNDS
+            .iter()
+            .zip(&self.buckets)
+            .take_while(|(bound, _)| **bound <= limit)
+            .map(|(_, b)| b.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn sum(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SizeHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +249,24 @@ mod tests {
         assert_eq!(pings.at_or_under(ms(500)), 5);
         assert_eq!(pings.at_or_under(ms(1000)), 5, "2.5 s is past every bound");
         assert_eq!(pings.sum(), ms(3 + 10 + 11 + 180 + 450 + 2500));
+    }
+
+    #[test]
+    fn sizes_land_in_buckets_up_to_a_megabyte() {
+        let sizes = SizeHistogram::new();
+        for bytes in [0, 0, 1024, 1025, 70_000, 5 << 20] {
+            sizes.record(bytes);
+        }
+        assert_eq!(sizes.count(), 6);
+        assert_eq!(
+            sizes.at_or_under(0),
+            2,
+            "nothing waiting has its own bucket"
+        );
+        assert_eq!(sizes.at_or_under(1 << 10), 3);
+        assert_eq!(sizes.at_or_under(4 << 10), 4);
+        assert_eq!(sizes.at_or_under(256 << 10), 5);
+        assert_eq!(sizes.at_or_under(1 << 20), 5, "5 MB is past every bound");
+        assert_eq!(sizes.sum(), 1024 + 1025 + 70_000 + (5 << 20));
     }
 }

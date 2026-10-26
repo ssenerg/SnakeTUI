@@ -78,10 +78,29 @@ async fn metrics_count_players_and_rooms() {
         "snaketui_draining 0",
         "# TYPE snaketui_tick_lag_seconds histogram",
         "snaketui_tick_lag_seconds_bucket{le=\"+Inf\"}",
+        "# TYPE snaketui_tcp_rtt_seconds histogram",
+        "# TYPE snaketui_tcp_unacked_bytes histogram",
+        "snaketui_tcp_unacked_bytes_bucket{le=\"0\"}",
+        "# TYPE snaketui_tcp_sent_bytes_total counter",
+        "# TYPE snaketui_tcp_resent_bytes_total counter",
     ] {
         assert!(metrics.contains(line), "no {line:?} in:\n{metrics}");
     }
+    // The kernel's numbers, read as each game opened.
+    if cfg!(target_os = "linux") {
+        assert!(number(&metrics, "snaketui_tcp_rtt_seconds_count") >= 2.0);
+        assert!(number(&metrics, "snaketui_tcp_sent_bytes_total") > 0.0);
+    }
     assert_eq!(http_get(server.admin, "/nothing").await.0, 404);
+}
+
+/// The value of `name` in /metrics.
+fn number(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in:\n{metrics}"))
 }
 
 /// Players listed with their round trip.

@@ -4,6 +4,7 @@
 
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::debug;
 
 use crate::accept::Limits;
-use crate::metrics::{PINGS, PingHistogram, TICK_LAG};
+use crate::metrics::{
+    PINGS, PingHistogram, SizeHistogram, TCP_RESENT, TCP_RTTS, TCP_SENT, TICK_LAG, UNACKED,
+};
 use crate::{Shared, Stopping};
 
 /// A request has this long to arrive whole.
@@ -110,41 +113,70 @@ fn metrics(shared: &Shared, limits: &Limits) -> String {
             cluster.peers().len() as f64,
         );
     }
+    let mut counter = |name: &str, help: &str, value: u64| {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
+        );
+    };
+    counter(
+        "snaketui_tcp_sent_bytes_total",
+        "Bytes sent to players, those sent again included.",
+        TCP_SENT.load(Ordering::Relaxed),
+    );
+    counter(
+        "snaketui_tcp_resent_bytes_total",
+        "Bytes sent to players again because they were lost. Over \
+         snaketui_tcp_sent_bytes_total, the share lost.",
+        TCP_RESENT.load(Ordering::Relaxed),
+    );
     histogram(
         &mut out,
         "snaketui_tick_lag_seconds",
         "How late rooms' ticks ran.",
-        LAG_BOUNDS.map(Duration::from_secs_f64),
-        |bound| TICK_LAG.at_or_under(bound),
-        (TICK_LAG.count(), TICK_LAG.sum()),
+        LAG_BOUNDS.map(|s| (s, TICK_LAG.at_or_under(Duration::from_secs_f64(s)))),
+        (TICK_LAG.count(), TICK_LAG.sum().as_secs_f64()),
     );
     histogram(
         &mut out,
         "snaketui_ping_seconds",
         "Players' round trips to this server, measured every few seconds.",
-        PingHistogram::BOUNDS,
-        |bound| PINGS.at_or_under(bound),
-        (PINGS.count(), PINGS.sum()),
+        PingHistogram::BOUNDS.map(|b| (b.as_secs_f64(), PINGS.at_or_under(b))),
+        (PINGS.count(), PINGS.sum().as_secs_f64()),
+    );
+    histogram(
+        &mut out,
+        "snaketui_tcp_rtt_seconds",
+        "The kernel's round trips for players' connections, read every few \
+         seconds (Linux only).",
+        PingHistogram::BOUNDS.map(|b| (b.as_secs_f64(), TCP_RTTS.at_or_under(b))),
+        (TCP_RTTS.count(), TCP_RTTS.sum().as_secs_f64()),
+    );
+    histogram(
+        &mut out,
+        "snaketui_tcp_unacked_bytes",
+        "Bytes written to a player that they haven't acknowledged: not sent \
+         yet, or on their way. Read every few seconds (Linux only).",
+        SizeHistogram::BOUNDS.map(|b| (f64::from(b), UNACKED.at_or_under(b))),
+        (UNACKED.count(), UNACKED.sum() as f64),
     );
     out
 }
 
 /// A histogram in Prometheus's text format: how many samples were at or
-/// under each bound, then their count and sum.
+/// under each bucket's bound, then their count and sum.
 fn histogram<const N: usize>(
     out: &mut String,
     name: &str,
     help: &str,
-    bounds: [Duration; N],
-    at_or_under: impl Fn(Duration) -> u64,
-    (count, sum): (u64, Duration),
+    buckets: [(f64, u64); N],
+    (count, sum): (u64, f64),
 ) {
     let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
-    for bound in bounds {
-        let le = bound.as_secs_f64();
-        let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {}", at_or_under(bound));
+    for (le, at_or_under) in buckets {
+        let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {at_or_under}");
     }
     let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
-    let _ = writeln!(out, "{name}_sum {}", sum.as_secs_f64());
+    let _ = writeln!(out, "{name}_sum {sum}");
     let _ = writeln!(out, "{name}_count {count}");
 }

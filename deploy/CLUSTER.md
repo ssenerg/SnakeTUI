@@ -408,6 +408,10 @@ format:
 | `snaketui_cluster_peers` | Other servers it heard from in the last 2 seconds. |
 | `snaketui_tick_lag_seconds` | A histogram of how late room ticks ran. Below 0.005 s at the 99th percentile is normal. |
 | `snaketui_ping_seconds` | A histogram of players' round trips to this server, timed every 2 seconds. Players see a turn this long after the key, plus up to one tick. |
+| `snaketui_tcp_rtt_seconds` | A histogram of the kernel's round trips for players' connections, read every 2 seconds. Linux only, like the three below. |
+| `snaketui_tcp_unacked_bytes` | A histogram of the bytes written to a player that they hadn't acknowledged yet, read every 2 seconds. Mostly under 4096 is normal. |
+| `snaketui_tcp_sent_bytes_total` | Bytes sent to players, sent-again bytes included. |
+| `snaketui_tcp_resent_bytes_total` | Bytes sent to players again because they were lost. Divided by `snaketui_tcp_sent_bytes_total`, it's the share of data lost. |
 
 For Prometheus on the private network:
 

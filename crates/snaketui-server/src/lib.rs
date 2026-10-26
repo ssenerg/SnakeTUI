@@ -25,6 +25,7 @@ pub mod room;
 pub mod session;
 pub mod ssh;
 pub mod store;
+pub mod tcp;
 
 use std::future::Future;
 use std::sync::Arc;
