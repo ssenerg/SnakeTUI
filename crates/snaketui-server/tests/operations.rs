@@ -83,6 +83,7 @@ async fn metrics_count_players_and_rooms() {
         "snaketui_tcp_unacked_bytes_bucket{le=\"0\"}",
         "# TYPE snaketui_tcp_sent_bytes_total counter",
         "# TYPE snaketui_tcp_resent_bytes_total counter",
+        "# TYPE snaketui_frame_holds_total counter",
     ] {
         assert!(metrics.contains(line), "no {line:?} in:\n{metrics}");
     }

@@ -38,6 +38,9 @@ pub fn config(host_key: PrivateKey) -> russh::server::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
+        // Output waiting for russh to write it. Sessions hold frames for a
+        // slow client themselves, to send the newest, so little need wait.
+        event_buffer_size: 2,
         ..Default::default()
     }
 }

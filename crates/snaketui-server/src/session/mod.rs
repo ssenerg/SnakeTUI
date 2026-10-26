@@ -5,7 +5,7 @@ mod account;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
@@ -30,7 +30,7 @@ use crate::input::{Budget, KeyParser, STATUS_QUERY};
 use crate::lobby::{CreateError, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
-use crate::metrics::{PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
+use crate::metrics::{FRAME_HOLDS, PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
 use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData, now};
@@ -41,8 +41,13 @@ use crate::{Shared, Stopping};
 /// make the server allocate huge screens.
 pub const MAX_COLS: u16 = 240;
 pub const MAX_ROWS: u16 = 80;
-/// Frames waiting to go out before drawing pauses for a slow client.
+/// Room for output waiting to go out: a frame, a status query, and what
+/// closing says.
 const OUT_QUEUE: usize = 4;
+/// Drawing waits while the player hasn't acknowledged more than this, so a
+/// slow connection gets the newest screen instead of a queue of old ones,
+/// here or in the network. A game sends far less than this in a round trip.
+const UNACKED_LIMIT: u64 = 8 << 10;
 /// How long a lone ESC waits to see whether it starts an arrow key.
 const ESC_WAIT: Duration = Duration::from_millis(50);
 /// While a game runs, wake at least this often for the clock and food.
@@ -50,7 +55,7 @@ const MAX_WAKE: Duration = Duration::from_millis(100);
 /// How often the queue screen updates its clock.
 const QUEUE_WAKE: Duration = Duration::from_secs(1);
 /// How soon to retry drawing for a client that's behind.
-const RETRY_DRAW: Duration = Duration::from_millis(50);
+const RETRY_DRAW: Duration = Duration::from_millis(10);
 const IDLE_CHECK: Duration = Duration::from_secs(15);
 /// How often the terminal is asked for a status report, to time the round
 /// trip.
@@ -289,6 +294,9 @@ pub struct SessionActor {
     status: Option<Doing>,
     hangup: Option<Hangup>,
     out: Option<mpsc::Sender<Out>>,
+    /// Output sent to `out` that russh hasn't taken yet. Drawing waits
+    /// while there's any.
+    unwritten: Arc<AtomicUsize>,
     player: Option<Player>,
     size: Size,
     /// Both exist from when the game screen opens.
@@ -385,6 +393,7 @@ impl SessionActor {
             status: None,
             hangup: None,
             out: None,
+            unwritten: Arc::default(),
             player: None,
             size: Size::new(80, 24),
             terminal: None,
@@ -428,7 +437,12 @@ impl SessionActor {
     }
 
     fn send(&self, out: Out) -> bool {
-        self.out.as_ref().is_some_and(|tx| tx.try_send(out).is_ok())
+        let data = matches!(out, Out::Data(_));
+        let sent = self.out.as_ref().is_some_and(|tx| tx.try_send(out).is_ok());
+        if sent && data {
+            self.unwritten.fetch_add(1, Ordering::Relaxed);
+        }
+        sent
     }
 
     fn fingerprint(&self) -> Option<String> {
@@ -1026,11 +1040,18 @@ impl SessionActor {
         else {
             return;
         };
-        if out.capacity() == 0 {
-            // The client is behind. Its screen still matches what ratatui
-            // last sent, so just draw again once it catches up.
+        let unacked = self
+            .hangup
+            .as_ref()
+            .and_then(Hangup::tcp)
+            .map_or(0, |t| t.unacked());
+        if self.unwritten.load(Ordering::Relaxed) > 0 || unacked > UNACKED_LIMIT {
+            // The client is behind: output is still waiting here, or on its
+            // way. Its screen will match what ratatui last sent, so just
+            // draw again once that's through, from the screen as it is then.
             let since = *self.stalled_since.get_or_insert_with(|| {
-                debug!(peer = %self.peer, "client is behind; holding frames");
+                debug!(peer = %self.peer, unacked, "client is behind; holding frames");
+                FRAME_HOLDS.fetch_add(1, Ordering::Relaxed);
                 Instant::now()
             });
             if since.elapsed() > self.shared.cfg.stall_timeout() {
@@ -1052,8 +1073,8 @@ impl SessionActor {
             terminal.draw(|frame| ui::draw(frame, app)).map(|_| ())
         }));
         let bytes = terminal.backend_mut().take_output();
-        if !bytes.is_empty() {
-            let _ = out.try_send(Out::Data(bytes.into()));
+        if !bytes.is_empty() && out.try_send(Out::Data(bytes.into())).is_ok() {
+            self.unwritten.fetch_add(1, Ordering::Relaxed);
         }
         match drawn {
             Ok(Ok(())) => {}
@@ -1184,12 +1205,14 @@ impl SessionActor {
 }
 
 /// Sends queued output to the client, in order, until told to close; then
-/// makes sure the connection ends.
+/// makes sure the connection ends. Counts each piece of `unwritten` off as
+/// russh takes it.
 async fn write_out(
     handle: Handle,
     channel: ChannelId,
     hangup: Option<Hangup>,
     mut rx: mpsc::Receiver<Out>,
+    unwritten: Arc<AtomicUsize>,
 ) {
     while let Some(out) = rx.recv().await {
         match out {
@@ -1197,6 +1220,7 @@ async fn write_out(
                 if handle.data(channel, data).await.is_err() {
                     break;
                 }
+                unwritten.fetch_sub(1, Ordering::Relaxed);
             }
             Out::Close { exit_status } => {
                 let goodbye = async {
@@ -1245,7 +1269,14 @@ impl Handler<ChannelOpened> for SessionActor {
 
     fn handle(&mut self, msg: ChannelOpened, _: &mut Self::Context) {
         let (tx, rx) = mpsc::channel(OUT_QUEUE);
-        actix::spawn(write_out(msg.handle, msg.channel, self.hangup.clone(), rx));
+        let unwritten = Arc::clone(&self.unwritten);
+        actix::spawn(write_out(
+            msg.handle,
+            msg.channel,
+            self.hangup.clone(),
+            rx,
+            unwritten,
+        ));
         self.out = Some(tx);
     }
 }

@@ -320,3 +320,74 @@ async fn a_client_that_stops_reading_is_disconnected() {
     }
     p.wait_closed(Duration::from_secs(5)).await;
 }
+
+/// A client that falls behind gets the newest screen once it catches up,
+/// not every frame drawn meanwhile: those would only arrive late. Linux
+/// only, where the server can see what the kernel hasn't sent.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_client_that_falls_behind_gets_the_newest_screen() {
+    let server = TestServer::start();
+    let paused = Arc::new(AtomicBool::new(false));
+    let waker = Arc::new(Mutex::new(None::<Waker>));
+    // A small receive buffer, so the server feels the pause at once.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let stream = Pausable {
+        inner: socket.connect(server.addr).await.unwrap(),
+        paused: Arc::clone(&paused),
+        waker: Arc::clone(&waker),
+    };
+    // An SSH window far bigger than everything drawn, so SSH's own flow
+    // control never holds anything back.
+    let config = client::Config {
+        window_size: 1 << 30,
+        ..Default::default()
+    };
+    let mut client = client::connect_stream(Arc::new(config), stream, TrustAnyHost)
+        .await
+        .unwrap();
+    assert!(sign_in(&mut client, Login::Key(&new_key())).await);
+    let mut p = Player::open(client, 240, 80).await;
+    p.single_player().await;
+    p.send(ENTER).await;
+    p.wait_for("press an arrow key").await;
+
+    // How big one redraw of the whole screen is.
+    let quiet = Duration::from_millis(500);
+    p.saw("never shown", quiet).await;
+    let before = p.received;
+    p.channel.window_change(239, 80, 0, 0).await.unwrap();
+    p.saw("never shown", quiet).await;
+    let frame = p.received - before;
+    assert!(frame > 1000, "a whole screen is bigger than that: {frame}");
+
+    // 100 whole-screen redraws while not reading.
+    paused.store(true, Ordering::SeqCst);
+    let mut cols = 239;
+    for _ in 0..100 {
+        cols = if cols == 240 { 239 } else { 240 };
+        let _ = timeout(
+            Duration::from_millis(100),
+            p.channel.window_change(cols, 80, 0, 0),
+        )
+        .await;
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // Reading again brings what was in flight, then the newest screen.
+    let before = p.received;
+    paused.store(false, Ordering::SeqCst);
+    if let Some(w) = waker.lock().unwrap().take() {
+        w.wake();
+    }
+    p.saw("never shown", Duration::from_secs(2)).await;
+    // Every screen drawn meanwhile would be about 100 of them.
+    let caught_up = p.received - before;
+    assert!(
+        caught_up < 10 * frame,
+        "{caught_up} bytes to catch up, with screens of {frame}"
+    );
+    p.channel.window_change(200, 60, 0, 0).await.unwrap();
+    p.wait_for("press an arrow key").await;
+}

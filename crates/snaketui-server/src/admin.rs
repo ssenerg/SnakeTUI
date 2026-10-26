@@ -13,7 +13,8 @@ use tracing::debug;
 
 use crate::accept::Limits;
 use crate::metrics::{
-    PINGS, PingHistogram, SizeHistogram, TCP_RESENT, TCP_RTTS, TCP_SENT, TICK_LAG, UNACKED,
+    FRAME_HOLDS, PINGS, PingHistogram, SizeHistogram, TCP_RESENT, TCP_RTTS, TCP_SENT, TICK_LAG,
+    UNACKED,
 };
 use crate::{Shared, Stopping};
 
@@ -129,6 +130,12 @@ fn metrics(shared: &Shared, limits: &Limits) -> String {
         "Bytes sent to players again because they were lost. Over \
          snaketui_tcp_sent_bytes_total, the share lost.",
         TCP_RESENT.load(Ordering::Relaxed),
+    );
+    counter(
+        "snaketui_frame_holds_total",
+        "Times a player's connection fell behind and the server held frames \
+         back, to send the newest screen once it caught up.",
+        FRAME_HOLDS.load(Ordering::Relaxed),
     );
     histogram(
         &mut out,

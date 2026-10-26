@@ -98,6 +98,8 @@ pub static UNACKED: SizeHistogram = SizeHistogram::new();
 /// Bytes sent to players, and how many of them were sent again.
 pub static TCP_SENT: AtomicU64 = AtomicU64::new(0);
 pub static TCP_RESENT: AtomicU64 = AtomicU64::new(0);
+/// Times a player's connection fell behind and frames were held for it.
+pub static FRAME_HOLDS: AtomicU64 = AtomicU64::new(0);
 
 impl PingHistogram {
     /// Each bucket's upper bound.
