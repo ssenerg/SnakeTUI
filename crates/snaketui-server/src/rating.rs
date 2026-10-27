@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 use skillratings::MultiTeamOutcome;
 use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
 
+/// Which rating: a game's, for one kind of play in it, such as chess's
+/// blitz. Each is rated on its own, never from another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RatingKey {
+    pub game: &'static str,
+    pub category: &'static str,
+}
+
+/// Snake's quick play, every snake for itself.
+pub const SNAKE_QUICK: RatingKey = RatingKey {
+    game: "snake",
+    category: "ffa",
+};
+
 /// A player's estimated skill, `mu`, and how unsure that estimate is,
 /// `sigma`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

@@ -25,7 +25,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 use tracing::{info, warn};
 
-use crate::rating::{self, Rating};
+use crate::rating::{self, Rating, SNAKE_QUICK};
 use crate::room::{RoomRef, ServerId};
 
 /// The tables as they were before migrations, which is step 1. Frozen: a
@@ -202,12 +202,142 @@ struct Migration {
 
 /// Every change, oldest first; a step's version is its place in the list,
 /// from 1. Never edit or reorder a step that has shipped: add another.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "the tables as first made",
-    sqlite: SQLITE_SCHEMA,
-    postgres: POSTGRES_SCHEMA,
-    breaks_older: false,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "the tables as first made",
+        sqlite: SQLITE_SCHEMA,
+        postgres: POSTGRES_SCHEMA,
+        breaks_older: false,
+    },
+    Migration {
+        name: "ratings and settings for each game",
+        sqlite: SQLITE_PER_GAME,
+        postgres: POSTGRES_PER_GAME,
+        breaks_older: false,
+    },
+];
+
+/// Step 2: ratings and settings are kept for each game, apart, starting
+/// with copies of Snake's. Until every server writes them, the accounts'
+/// and players' own columns stay what's read.
+const SQLITE_PER_GAME: &str = "
+CREATE TABLE IF NOT EXISTS ratings (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    game       TEXT NOT NULL,
+    -- a kind of play rated on its own, like chess's blitz
+    category   TEXT NOT NULL,
+    -- Weng-Lin's mu and sigma, or Glicko-2's rating and deviation
+    rating     REAL NOT NULL,
+    deviation  REAL NOT NULL,
+    -- Glicko-2's volatility
+    volatility REAL,
+    games      INTEGER NOT NULL DEFAULT 0,
+    wins       INTEGER NOT NULL DEFAULT 0,
+    draws      INTEGER NOT NULL DEFAULT 0,
+    rated_at   INTEGER NOT NULL,
+    PRIMARY KEY (account_id, game, category)
+);
+CREATE INDEX IF NOT EXISTS ratings_board ON ratings (game, category, rating DESC, games DESC);
+CREATE TABLE IF NOT EXISTS account_prefs (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    game       TEXT NOT NULL,
+    prefs      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, game)
+);
+CREATE TABLE IF NOT EXISTS player_prefs (
+    fingerprint TEXT NOT NULL REFERENCES players(fingerprint) ON DELETE CASCADE,
+    game        TEXT NOT NULL,
+    prefs       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (fingerprint, game)
+);
+ALTER TABLE accounts ADD COLUMN last_game TEXT;
+ALTER TABLE players ADD COLUMN last_game TEXT;
+INSERT INTO ratings
+    (account_id, game, category, rating, deviation, volatility, games, wins, draws, rated_at)
+SELECT id, 'snake', 'ffa', rating_mu, rating_sigma, NULL, games, wins, 0, last_seen
+FROM accounts WHERE games > 0
+ON CONFLICT DO NOTHING;
+INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+SELECT id, 'snake', config, last_seen FROM accounts WHERE config <> ''
+ON CONFLICT DO NOTHING;
+INSERT INTO player_prefs (fingerprint, game, prefs, updated_at)
+SELECT fingerprint, 'snake', config, last_seen FROM players WHERE config <> ''
+ON CONFLICT DO NOTHING;
+";
+
+/// [`SQLITE_PER_GAME`], in Postgres's types.
+const POSTGRES_PER_GAME: &str = "
+CREATE TABLE IF NOT EXISTS ratings (
+    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    game       TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    rating     DOUBLE PRECISION NOT NULL,
+    deviation  DOUBLE PRECISION NOT NULL,
+    volatility DOUBLE PRECISION,
+    games      BIGINT NOT NULL DEFAULT 0,
+    wins       BIGINT NOT NULL DEFAULT 0,
+    draws      BIGINT NOT NULL DEFAULT 0,
+    rated_at   BIGINT NOT NULL,
+    PRIMARY KEY (account_id, game, category)
+);
+CREATE INDEX IF NOT EXISTS ratings_board ON ratings (game, category, rating DESC, games DESC);
+CREATE TABLE IF NOT EXISTS account_prefs (
+    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    game       TEXT NOT NULL,
+    prefs      TEXT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (account_id, game)
+);
+CREATE TABLE IF NOT EXISTS player_prefs (
+    fingerprint TEXT NOT NULL REFERENCES players(fingerprint) ON DELETE CASCADE,
+    game        TEXT NOT NULL,
+    prefs       TEXT NOT NULL,
+    updated_at  BIGINT NOT NULL,
+    PRIMARY KEY (fingerprint, game)
+);
+ALTER TABLE accounts ADD COLUMN last_game TEXT;
+ALTER TABLE players ADD COLUMN last_game TEXT;
+INSERT INTO ratings
+    (account_id, game, category, rating, deviation, volatility, games, wins, draws, rated_at)
+SELECT id, 'snake', 'ffa', rating_mu, rating_sigma, NULL, games, wins, 0, last_seen
+FROM accounts WHERE games > 0
+ON CONFLICT DO NOTHING;
+INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+SELECT id, 'snake', config, last_seen FROM accounts WHERE config <> ''
+ON CONFLICT DO NOTHING;
+INSERT INTO player_prefs (fingerprint, game, prefs, updated_at)
+SELECT fingerprint, 'snake', config, last_seen FROM players WHERE config <> ''
+ON CONFLICT DO NOTHING;
+";
+
+/// The game whose settings the accounts' and players' `config` columns
+/// hold, and that their copies in `account_prefs` and `player_prefs` are
+/// kept for.
+const SNAKE: &str = SNAKE_QUICK.game;
+
+/// Copies an account's quick-play rating, as just saved in `accounts`,
+/// into `ratings`, so the two stay the same until `ratings` is what's read.
+async fn mirror_rating(conn: &mut AnyConnection, id: AccountId) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ratings
+             (account_id, game, category, rating, deviation, volatility,
+              games, wins, draws, rated_at)
+         SELECT id, $2, $3, rating_mu, rating_sigma, NULL, games, wins, 0, $4
+         FROM accounts WHERE id = $1
+         ON CONFLICT (account_id, game, category) DO UPDATE SET
+             rating = excluded.rating, deviation = excluded.deviation,
+             games = excluded.games, wins = excluded.wins, rated_at = excluded.rated_at",
+    )
+    .bind(id)
+    .bind(SNAKE_QUICK.game)
+    .bind(SNAKE_QUICK.category)
+    .bind(now())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
 
 /// Which steps a database has had. `needs` is the oldest code, by the
 /// number of steps it knows, that can still use it: 0 for a step that only
@@ -519,11 +649,26 @@ impl Store {
     }
 
     pub async fn save_config(&self, fingerprint: &str, cfg: &GameConfig) -> Result<()> {
+        let text = cfg.to_saved_text();
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE players SET config = $2 WHERE fingerprint = $1")
             .bind(fingerprint)
-            .bind(cfg.to_saved_text())
-            .execute(&self.pool)
+            .bind(&text)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "INSERT INTO player_prefs (fingerprint, game, prefs, updated_at)
+             SELECT fingerprint, $2, $3, $4 FROM players WHERE fingerprint = $1
+             ON CONFLICT (fingerprint, game) DO UPDATE SET
+                 prefs = excluded.prefs, updated_at = excluded.updated_at",
+        )
+        .bind(fingerprint)
+        .bind(SNAKE)
+        .bind(&text)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -577,6 +722,16 @@ impl Store {
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        sqlx::query(
+            "INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(SNAKE)
+        .bind(cfg.to_saved_text())
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
         for (record_key, best) in records.iter() {
             sqlx::query(
                 "INSERT INTO account_records (account_id, record_key, best) VALUES ($1, $2, $3)",
@@ -725,11 +880,26 @@ impl Store {
     }
 
     pub async fn save_account_config(&self, id: AccountId, cfg: &GameConfig) -> Result<()> {
+        let text = cfg.to_saved_text();
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE accounts SET config = $2 WHERE id = $1")
             .bind(id)
-            .bind(cfg.to_saved_text())
-            .execute(&self.pool)
+            .bind(&text)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (account_id, game) DO UPDATE SET
+                 prefs = excluded.prefs, updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(SNAKE)
+        .bind(&text)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -748,8 +918,6 @@ impl Store {
         Ok(())
     }
 
-    /// Saves everyone's new rating after a quick-play round, and counts the
-    /// game and any win.
     /// Rates a round between these accounts, given each one's place (1 is
     /// first) and whether they won: works out their new ratings from the
     /// ones saved now, saves them, and answers each account's rating
@@ -795,11 +963,14 @@ impl Store {
             .bind(i64::from(won))
             .execute(&mut *tx)
             .await?;
+            mirror_rating(&mut tx, id).await?;
         }
         tx.commit().await?;
         Ok(before.into_iter().map(|(r, _)| r).zip(after).collect())
     }
 
+    /// Saves everyone's new rating after a quick-play round, and counts the
+    /// game and any win.
     pub async fn save_rated_round(&self, results: &[RatedResult]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for r in results {
@@ -814,6 +985,7 @@ impl Store {
             .bind(i64::from(r.won))
             .execute(&mut *tx)
             .await?;
+            mirror_rating(&mut tx, r.account).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1266,6 +1438,7 @@ mod tests {
         asking_back_respects_the_friend_limit,
         limits_count_recent_events_and_tidy_away_old_ones,
         room_codes_are_claimed_once_and_expire,
+        snake_ratings_and_settings_are_copied_for_the_game,
     );
 
     async fn sqlite() -> Store {
@@ -1301,6 +1474,7 @@ mod tests {
         steps_are_applied_once_and_noted,
         a_database_from_before_migrations_is_taken_as_step_one,
         newer_databases_are_refused_only_when_they_must_be,
+        step_two_copies_what_was_saved_for_snake,
     );
 
     /// A SQLite file in the temporary directory, removed afterwards.
@@ -1430,6 +1604,115 @@ mod tests {
         assert!(refused.contains("newer code"), "{refused}");
     }
 
+    async fn step_two_copies_what_was_saved_for_snake(url: String) {
+        // Saved by the code from before steps: a rated account, a new one,
+        // and two guests with a key, one of whom changed settings.
+        let mut conn = raw(&url).await;
+        let schema = if url.starts_with("sqlite") {
+            SQLITE_SCHEMA
+        } else {
+            POSTGRES_SCHEMA
+        };
+        sqlx::raw_sql(schema).execute(&mut conn).await.unwrap();
+        for (id, name, config, mu, sigma, games, wins) in [
+            (1_i64, "ann", "width=40\n", 30.5, 6.5, 7_i64, 3_i64),
+            (2, "ben", "", 25.0, 8.25, 0, 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO accounts (id, username, password_hash, config, rating_mu,
+                     rating_sigma, games, wins, created_at, last_seen)
+                 VALUES ($1, $2, 'hash', $3, $4, $5, $6, $7, 1, 2)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(config)
+            .bind(mu)
+            .bind(sigma)
+            .bind(games)
+            .bind(wins)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        for (key, nick, config) in [
+            ("SHA256:cat", "cat", "tick_ms=100\n"),
+            ("SHA256:dan", "dan", ""),
+        ] {
+            sqlx::query(
+                "INSERT INTO players (fingerprint, nick, config, last_seen) VALUES ($1, $2, $3, 5)",
+            )
+            .bind(key)
+            .bind(nick)
+            .bind(config)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        conn.close().await.unwrap();
+
+        let store = Store::open(&url).await.unwrap();
+        let ratings = sqlx::query(
+            "SELECT account_id, game, category, rating, deviation, volatility, games, wins, draws
+             FROM ratings",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let ratings: Vec<_> = ratings
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<i64, _>(0).unwrap(),
+                    r.try_get::<String, _>(1).unwrap(),
+                    r.try_get::<String, _>(2).unwrap(),
+                    r.try_get::<f64, _>(3).unwrap(),
+                    r.try_get::<f64, _>(4).unwrap(),
+                    r.try_get::<Option<f64>, _>(5).unwrap(),
+                    r.try_get::<i64, _>(6).unwrap(),
+                    r.try_get::<i64, _>(7).unwrap(),
+                    r.try_get::<i64, _>(8).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ratings,
+            [(1, "snake".into(), "ffa".into(), 30.5, 6.5, None, 7, 3, 0)],
+            "only accounts that played: no row means a new player's rating"
+        );
+        let prefs = |sql: &'static str| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query(sql)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.try_get::<String, _>(0).unwrap(),
+                            r.try_get::<String, _>(1).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            prefs("SELECT game, prefs FROM account_prefs").await,
+            [("snake".to_string(), "width=40\n".to_string())]
+        );
+        assert_eq!(
+            prefs("SELECT fingerprint, prefs FROM player_prefs WHERE game = 'snake'").await,
+            [("SHA256:cat".to_string(), "tick_ms=100\n".to_string())]
+        );
+        let unplayed: i64 = sqlx::query("SELECT count(*) FROM accounts WHERE last_game IS NULL")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        assert_eq!(unplayed, 2, "nobody has a last game yet");
+    }
+
     #[actix_rt::test]
     async fn postgres_servers_opening_at_once_take_turns() {
         let url = snaketui_test_services::postgres().await;
@@ -1478,6 +1761,91 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn snake_ratings_and_settings_are_copied_for_the_game(store: Store) {
+        let saved = |sql: &'static str, key: String| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query(sql)
+                    .bind(key)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .map(|r| r.try_get::<String, _>(0).unwrap())
+            }
+        };
+        let guest_prefs = |key: &str| {
+            saved(
+                "SELECT prefs FROM player_prefs WHERE fingerprint = $1 AND game = 'snake'",
+                key.to_string(),
+            )
+        };
+        let account_prefs = |id: AccountId| {
+            saved(
+                "SELECT prefs FROM account_prefs WHERE account_id = CAST($1 AS BIGINT) \
+                 AND game = 'snake'",
+                id.to_string(),
+            )
+        };
+
+        // A guest's settings, then theirs as an account, then changed.
+        store.visit("SHA256:ann", "ann").await.unwrap();
+        let wide = GameConfig::from_saved_text("width=40\n");
+        store.save_config("SHA256:ann", &wide).await.unwrap();
+        assert_eq!(guest_prefs("SHA256:ann").await, Some(wide.to_saved_text()));
+        let ann = store
+            .create_account(
+                "ann",
+                "hash",
+                Some("SHA256:ann"),
+                &wide,
+                &Records::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account_prefs(ann.id).await, Some(wide.to_saved_text()));
+        assert_eq!(
+            guest_prefs("SHA256:ann").await,
+            None,
+            "they went with the guest"
+        );
+        let fast = GameConfig::from_saved_text("tick_ms=100\n");
+        store.save_account_config(ann.id, &fast).await.unwrap();
+        assert_eq!(account_prefs(ann.id).await, Some(fast.to_saved_text()));
+
+        // Ratings, as each account has them.
+        let ben = account(&store, "ben", None).await;
+        store
+            .rate_round(&[(ann.id, 1, true), (ben.id, 2, false)])
+            .await
+            .unwrap();
+        for id in [ann.id, ben.id] {
+            let account = store.load_account(id).await.unwrap().account;
+            let copy = sqlx::query(
+                "SELECT rating, deviation, games, wins FROM ratings
+                 WHERE account_id = $1 AND game = 'snake' AND category = 'ffa'",
+            )
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    copy.try_get::<f64, _>(0).unwrap(),
+                    copy.try_get::<f64, _>(1).unwrap(),
+                    copy.try_get::<i64, _>(2).unwrap(),
+                    copy.try_get::<i64, _>(3).unwrap(),
+                ),
+                (
+                    account.rating.mu,
+                    account.rating.sigma,
+                    i64::from(account.games),
+                    i64::from(account.wins),
+                )
+            );
+        }
     }
 
     async fn usernames_are_unique_ignoring_case(store: Store) {
