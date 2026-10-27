@@ -1,0 +1,14 @@
+[package]
+name = "game-api"
+description = "What every game on the server shares: players, rooms and their lobby, and the traits a game implements"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# Rooms' views as the server sends them between machines.
+serde = ["dep:serde"]
+
+[dependencies]
+rand.workspace = true
+serde = { version = "1.0.228", features = ["derive"], optional = true }

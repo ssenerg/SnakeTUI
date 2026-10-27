@@ -1,10 +1,10 @@
 //! The cluster's quick-play queue, which `snaketui-matchmaker` runs: one
 //! for the whole cluster.
 //!
-//! Servers send it their waiting players. It runs the [`Matcher`] on all of
-//! them and asks a server to host each match it forms: one in the region
-//! most of the players are in, preferring the server that already has the
-//! most of them, then the least busy.
+//! Servers send it their waiting players. It runs the [`Pools`] on all of
+//! them and asks a server to host each match they form: one that hosts the
+//! pool's game, in the region most of the players are in, preferring the
+//! server that already has the most of them, then the least busy.
 //!
 //! Nothing is kept on disk. When it restarts, servers hear its new
 //! instance and send their players again, with how long they've waited.
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use async_nats::Client;
 use futures::StreamExt;
-use snake_core::round::PlayerId;
+use game_api::{GameId, PlayerId};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -26,7 +26,8 @@ use crate::cluster::wire::{
 };
 use crate::cluster::{HEARTBEAT, PEER_TIMEOUT, nats_options, prefix};
 use crate::config::ClusterConfig;
-use crate::matcher::{Matcher, Ticket};
+use crate::games::PoolKey;
+use crate::matcher::{Pools, Ticket};
 use crate::room::{RoomRef, ServerId};
 
 /// How often the queue looks for matches.
@@ -49,12 +50,15 @@ pub struct ServerSeen {
     pub load: u32,
     /// Stopping, so it hosts no new matches.
     pub draining: bool,
+    /// The games it hosts matches of.
+    pub games: Vec<GameId>,
     pub seen: Instant,
 }
 
 /// A match formed, and the servers to ask to host it, best first.
 #[derive(Debug)]
 pub struct Plan {
+    pub pool: PoolKey,
     pub seats: Vec<MatchSeat>,
     pub hosts: Vec<ServerId>,
     /// The players' tickets, and when each joined on the queue's clock, in
@@ -64,7 +68,7 @@ pub struct Plan {
 
 /// The queue, apart from NATS: tickets in, plans out.
 pub struct Queue {
-    matcher: Matcher,
+    matcher: Pools,
     /// Each waiting player's ticket, and when they joined on the queue's
     /// clock.
     tickets: HashMap<PlayerId, (QueueTicket, Duration)>,
@@ -78,7 +82,7 @@ pub struct Queue {
 impl Queue {
     pub fn new(speed: f64) -> Self {
         Self {
-            matcher: Matcher::default(),
+            matcher: Pools::default(),
             tickets: HashMap::new(),
             servers: HashMap::new(),
             recently: HashMap::new(),
@@ -115,13 +119,21 @@ impl Queue {
     }
 
     fn queue(&mut self, ticket: QueueTicket, since: Duration) {
-        self.matcher.add(Ticket {
-            player: ticket.who.id,
-            rating: f64::from(ticket.rating.shown()),
-            region: ticket.region.clone(),
-            since,
-        });
-        self.tickets.insert(ticket.who.id, (ticket, since));
+        let queued = self.matcher.add(
+            &ticket.pool,
+            Ticket {
+                player: ticket.who.id,
+                rating: f64::from(ticket.rating.shown()),
+                region: ticket.region.clone(),
+                since,
+            },
+        );
+        // A pool of a game this queue doesn't know waits for nobody.
+        if queued {
+            self.tickets.insert(ticket.who.id, (ticket, since));
+        } else {
+            self.tickets.remove(&ticket.who.id);
+        }
     }
 
     pub fn remove(&mut self, player: PlayerId) {
@@ -134,6 +146,7 @@ impl Queue {
             region: alive.region,
             load: alive.load,
             draining: alive.draining,
+            games: alive.games,
             seen: Instant::now(),
         };
         self.servers.insert(alive.server, seen);
@@ -163,7 +176,7 @@ impl Queue {
         self.recently.retain(|_, at| at.elapsed() < RECENTLY);
         let now = self.now();
         let mut plans = Vec::new();
-        for group in self.matcher.run(now) {
+        for (pool, group) in self.matcher.run(now) {
             let back: Vec<(QueueTicket, Duration)> = group
                 .players
                 .iter()
@@ -184,11 +197,18 @@ impl Queue {
             let hosts: HashMap<ServerId, &ServerSeen> = self
                 .servers
                 .iter()
-                .filter(|(_, s)| s.seen.elapsed() < PEER_TIMEOUT && !s.draining)
+                .filter(|(_, s)| {
+                    s.seen.elapsed() < PEER_TIMEOUT && !s.draining && s.games.contains(&pool.game)
+                })
                 .map(|(id, s)| (*id, s))
                 .collect();
             let hosts = choose_hosts(&group.region, &seats, &hosts);
-            plans.push(Plan { seats, hosts, back });
+            plans.push(Plan {
+                pool,
+                seats,
+                hosts,
+                back,
+            });
         }
         plans
     }
@@ -286,6 +306,7 @@ pub async fn run(cfg: &ClusterConfig, speed: f64, stop: impl Future<Output = ()>
 /// players go back in the queue.
 async fn host(client: Client, prefix: String, plan: Plan, unplanned: mpsc::UnboundedSender<Plan>) {
     let request = encode(&MakeMatch {
+        pool: plan.pool.clone(),
         seats: plan.seats.clone(),
     });
     for &server in plan.hosts.iter().take(HOST_TRIES) {
@@ -299,6 +320,7 @@ async fn host(client: Client, prefix: String, plan: Plan, unplanned: mpsc::Unbou
         };
         if let Some(room) = made {
             debug!(
+                pool = %plan.pool,
                 players = plan.seats.len(),
                 server = %format!("{:016x}", room.server),
                 "match formed"
@@ -315,13 +337,15 @@ async fn host(client: Client, prefix: String, plan: Plan, unplanned: mpsc::Unbou
 
 #[cfg(test)]
 mod tests {
-    use snake_core::round::Entrant;
+    use game_api::Entrant;
 
     use super::*;
+    use crate::games::snake::quick_pool;
     use crate::rating::Rating;
 
     fn ticket(id: PlayerId, server: ServerId, region: &str, waited: u64) -> QueueTicket {
         QueueTicket {
+            pool: quick_pool(),
             who: Entrant {
                 id,
                 name: format!("p{id}"),
@@ -340,6 +364,7 @@ mod tests {
             region: region.into(),
             load,
             draining: false,
+            games: vec![GameId::Snake],
         }
     }
 
@@ -349,6 +374,7 @@ mod tests {
             region: region.into(),
             load,
             draining: false,
+            games: vec![GameId::Snake],
             seen: Instant::now(),
         };
         let servers = [(1, seen("eu", 50)), (2, seen("eu", 10)), (3, seen("us", 0))];
@@ -418,5 +444,29 @@ mod tests {
         queue.add(ticket(11, 2, "eu", 0));
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(queue.run().len(), 1, "20 ms is 20 s on this clock");
+    }
+
+    #[test]
+    fn only_servers_with_the_game_host_its_matches() {
+        let mut queue = Queue::new(1.0);
+        queue.heard(alive(1, "eu", 0));
+        queue.heard(Alive {
+            games: Vec::new(),
+            ..alive(2, "eu", 0)
+        });
+        queue.add(ticket(10, 2, "eu", 11));
+        queue.add(ticket(11, 2, "eu", 11));
+        let plans = queue.run();
+        assert_eq!(plans[0].pool, quick_pool());
+        assert_eq!(
+            plans[0].hosts,
+            [1],
+            "server 2 has the players, not the game"
+        );
+
+        let mut elsewhere = ticket(12, 1, "eu", 0);
+        elsewhere.pool.pool = "no such pool".into();
+        queue.add(elsewhere);
+        assert!(queue.is_empty());
     }
 }

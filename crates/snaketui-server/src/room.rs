@@ -1,10 +1,11 @@
-//! One multiplayer room: its round, its clock, and the view it publishes.
+//! One multiplayer room: its game's [`Room`], its clock, and the view it
+//! publishes. A [`RoomActor`] runs a room of any game; the rest of the
+//! server reaches it through a [`RoomPort`], which speaks [`RoomCmd`]s.
 //!
 //! A room never waits on its players. It publishes each new view on a watch
 //! channel, and every session reads the latest one at its own pace.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -12,24 +13,25 @@ use std::time::{Duration, Instant};
 
 use actix::prelude::*;
 use actix_rt::ArbiterHandle;
-use serde::{Deserialize, Serialize};
-use snake_core::config::Rules;
-use snake_core::geom::Direction;
-use snake_core::round::{
-    Entrant, JoinError, Outcome, PhaseView, Placement, PlayerId, RatingChange, RoomKind, RoomView,
-    Round, RoundEvent,
+use futures::future::BoxFuture;
+use game_api::{
+    Entrant, GameId, JoinError, PhaseView, Placement, PlayerId, RatingChange, RatingKey, Room,
+    RoomKind, RoomView, RoundEnd,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::cluster::Cluster;
-use crate::cluster::wire::{InputKind, RatedAt};
+use crate::cluster::wire::RatedAt;
+use crate::games::{self, AnyRoomView, Served};
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
 use crate::rating::Rating;
 use crate::store::{AccountId, Store};
 
-pub type ViewRx = watch::Receiver<Arc<RoomView>>;
+/// A room's views, newest first, of whichever game.
+pub type ViewRx = watch::Receiver<Arc<dyn AnyRoomView>>;
 
 /// Shows that a player's session is still there: the session holds the
 /// `Arc`, rooms and the queue a `Weak`. A session that dies without saying
@@ -62,19 +64,19 @@ pub struct RoomRef {
 }
 
 /// A room here, and the thread it runs on.
-type Running = (Addr<RoomActor>, ArbiterHandle);
+type Running = (Arc<dyn RoomPort>, ArbiterHandle);
 
 /// The rooms this server runs.
 #[derive(Clone, Default)]
 pub struct LocalRooms(Arc<Mutex<HashMap<RoomId, Running>>>);
 
 impl LocalRooms {
-    pub fn get(&self, id: RoomId) -> Option<Addr<RoomActor>> {
+    pub fn get(&self, id: RoomId) -> Option<Arc<dyn RoomPort>> {
         self.0
             .lock()
             .unwrap()
             .get(&id)
-            .map(|(addr, _)| addr.clone())
+            .map(|(port, _)| Arc::clone(port))
     }
 
     /// The room, and the thread it runs on, for work that belongs with it.
@@ -82,8 +84,8 @@ impl LocalRooms {
         self.0.lock().unwrap().get(&id).cloned()
     }
 
-    fn insert(&self, id: RoomId, addr: Addr<RoomActor>, thread: ArbiterHandle) {
-        self.0.lock().unwrap().insert(id, (addr, thread));
+    fn insert(&self, id: RoomId, port: Arc<dyn RoomPort>, thread: ArbiterHandle) {
+        self.0.lock().unwrap().insert(id, (port, thread));
     }
 
     fn remove(&self, id: RoomId) {
@@ -94,12 +96,12 @@ impl LocalRooms {
         self.0.lock().unwrap().len()
     }
 
-    pub fn all(&self) -> Vec<Addr<RoomActor>> {
+    pub fn all(&self) -> Vec<Arc<dyn RoomPort>> {
         self.0
             .lock()
             .unwrap()
             .values()
-            .map(|(addr, _)| addr.clone())
+            .map(|(port, _)| Arc::clone(port))
             .collect()
     }
 
@@ -150,23 +152,113 @@ impl RoomHost {
         }
     }
 
-    /// Starts `room` on the next room thread.
-    pub fn start(&self, room: RoomActor) -> RoomHandle {
-        self.start_as(self.new_id(), room)
-    }
-
-    /// Starts `room` as `id`, from [`Self::new_id`].
-    pub fn start_as(&self, id: RoomId, mut room: RoomActor) -> RoomHandle {
+    /// Starts `room` as `id`, from [`Self::new_id`], on the next room
+    /// thread.
+    pub fn start_as<G: Served>(&self, id: RoomId, mut room: RoomActor<G>) -> RoomHandle {
         room.registered = Some((id, self.rooms.clone()));
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.arbiters.len();
         let thread = self.arbiters[i].clone();
         let addr = RoomActor::start_in_arbiter(&thread, move |_| room);
-        self.rooms.insert(id, addr.clone(), thread);
+        let port: Arc<dyn RoomPort> = Arc::new(addr);
+        self.rooms.insert(id, Arc::clone(&port), thread);
         RoomHandle::Local {
             at: self.at(id),
-            addr,
+            port,
         }
     }
+}
+
+/// What a room is told, by players here and on other servers alike.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoomCmd {
+    Ready,
+    /// Gives up a seat, or stops watching.
+    Leave,
+    /// The player's round trip, measured by their session.
+    Ping(Duration),
+    /// The host adds a bot.
+    AddBot,
+    /// The host takes the last bot out.
+    RemoveBot,
+    /// A move, as the room's game reads it.
+    Play(Vec<u8>),
+    /// The host changes the settings of the room's next rounds, as its
+    /// game reads them.
+    Settings(Vec<u8>),
+}
+
+/// A room running here, of whichever game.
+pub trait RoomPort: Send + Sync {
+    /// Takes a seat for `who`; `presence` shows the player is still there.
+    fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined>;
+    /// Lets `id` watch without a seat.
+    fn watch(&self, id: PlayerId, presence: Presence) -> BoxFuture<'static, Joined>;
+    /// Keys wait in the room's mailbox, and a full one drops them; leaving
+    /// always gets there.
+    fn send(&self, id: PlayerId, cmd: RoomCmd);
+    /// The server is stopping.
+    fn drain(&self);
+}
+
+pub type Joined = Result<ViewRx, JoinError>;
+
+impl<G: Served> RoomPort for Addr<RoomActor<G>> {
+    fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined> {
+        let joined = self.send(Join { who, presence });
+        Box::pin(async move { joined.await.unwrap_or(Err(JoinError::Closed)) })
+    }
+
+    fn watch(&self, id: PlayerId, presence: Presence) -> BoxFuture<'static, Joined> {
+        let joined = self.send(Watch { id, presence });
+        Box::pin(async move { joined.await.unwrap_or(Err(JoinError::Closed)) })
+    }
+
+    fn send(&self, id: PlayerId, cmd: RoomCmd) {
+        if cmd == RoomCmd::Leave {
+            self.do_send(Cmd { id, cmd });
+        } else {
+            let _ = self.try_send(Cmd { id, cmd });
+        }
+    }
+
+    fn drain(&self) {
+        self.do_send(Drain);
+    }
+}
+
+/// A room about to start, of whichever game.
+pub trait NewRoom: Send {
+    /// Starts it here as `id`, from [`RoomHost::new_id`].
+    fn start(
+        self: Box<Self>,
+        host: &RoomHost,
+        id: RoomId,
+        setup: RoomSetup,
+    ) -> (RoomHandle, ViewRx);
+}
+
+impl<G: Served> NewRoom for Room<G> {
+    fn start(
+        self: Box<Self>,
+        host: &RoomHost,
+        id: RoomId,
+        setup: RoomSetup,
+    ) -> (RoomHandle, ViewRx) {
+        let (room, view) = RoomActor::new(*self, setup);
+        (host.start_as(id, room), view)
+    }
+}
+
+/// What a room starts with besides its game.
+#[derive(Default)]
+pub struct RoomSetup {
+    /// Private rooms: the code others join with, and the lobby that keeps
+    /// it.
+    pub code: Option<(String, Addr<LobbyActor>)>,
+    /// The players already seated, as a matched room has.
+    pub present: HashMap<PlayerId, Presence>,
+    /// Rated rooms: whom to rate, and where.
+    pub ratings: Option<Ratings>,
 }
 
 /// A room to join and play in, wherever it runs.
@@ -174,14 +266,11 @@ impl RoomHost {
 pub enum RoomHandle {
     Local {
         at: RoomRef,
-        addr: Addr<RoomActor>,
+        port: Arc<dyn RoomPort>,
     },
     /// On another server: keys go there through NATS, and its views come
     /// back.
-    Remote {
-        at: RoomRef,
-        cluster: Arc<Cluster>,
-    },
+    Remote { at: RoomRef, cluster: Arc<Cluster> },
 }
 
 impl RoomHandle {
@@ -193,111 +282,44 @@ impl RoomHandle {
 
     /// Lets `who` watch without a seat; `presence` shows they're still
     /// there.
-    pub fn watch(
-        &self,
-        who: Entrant,
-        presence: Presence,
-    ) -> impl Future<Output = Result<ViewRx, JoinError>> + use<> {
-        let room = self.clone();
-        async move {
-            match room {
-                RoomHandle::Local { addr, .. } => addr
-                    .send(Watch {
-                        id: who.id,
-                        presence,
-                    })
-                    .await
-                    .unwrap_or(Err(JoinError::Closed)),
-                RoomHandle::Remote { at, cluster } => {
-                    cluster.join_remote(at, who, presence, true).await
-                }
+    pub fn watch(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined> {
+        match self {
+            RoomHandle::Local { port, .. } => port.watch(who.id, presence),
+            RoomHandle::Remote { at, cluster } => {
+                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, true))
             }
         }
     }
 
     /// Takes a seat for `who`; `presence` shows the player is still there.
-    pub fn join(
-        &self,
-        who: Entrant,
-        presence: Presence,
-    ) -> impl Future<Output = Result<ViewRx, JoinError>> + use<> {
-        let room = self.clone();
-        async move {
-            match room {
-                RoomHandle::Local { addr, .. } => addr
-                    .send(Join { who, presence })
-                    .await
-                    .unwrap_or(Err(JoinError::Closed)),
-                RoomHandle::Remote { at, cluster } => {
-                    cluster.join_remote(at, who, presence, false).await
-                }
-            }
-        }
-    }
-
-    /// Steering waits in the room's mailbox; a full one drops it.
-    pub fn steer(&self, id: PlayerId, dir: Direction) {
+    pub fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined> {
         match self {
-            RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(Steer { id, dir });
-            }
+            RoomHandle::Local { port, .. } => port.join(who, presence),
             RoomHandle::Remote { at, cluster } => {
-                cluster.send_input(*at, id, InputKind::Steer(dir))
+                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, false))
             }
         }
     }
 
-    pub fn ready(&self, id: PlayerId) {
+    pub fn send(&self, id: PlayerId, cmd: RoomCmd) {
         match self {
-            RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(Ready(id));
-            }
-            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Ready),
+            RoomHandle::Local { port, .. } => port.send(id, cmd),
+            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, cmd),
         }
     }
 
     pub fn leave(&self, id: PlayerId) {
-        match self {
-            RoomHandle::Local { addr, .. } => addr.do_send(Leave(id)),
-            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Leave),
-        }
+        self.send(id, RoomCmd::Leave);
     }
 
-    /// The host adds a bot, or with `add` false, takes one out.
-    pub fn bot(&self, id: PlayerId, add: bool) {
-        match self {
-            RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(Bot { id, add });
-            }
-            RoomHandle::Remote { at, cluster } => {
-                let kind = if add {
-                    InputKind::AddBot
-                } else {
-                    InputKind::RemoveBot
-                };
-                cluster.send_input(*at, id, kind)
-            }
-        }
+    /// A move in a room of `G`.
+    pub fn play<G: Served>(&self, id: PlayerId, input: &G::Input) {
+        self.send(id, RoomCmd::Play(games::encode(input)));
     }
 
-    pub fn set_rules(&self, id: PlayerId, rules: Rules) {
-        match self {
-            RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(SetRules { id, rules });
-            }
-            RoomHandle::Remote { at, cluster } => {
-                cluster.send_input(*at, id, InputKind::Rules(rules))
-            }
-        }
-    }
-
-    pub fn ping(&self, id: PlayerId, rtt: Duration) {
-        match self {
-            RoomHandle::Local { addr, .. } => {
-                let _ = addr.try_send(Ping { id, rtt });
-            }
-            RoomHandle::Remote { at, cluster } => cluster.send_input(*at, id, InputKind::Ping(rtt)),
-        }
+    /// The host changes a room of `G`'s settings.
+    pub fn set_settings<G: Served>(&self, id: PlayerId, settings: &G::Settings) {
+        self.send(id, RoomCmd::Settings(games::encode(settings)));
     }
 }
 
@@ -305,6 +327,7 @@ impl RoomHandle {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Rated {
+    pub game: GameId,
     pub rating: Rating,
     pub won: bool,
 }
@@ -345,6 +368,7 @@ impl RatedNotify {
             } => {
                 let news = RatedAt {
                     player: *player,
+                    game: rated.game,
                     rating: rated.rating,
                     won: rated.won,
                 };
@@ -355,66 +379,35 @@ impl RatedNotify {
     }
 }
 
-/// What a rated room needs: everyone's rating, and where to save new ones.
+/// What a rated room needs: which rating it changes, everyone's, and where
+/// to save new ones.
 pub struct Ratings {
+    pub key: RatingKey,
     pub store: Store,
     pub members: HashMap<PlayerId, RatedMember>,
 }
 
 #[derive(Message)]
 #[rtype(result = "Result<ViewRx, JoinError>")]
-pub struct Join {
-    pub who: Entrant,
-    pub presence: Presence,
+struct Join {
+    who: Entrant,
+    presence: Presence,
 }
 
 /// Watching without a seat. A full room of watchers says
 /// [`JoinError::Full`].
 #[derive(Message)]
 #[rtype(result = "Result<ViewRx, JoinError>")]
-pub struct Watch {
-    pub id: PlayerId,
-    pub presence: Presence,
-}
-
-/// Gives up a seat, or stops watching.
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct Leave(pub PlayerId);
-
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct Steer {
-    pub id: PlayerId,
-    pub dir: Direction,
+struct Watch {
+    id: PlayerId,
+    presence: Presence,
 }
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct Ready(pub PlayerId);
-
-/// The host changes the rules of the room's next rounds.
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct SetRules {
-    pub id: PlayerId,
-    pub rules: Rules,
-}
-
-/// The host adds a bot, or takes one out.
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct Bot {
-    pub id: PlayerId,
-    pub add: bool,
-}
-
-/// A player's latest round trip, for everyone in the room to see.
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct Ping {
-    pub id: PlayerId,
-    pub rtt: Duration,
+struct Cmd {
+    id: PlayerId,
+    cmd: RoomCmd,
 }
 
 /// The server is stopping: finish the round in play, if any, then close.
@@ -422,12 +415,12 @@ pub struct Ping {
 #[rtype(result = "()")]
 pub struct Drain;
 
-pub struct RoomActor {
+pub struct RoomActor<G: Served> {
     /// Its id, and the list of this server's rooms it leaves on closing.
     registered: Option<(RoomId, LocalRooms)>,
-    round: Round,
+    room: Room<G>,
     code: Option<String>,
-    view: watch::Sender<Arc<RoomView>>,
+    view: watch::Sender<Arc<dyn AnyRoomView>>,
     lobby: Option<Addr<LobbyActor>>,
     present: HashMap<PlayerId, Presence>,
     /// People watching without a seat.
@@ -446,7 +439,7 @@ pub struct RoomActor {
     closing_soon: bool,
 }
 
-impl Actor for RoomActor {
+impl<G: Served> Actor for RoomActor<G> {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
@@ -456,7 +449,7 @@ impl Actor for RoomActor {
     }
 
     fn stopped(&mut self, _: &mut Self::Context) {
-        debug!(code = ?self.code, "room closed");
+        debug!(game = %G::ID, code = ?self.code, "room closed");
         if let Some((id, rooms)) = self.registered.take() {
             rooms.remove(id);
         }
@@ -466,23 +459,22 @@ impl Actor for RoomActor {
     }
 }
 
-impl RoomActor {
-    /// A room for `round`, with the receiver for its view. `present` lists
-    /// the players already seated, as a matched room has; with `ratings`,
-    /// its rounds are rated.
-    pub fn new(
-        round: Round,
-        code: Option<String>,
-        lobby: Option<Addr<LobbyActor>>,
-        present: HashMap<PlayerId, Presence>,
-        ratings: Option<Ratings>,
-    ) -> (Self, ViewRx) {
+impl<G: Served> RoomActor<G> {
+    /// A room for `room`, with the receiver for its view.
+    pub fn new(room: Room<G>, setup: RoomSetup) -> (Self, ViewRx) {
+        let RoomSetup {
+            code,
+            present,
+            ratings,
+        } = setup;
+        let (code, lobby) = code.unzip();
         let pings = HashMap::new();
-        let (view, rx) = watch::channel(Arc::new(view_of(&round, &code, &[], &pings, 0)));
+        let first: Arc<dyn AnyRoomView> = Arc::new(view_of(&room, &code, &[], &pings, 0));
+        let (view, rx) = watch::channel(first);
         let now = Instant::now();
         let room = Self {
             registered: None,
-            round,
+            room,
             code,
             view,
             lobby,
@@ -502,7 +494,7 @@ impl RoomActor {
 
     fn schedule(&mut self, ctx: &mut Context<Self>) {
         let delay = self
-            .round
+            .room
             .until_next()
             .clamp(Duration::from_millis(1), Duration::from_secs(1));
         self.due = Instant::now() + delay;
@@ -511,26 +503,26 @@ impl RoomActor {
 
     fn on_timer(&mut self, ctx: &mut Context<Self>) {
         let now = Instant::now();
-        if self.round.in_play() {
+        if self.room.in_play() {
             TICK_LAG.record(now.saturating_duration_since(self.due));
         }
         let dt = now - self.last;
         self.last = now;
         self.drop_absent(ctx);
-        let Some(events) = self.guarded(ctx, |round| round.advance(dt)) else {
+        let Some(end) = self.guarded(ctx, |room| room.advance(dt)) else {
             return;
         };
-        self.on_events(events, ctx);
+        self.on_end(end, ctx);
         self.publish();
-        if self.round.is_empty() {
+        if self.room.is_empty() {
             return ctx.stop();
         }
-        if self.draining && !self.round.in_play() && !self.closing_soon {
+        if self.draining && !self.room.in_play() && !self.closing_soon {
             self.closing_soon = true;
             ctx.run_later(RESULTS_GRACE, |act, ctx| act.close(DRAINED, ctx));
         }
-        if self.round.settings.kind == RoomKind::Match
-            && matches!(self.view.borrow().phase, PhaseView::Results { .. })
+        if self.room.settings.kind == RoomKind::Match
+            && matches!(self.view.borrow().shell().phase, PhaseView::Results { .. })
             && self.over_since.get_or_insert(now).elapsed() > MATCH_LINGER
         {
             return self.close(MATCH_OVER, ctx);
@@ -559,19 +551,15 @@ impl RoomActor {
         }
         self.present.remove(&id);
         self.pings.remove(&id);
-        if let Some(events) = self.guarded(ctx, |round| round.leave(id)) {
-            self.on_events(events, ctx);
+        if let Some(end) = self.guarded(ctx, |room| room.leave(id)) {
+            self.on_end(end, ctx);
         }
     }
 
-    fn on_events(&mut self, events: Vec<RoundEvent>, ctx: &mut Context<Self>) {
-        for event in events {
-            let RoundEvent::Ended {
-                outcome,
-                placements,
-            } = event;
-            debug!(code = ?self.code, ?outcome, "round over");
-            self.rate(&outcome, &placements, ctx);
+    fn on_end(&mut self, end: Option<RoundEnd>, ctx: &mut Context<Self>) {
+        if let Some(end) = end {
+            debug!(game = %G::ID, code = ?self.code, ?end, "round over");
+            self.rate(end.placements(), ctx);
         }
     }
 
@@ -579,15 +567,12 @@ impl RoomActor {
     /// new ratings from the saved ones, saves them, tells each player, and
     /// shows the changes with the results. It finishes even if the room
     /// closes meanwhile.
-    fn rate(&mut self, outcome: &Outcome, placements: &[Placement], ctx: &mut Context<Self>) {
+    fn rate(&mut self, placements: &[Placement], ctx: &mut Context<Self>) {
         self.changes.clear();
         let Some(ratings) = &self.ratings else {
             return;
         };
-        let winner = match outcome {
-            Outcome::Won { winner, .. } => Some(winner.id),
-            Outcome::Draw { .. } => None,
-        };
+        let winner = game_api::winner(placements).map(|w| w.id);
         let rated = rated_players(placements, &ratings.members);
         // Rated against nobody: nothing changes.
         if rated.len() < 2 {
@@ -601,9 +586,9 @@ impl RoomActor {
             .iter()
             .map(|&(id, _, _)| (id, ratings.members.get(&id).map(|m| m.notify.clone())))
             .collect();
-        let (store, room) = (ratings.store.clone(), ctx.address());
+        let (key, store, room) = (ratings.key, ratings.store.clone(), ctx.address());
         actix::spawn(async move {
-            let changes = match store.rate_round(&players).await {
+            let changes = match store.rate_round(key, &players).await {
                 Ok(changes) => changes,
                 Err(e) => return warn!(error = %e, "couldn't save ratings"),
             };
@@ -613,6 +598,7 @@ impl RoomActor {
             {
                 if let Some(notify) = notify {
                     notify.send(Rated {
+                        game: key.game,
                         rating: after,
                         won: *won,
                     });
@@ -627,17 +613,17 @@ impl RoomActor {
         });
     }
 
-    /// Runs `f` on the round; a panic closes the room with a message for its
+    /// Runs `f` on the room; a panic closes it with a message for its
     /// players instead of killing the thread.
     fn guarded<R>(
         &mut self,
         ctx: &mut Context<Self>,
-        f: impl FnOnce(&mut Round) -> R,
+        f: impl FnOnce(&mut Room<G>) -> R,
     ) -> Option<R> {
-        match catch_unwind(AssertUnwindSafe(|| f(&mut self.round))) {
+        match catch_unwind(AssertUnwindSafe(|| f(&mut self.room))) {
             Ok(r) => Some(r),
             Err(_) => {
-                warn!(code = ?self.code, "a room panicked; closing it");
+                warn!(game = %G::ID, code = ?self.code, "a room panicked; closing it");
                 self.close(BROKEN, ctx);
                 None
             }
@@ -645,14 +631,14 @@ impl RoomActor {
     }
 
     fn publish(&mut self) {
-        if self.round.take_changed() {
+        if self.room.take_changed() {
             self.publish_now();
         }
     }
 
     fn publish_now(&mut self) {
         self.view.send_replace(Arc::new(view_of(
-            &self.round,
+            &self.room,
             &self.code,
             &self.changes,
             &self.pings,
@@ -661,12 +647,71 @@ impl RoomActor {
     }
 
     fn close(&mut self, reason: &str, ctx: &mut Context<Self>) {
-        let mut last = (**self.view.borrow()).clone();
-        last.phase = PhaseView::Closed {
-            reason: reason.to_string(),
-        };
-        self.view.send_replace(Arc::new(last));
+        let last = self.view.borrow().closed(reason);
+        self.view.send_replace(last);
         ctx.stop();
+    }
+
+    fn command(&mut self, id: PlayerId, cmd: RoomCmd, ctx: &mut Context<Self>) {
+        match cmd {
+            RoomCmd::Ready => {
+                self.guarded(ctx, |room| room.toggle_ready(id));
+                self.publish();
+            }
+            RoomCmd::Leave => {
+                self.leave(id, ctx);
+                self.publish();
+                if self.room.is_empty() {
+                    ctx.stop();
+                }
+            }
+            RoomCmd::Ping(rtt) => {
+                if !self.present.contains_key(&id) {
+                    return;
+                }
+                self.pings.insert(id, rtt);
+                // In play, the next tick's view carries it; otherwise show
+                // it now.
+                if !self.room.in_play() {
+                    self.publish_now();
+                }
+            }
+            RoomCmd::AddBot | RoomCmd::RemoveBot => {
+                let add = cmd == RoomCmd::AddBot;
+                let changed = self.guarded(ctx, |room| {
+                    if add {
+                        room.add_bot(id)
+                    } else {
+                        room.remove_bot(id)
+                    }
+                });
+                if changed == Some(true) {
+                    debug!(code = ?self.code, add, players = self.room.players(), "bots changed");
+                    self.publish();
+                }
+            }
+            RoomCmd::Play(bytes) => {
+                let Some(input) = games::decode::<G::Input>(&bytes) else {
+                    return;
+                };
+                let rtt = self.pings.get(&id).copied();
+                if let Some(end) = self.guarded(ctx, |room| room.play(id, input, rtt))
+                    && end.is_some()
+                {
+                    self.on_end(end, ctx);
+                    self.publish();
+                }
+            }
+            RoomCmd::Settings(bytes) => {
+                let Some(settings) = games::decode::<G::Settings>(&bytes) else {
+                    return;
+                };
+                if self.guarded(ctx, |room| room.set_settings(id, settings)) == Some(true) {
+                    debug!(code = ?self.code, "settings changed");
+                    self.publish();
+                }
+            }
+        }
     }
 }
 
@@ -691,32 +736,33 @@ fn rated_players(
         .collect()
 }
 
-fn view_of(
-    round: &Round,
+fn view_of<G: Served>(
+    room: &Room<G>,
     code: &Option<String>,
     changes: &[RatingChange],
     pings: &HashMap<PlayerId, Duration>,
     watchers: usize,
-) -> RoomView {
-    let mut view = round.view();
-    view.code.clone_from(code);
-    view.watchers = watchers;
-    if !view.placements.is_empty() {
-        view.ratings = changes.to_vec();
+) -> RoomView<G> {
+    let mut view = room.view();
+    let shell = &mut view.shell;
+    shell.code.clone_from(code);
+    shell.watchers = watchers;
+    if !shell.placements.is_empty() {
+        shell.ratings = changes.to_vec();
     }
-    for seat in &mut view.seats {
+    for seat in &mut shell.seats {
         seat.ping = pings.get(&seat.who.id).copied();
     }
     view
 }
 
-impl Handler<Join> for RoomActor {
+impl<G: Served> Handler<Join> for RoomActor<G> {
     type Result = Result<ViewRx, JoinError>;
 
     fn handle(&mut self, msg: Join, ctx: &mut Self::Context) -> Self::Result {
         let id = msg.who.id;
         let joined = self
-            .guarded(ctx, |round| round.join(msg.who))
+            .guarded(ctx, |room| room.join(msg.who))
             .unwrap_or(Err(JoinError::Closed));
         joined?;
         self.present.insert(id, msg.presence);
@@ -730,7 +776,7 @@ impl Handler<Join> for RoomActor {
 #[rtype(result = "()")]
 struct RatingsChanged(Vec<RatingChange>);
 
-impl Handler<RatingsChanged> for RoomActor {
+impl<G: Served> Handler<RatingsChanged> for RoomActor<G> {
     type Result = ();
 
     fn handle(&mut self, RatingsChanged(changes): RatingsChanged, _: &mut Self::Context) {
@@ -739,7 +785,7 @@ impl Handler<RatingsChanged> for RoomActor {
     }
 }
 
-impl Handler<Watch> for RoomActor {
+impl<G: Served> Handler<Watch> for RoomActor<G> {
     type Result = Result<ViewRx, JoinError>;
 
     fn handle(&mut self, Watch { id, presence }: Watch, _: &mut Self::Context) -> Self::Result {
@@ -753,95 +799,31 @@ impl Handler<Watch> for RoomActor {
     }
 }
 
-impl Handler<Leave> for RoomActor {
+impl<G: Served> Handler<Cmd> for RoomActor<G> {
     type Result = ();
 
-    fn handle(&mut self, Leave(id): Leave, ctx: &mut Self::Context) {
-        self.leave(id, ctx);
-        self.publish();
-        if self.round.is_empty() {
-            ctx.stop();
-        }
+    fn handle(&mut self, Cmd { id, cmd }: Cmd, ctx: &mut Self::Context) {
+        self.command(id, cmd, ctx);
     }
 }
 
-impl Handler<Steer> for RoomActor {
-    type Result = ();
-
-    fn handle(&mut self, msg: Steer, ctx: &mut Self::Context) {
-        self.guarded(ctx, |round| round.steer(msg.id, msg.dir));
-    }
-}
-
-impl Handler<SetRules> for RoomActor {
-    type Result = ();
-
-    fn handle(&mut self, SetRules { id, rules }: SetRules, ctx: &mut Self::Context) {
-        if self.guarded(ctx, |round| round.set_rules(id, rules)) == Some(true) {
-            debug!(code = ?self.code, "rules changed");
-            self.publish();
-        }
-    }
-}
-
-impl Handler<Bot> for RoomActor {
-    type Result = ();
-
-    fn handle(&mut self, Bot { id, add }: Bot, ctx: &mut Self::Context) {
-        let changed = self.guarded(ctx, |round| {
-            if add {
-                round.add_bot(id)
-            } else {
-                round.remove_bot(id)
-            }
-        });
-        if changed == Some(true) {
-            debug!(code = ?self.code, add, players = self.round.players(), "bots changed");
-            self.publish();
-        }
-    }
-}
-
-impl Handler<Ping> for RoomActor {
-    type Result = ();
-
-    fn handle(&mut self, Ping { id, rtt }: Ping, _: &mut Self::Context) {
-        if !self.present.contains_key(&id) {
-            return;
-        }
-        self.pings.insert(id, rtt);
-        // In play, the next tick's view carries it; otherwise show it now.
-        if !self.round.in_play() {
-            self.publish_now();
-        }
-    }
-}
-
-impl Handler<Drain> for RoomActor {
+impl<G: Served> Handler<Drain> for RoomActor<G> {
     type Result = ();
 
     fn handle(&mut self, _: Drain, ctx: &mut Self::Context) {
         self.draining = true;
-        if !self.round.in_play() {
+        if !self.room.in_play() {
             self.close(DRAINED, ctx);
         }
     }
 }
 
-impl Handler<Ready> for RoomActor {
-    type Result = ();
-
-    fn handle(&mut self, Ready(id): Ready, ctx: &mut Self::Context) {
-        self.guarded(ctx, |round| round.toggle_ready(id));
-        self.publish();
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use snake_core::round::{Placement, RoomKind, Round, RoundSettings, quick_rules};
+    use snake_core::round::{Placement, RoomKind, RoomSettings, Snake, quick_rules};
 
     use super::*;
+    use crate::games::view_of;
 
     #[test]
     fn only_accounts_are_rated_each_once() {
@@ -864,7 +846,6 @@ mod tests {
                     name: format!("p{id}"),
                 },
                 place: id as usize,
-                length: 3,
             })
             .collect();
         assert_eq!(
@@ -876,34 +857,68 @@ mod tests {
 
     #[actix_rt::test]
     async fn watchers_have_no_seats_and_only_so_many_fit() {
-        let settings = RoundSettings::new(quick_rules(), RoomKind::Private).unwrap();
-        let round = Round::new(settings, 1);
-        let (room, view) = RoomActor::new(round, None, None, HashMap::new(), None);
-        let room = room.start();
+        let settings = RoomSettings::new(quick_rules(), RoomKind::Private).unwrap();
+        let room = Room::<Snake>::new(settings, 1);
+        let (room, view) = RoomActor::new(room, RoomSetup::default());
+        let room: Arc<dyn RoomPort> = Arc::new(room.start());
         let seat = Arc::new(());
         let who = Entrant {
             id: 1,
             name: "~p1".into(),
         };
-        let presence = Arc::downgrade(&seat);
-        room.send(Join { who, presence }).await.unwrap().unwrap();
+        room.join(who, Arc::downgrade(&seat)).await.unwrap();
 
         let here: Vec<Arc<()>> = (0..=MAX_WATCHERS).map(|_| Arc::new(())).collect();
-        let watch = |i: usize| Watch {
-            id: 100 + i as PlayerId,
-            presence: Arc::downgrade(&here[i]),
-        };
+        let watch = |i: usize| room.watch(100 + i as PlayerId, Arc::downgrade(&here[i]));
         for i in 0..MAX_WATCHERS {
-            room.send(watch(i)).await.unwrap().unwrap();
+            watch(i).await.unwrap();
         }
-        let full = room.send(watch(MAX_WATCHERS)).await.unwrap();
+        let full = watch(MAX_WATCHERS).await;
         assert!(matches!(full, Err(JoinError::Full)));
-        assert_eq!(view.borrow().watchers, MAX_WATCHERS);
-        let seats: Vec<PlayerId> = view.borrow().seats.iter().map(|s| s.who.id).collect();
+        assert_eq!(view.borrow().shell().watchers, MAX_WATCHERS);
+        let seats: Vec<PlayerId> = view
+            .borrow()
+            .shell()
+            .seats
+            .iter()
+            .map(|s| s.who.id)
+            .collect();
         assert_eq!(seats, [1], "watchers have no seats");
 
-        room.send(Leave(100)).await.unwrap();
-        assert_eq!(view.borrow().watchers, MAX_WATCHERS - 1);
-        assert!(room.send(watch(MAX_WATCHERS)).await.unwrap().is_ok());
+        let mut view = view;
+        view.mark_unchanged();
+        room.send(100, RoomCmd::Leave);
+        view.changed().await.unwrap();
+        assert_eq!(view.borrow().shell().watchers, MAX_WATCHERS - 1);
+        assert!(watch(MAX_WATCHERS).await.is_ok());
+        let snake = view_of::<Snake>(Arc::clone(&*view.borrow())).expect("a Snake room");
+        assert_eq!(snake.settings.width, quick_rules().width);
+    }
+
+    #[actix_rt::test]
+    async fn moves_and_settings_arrive_as_bytes() {
+        let settings = RoomSettings::new(quick_rules(), RoomKind::Private).unwrap();
+        let (room, mut view) =
+            RoomActor::new(Room::<Snake>::new(settings, 1), RoomSetup::default());
+        let room: Arc<dyn RoomPort> = Arc::new(room.start());
+        let seat = Arc::new(());
+        let who = Entrant {
+            id: 1,
+            name: "~p1".into(),
+        };
+        room.join(who, Arc::downgrade(&seat)).await.unwrap();
+        let faster = snake_core::config::Rules {
+            tick_ms: 100,
+            ..quick_rules()
+        };
+        view.mark_unchanged();
+        room.send(1, RoomCmd::Settings(vec![0xff, 0xff]));
+        room.send(1, RoomCmd::Settings(games::encode(&faster)));
+        view.changed().await.unwrap();
+        let snake = view_of::<Snake>(Arc::clone(&*view.borrow())).unwrap();
+        assert_eq!(
+            snake.settings.tick_ms, 100,
+            "garbage is dropped, and the rest taken"
+        );
     }
 }

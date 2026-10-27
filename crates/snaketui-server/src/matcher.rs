@@ -1,16 +1,18 @@
-//! Who plays whom in quick play: players close in rating, from the same
-//! region first, with both limits widening the longer they wait.
+//! Who plays whom in quick play: players in the same pool, close in
+//! rating, from the same region first, with both limits widening the
+//! longer they wait.
 //!
 //! Plain logic on its own clock, so tests drive it by hand;
 //! [`crate::matchmaker::MatchmakerActor`] runs it once a second.
 
+use std::collections::{BTreeMap, HashMap};
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use snake_core::round::{MAX_PLAYERS, MIN_PLAYERS, PlayerId};
+use game_api::PlayerId;
 
-/// A match with fewer than a full room starts once its longest-waiting
-/// player has waited this long.
-pub const FILL_WAIT: Duration = Duration::from_secs(10);
+use crate::games::{PoolInfo, PoolKey};
+
 /// Players from other regions are considered once both sides have waited
 /// this long.
 pub const REGION_WAIT: Duration = Duration::from_secs(20);
@@ -36,6 +38,25 @@ pub fn regions_open(waited: Duration) -> bool {
     waited >= REGION_WAIT
 }
 
+/// How a pool's matches form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolRules {
+    /// How many players a match takes; a full one starts at once.
+    pub seats: RangeInclusive<usize>,
+    /// A match with fewer than a full room starts once its longest-waiting
+    /// player has waited this long.
+    pub fill_wait: Duration,
+}
+
+impl From<&PoolInfo> for PoolRules {
+    fn from(pool: &PoolInfo) -> Self {
+        Self {
+            seats: pool.seats.clone(),
+            fill_wait: pool.fill_wait,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ticket {
     pub player: PlayerId,
@@ -53,13 +74,21 @@ pub struct Group {
     pub region: String,
 }
 
-#[derive(Default)]
+/// One pool's queue.
 pub struct Matcher {
+    rules: PoolRules,
     /// Longest-waiting first.
     queue: Vec<Ticket>,
 }
 
 impl Matcher {
+    pub fn new(rules: PoolRules) -> Self {
+        Self {
+            rules,
+            queue: Vec::new(),
+        }
+    }
+
     /// Queues a player, replacing any ticket they already had.
     pub fn add(&mut self, ticket: Ticket) {
         self.remove(ticket.player);
@@ -88,8 +117,9 @@ impl Matcher {
     /// room of others within their rating window and allowed regions,
     /// taking the same region first and then the closest ratings. The match
     /// starts when the room is full, or with at least two players once that
-    /// longest-waiting player has waited [`FILL_WAIT`].
+    /// longest-waiting player has waited the pool's fill wait.
     pub fn run(&mut self, now: Duration) -> Vec<Group> {
+        let (min, max) = (*self.rules.seats.start(), *self.rules.seats.end());
         let waited = |t: &Ticket| now.saturating_sub(t.since);
         let mut taken = vec![false; self.queue.len()];
         let mut groups = Vec::new();
@@ -117,9 +147,9 @@ impl Matcher {
                 let (kx, ky) = (key(x), key(y));
                 kx.0.cmp(&ky.0).then(kx.1.total_cmp(&ky.1))
             });
-            picks.truncate(MAX_PLAYERS - 1);
+            picks.truncate(max - 1);
             let size = picks.len() + 1;
-            if size < MAX_PLAYERS && (size < MIN_PLAYERS || waited(anchor) < FILL_WAIT) {
+            if size < max && (size < min || waited(anchor) < self.rules.fill_wait) {
                 continue;
             }
             taken[a] = true;
@@ -144,6 +174,79 @@ impl Matcher {
     }
 }
 
+/// Every pool's queue. A player waits in one pool at a time.
+pub struct Pools {
+    pools: BTreeMap<PoolKey, Matcher>,
+    /// Which pool each waiting player is in.
+    of: HashMap<PlayerId, PoolKey>,
+    /// How each pool's matches form; `None` for pools no game here has.
+    rules: fn(&PoolKey) -> Option<PoolRules>,
+}
+
+impl Default for Pools {
+    /// The pools of the games this server serves.
+    fn default() -> Self {
+        Self::with_rules(|pool| pool.find().map(|(_, info)| info.into()))
+    }
+}
+
+impl Pools {
+    pub fn with_rules(rules: fn(&PoolKey) -> Option<PoolRules>) -> Self {
+        Self {
+            pools: BTreeMap::new(),
+            of: HashMap::new(),
+            rules,
+        }
+    }
+
+    /// Queues a player in `pool`, taking them out of any other, and
+    /// replacing any ticket they had. Says whether the pool exists.
+    pub fn add(&mut self, pool: &PoolKey, ticket: Ticket) -> bool {
+        let Some(rules) = (self.rules)(pool) else {
+            return false;
+        };
+        self.remove(ticket.player);
+        self.of.insert(ticket.player, pool.clone());
+        self.pools
+            .entry(pool.clone())
+            .or_insert_with(|| Matcher::new(rules))
+            .add(ticket);
+        true
+    }
+
+    pub fn remove(&mut self, player: PlayerId) -> bool {
+        let Some(pool) = self.of.remove(&player) else {
+            return false;
+        };
+        self.pools.get_mut(&pool).is_some_and(|m| m.remove(player))
+    }
+
+    /// Players waiting, in every pool.
+    pub fn len(&self) -> usize {
+        self.of.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.of.is_empty()
+    }
+
+    /// Forms every match it can in every pool at time `now`, and takes
+    /// those players out of the queue.
+    pub fn run(&mut self, now: Duration) -> Vec<(PoolKey, Group)> {
+        let mut formed = Vec::new();
+        for (pool, matcher) in &mut self.pools {
+            for group in matcher.run(now) {
+                for player in &group.players {
+                    self.of.remove(player);
+                }
+                formed.push((pool.clone(), group));
+            }
+        }
+        self.pools.retain(|_, m| !m.is_empty());
+        formed
+    }
+}
+
 /// The region most of `members` are in; a tie goes to the first member's.
 fn majority_region(members: &[&Ticket]) -> String {
     let count = |region: &str| members.iter().filter(|t| t.region == region).count();
@@ -158,9 +261,20 @@ fn majority_region(members: &[&Ticket]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use game_api::GameId;
+
     use super::*;
 
     const S: Duration = Duration::from_secs(1);
+    /// A full Snake room.
+    const FULL: usize = 8;
+
+    fn snake() -> PoolRules {
+        PoolRules {
+            seats: 2..=FULL,
+            fill_wait: 10 * S,
+        }
+    }
 
     fn ticket(player: PlayerId, rating: f64, region: &str, since: Duration) -> Ticket {
         Ticket {
@@ -172,7 +286,7 @@ mod tests {
     }
 
     fn queue(tickets: &[Ticket]) -> Matcher {
-        let mut m = Matcher::default();
+        let mut m = Matcher::new(snake());
         for t in tickets {
             m.add(t.clone());
         }
@@ -199,7 +313,7 @@ mod tests {
         let mut m = queue(&tickets);
         let groups = m.run(S);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].players.len(), MAX_PLAYERS);
+        assert_eq!(groups[0].players.len(), FULL);
         assert_eq!(groups[0].players[0], 1, "longest-waiting first");
         assert_eq!(m.len(), 1);
         assert!(m.run(5 * S).is_empty(), "alone");
@@ -243,7 +357,7 @@ mod tests {
         let mut m = queue(&tickets);
         let groups = m.run(25 * S);
         assert!(!groups[0].players.contains(&2), "{groups:?}");
-        assert_eq!(groups[0].players.len(), MAX_PLAYERS);
+        assert_eq!(groups[0].players.len(), FULL);
 
         let mut m = queue(&[
             ticket(1, 1000.0, "eu", Duration::ZERO),
@@ -274,5 +388,48 @@ mod tests {
         assert!(m.run(60 * S).is_empty());
         m.add(ticket(1, 1000.0, "eu", 50 * S));
         assert_eq!(m.len(), 1, "a second ticket replaces the first");
+    }
+
+    fn pool(name: &str) -> PoolKey {
+        PoolKey {
+            game: GameId::Snake,
+            pool: name.into(),
+        }
+    }
+
+    /// Duels take two at once; "ffa" is Snake's; anything else isn't
+    /// served.
+    fn pools() -> Pools {
+        Pools::with_rules(|key| match key.pool.as_str() {
+            "duel" => Some(PoolRules {
+                seats: 2..=2,
+                fill_wait: Duration::ZERO,
+            }),
+            "ffa" => Some(snake()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn pools_are_matched_apart_and_a_player_waits_in_one() {
+        let mut pools = pools();
+        for (player, name) in [(1, "duel"), (2, "ffa"), (3, "duel"), (4, "ffa")] {
+            assert!(pools.add(&pool(name), ticket(player, 1000.0, "eu", Duration::ZERO)));
+        }
+        assert!(!pools.add(&pool("chess"), ticket(5, 1000.0, "eu", Duration::ZERO)));
+        assert_eq!(pools.len(), 4);
+        let formed = pools.run(S);
+        assert_eq!(formed.len(), 1, "the ffa pool waits to fill: {formed:?}");
+        assert_eq!(formed[0].0, pool("duel"));
+        assert_eq!(formed[0].1.players, [1, 3]);
+        assert_eq!(pools.len(), 2);
+
+        // Queueing in another pool leaves the first.
+        assert!(pools.add(&pool("duel"), ticket(2, 1000.0, "eu", S)));
+        assert_eq!(pools.len(), 2);
+        assert!(pools.run(20 * S).is_empty(), "alone in each pool");
+        assert!(pools.remove(4));
+        assert!(!pools.remove(4));
+        assert_eq!(pools.len(), 1);
     }
 }

@@ -11,6 +11,7 @@ anyhow = "1.0.103"
 # Pinned exactly: seeded games must replay the same across builds.
 rand = "=0.10.2"
 ratatui = "0.30.2"
+game-api = { path = "crates/game-api" }
 snake-core = { path = "crates/snake-core" }
 snake-tui = { path = "crates/snake-tui" }
 

@@ -1420,6 +1420,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "game-api"
+version = "0.2.0"
+dependencies = [
+ "rand 0.10.2",
+ "serde",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3375,6 +3383,7 @@ name = "snake-core"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "game-api",
  "proptest",
  "rand 0.10.2",
  "serde",
@@ -3422,6 +3431,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "game-api",
  "libc",
  "percent-encoding",
  "postcard",

@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use self::rooms::{Export, Import};
 use self::wire::{Alive, decode, encode};
 use crate::config::ClusterConfig;
+use crate::games::GAMES;
 use crate::room::{LocalRooms, RoomRef, ServerId};
 
 /// How often a server says it's alive.
@@ -290,6 +291,7 @@ impl Cluster {
                         region: self.region.clone(),
                         load: (self.load)(),
                         draining: self.draining.load(Ordering::Relaxed),
+                        games: GAMES.iter().map(|g| g.info().id).collect(),
                     };
                     self.send(alive.clone(), &beat);
                 }

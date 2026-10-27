@@ -11,7 +11,7 @@ use common::rooms::*;
 use common::*;
 use russh::ChannelMsg;
 use snake_core::config::Rules;
-use snake_core::round::{Entrant, Outcome, RoomKind, Round, RoundEvent, RoundSettings};
+use snake_core::round::{Entrant, Room, RoomKind, RoomSettings};
 use snaketui_server::metrics::TICK_LAG;
 use tokio::time::{Instant, sleep};
 
@@ -38,13 +38,14 @@ async fn quick_play(p: &mut Player) {
 }
 
 /// The first seed whose first round, played with nobody pressing a key,
-/// ends the way `wanted` says, for `players` in a private room of `rules`.
-fn seed_where(players: u64, rules: &Rules, wanted: impl Fn(&Outcome, u64) -> bool) -> u64 {
-    let settings = RoundSettings::new(rules.clone(), RoomKind::Private).unwrap();
-    let tick = Duration::from_millis(settings.rules.tick_ms);
+/// ends the way `wanted` says, given its winner (`None` for a draw), for
+/// `players` in a private room of `rules`.
+fn seed_where(players: u64, rules: &Rules, wanted: impl Fn(Option<&Entrant>, u64) -> bool) -> u64 {
+    let settings = RoomSettings::new(rules.clone(), RoomKind::Private).unwrap();
+    let tick = Duration::from_millis(settings.game.tick_ms);
     (0..10_000)
         .find(|&seed| {
-            let mut round = Round::new(settings.clone(), seed);
+            let mut round = Room::new(settings.clone(), seed);
             for id in 1..=players {
                 round
                     .join(Entrant {
@@ -56,12 +57,12 @@ fn seed_where(players: u64, rules: &Rules, wanted: impl Fn(&Outcome, u64) -> boo
             }
             let started = round.view();
             assert!(
-                started.board.is_some(),
+                started.game.board.is_some(),
                 "everyone ready starts the countdown"
             );
             for step in 0..2_000u64 {
-                if let [RoundEvent::Ended { outcome, .. }] = round.advance(tick).as_slice() {
-                    return wanted(outcome, step);
+                if let Some(end) = round.advance(tick) {
+                    return wanted(game_api::winner(end.placements()), step);
                 }
             }
             false
@@ -89,9 +90,7 @@ async fn two_players_are_matched_and_see_the_countdown_and_each_other() {
 
 #[tokio::test]
 async fn a_round_where_everyone_crashes_at_once_is_a_draw_and_rooms_play_on() {
-    let seed = seed_where(2, &Rules::default(), |o, _| {
-        matches!(o, Outcome::Draw { .. })
-    });
+    let seed = seed_where(2, &Rules::default(), |winner, _| winner.is_none());
     let server = TestServer::with(|c| c.room_seed = Some(seed));
     let mut ann = guest(server.addr, "ann", 100, 30).await;
     let mut ben = guest(server.addr, "ben", 100, 30).await;

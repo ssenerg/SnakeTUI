@@ -6,18 +6,17 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use game_api::{Entrant, GameId, JoinError, PlayerId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use snake_core::config::Rules;
-use snake_core::geom::Direction;
-use snake_core::round::{Entrant, JoinError, PlayerId, RoomView};
 
+use crate::games::PoolKey;
 use crate::presence::Doing;
 use crate::rating::Rating;
-use crate::room::{RoomRef, ServerId};
+use crate::room::{RoomCmd, RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 8;
+pub const VERSION: u8 = 9;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -47,6 +46,8 @@ pub struct Alive {
     pub load: u32,
     /// Stopping: it takes no new matches.
     pub draining: bool,
+    /// The games it hosts matches of.
+    pub games: Vec<GameId>,
 }
 
 /// Twice a second, from the cluster's queue (`snaketui-matchmaker`). A new
@@ -60,6 +61,7 @@ pub struct QueueAlive {
 /// A player waiting for a match, sent to the cluster's queue.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueueTicket {
+    pub pool: PoolKey,
     pub who: Entrant,
     pub account: Option<AccountId>,
     pub rating: Rating,
@@ -87,6 +89,7 @@ pub struct MatchSeat {
 /// with the room, once everyone's seated.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct MakeMatch {
+    pub pool: PoolKey,
     pub seats: Vec<MatchSeat>,
 }
 
@@ -103,6 +106,7 @@ pub struct MatchedAt {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct RatedAt {
     pub player: PlayerId,
+    pub game: GameId,
     pub rating: Rating,
     pub won: bool,
 }
@@ -116,29 +120,22 @@ pub struct JoinRequest {
     pub watch: bool,
 }
 
+/// A room's view: its game, and the view as that game writes it
+/// ([`crate::games::AnyRoomView::to_wire`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireView {
+    pub game: GameId,
+    pub body: Vec<u8>,
+}
+
 /// The room as it is now, to start from.
-pub type JoinReply = Result<RoomView, JoinError>;
+pub type JoinReply = Result<WireView, JoinError>;
 
 /// A key from a player on another server.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Input {
     pub player: PlayerId,
-    pub kind: InputKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InputKind {
-    Steer(Direction),
-    Ready,
-    Leave,
-    /// The player's round trip, measured by their session.
-    Ping(Duration),
-    /// The host changes the rules of the room's next rounds.
-    Rules(Rules),
-    /// The host adds a bot.
-    AddBot,
-    /// The host takes the last bot out.
-    RemoveBot,
+    pub cmd: RoomCmd,
 }
 
 /// What are these accounts doing? Every other server answers for its own
@@ -154,26 +151,51 @@ pub struct StatusReply(pub Vec<(AccountId, Doing)>);
 
 #[cfg(test)]
 mod tests {
-    use snake_core::round::{RoomKind, Round, RoundSettings, quick_rules};
+    use std::sync::Arc;
+
+    use snake_core::round::{Room, RoomKind, RoomSettings, Snake, quick_rules};
 
     use super::*;
+    use crate::games::{self, AnyRoomView, view_of};
 
     #[test]
     fn a_running_room_crosses_the_wire_whole_and_small() {
-        let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+        let settings = RoomSettings::new(quick_rules(), RoomKind::Match).unwrap();
         let players = [1, 2, 3]
             .map(|id| Entrant {
                 id,
                 name: format!("p{id}"),
             })
             .to_vec();
-        let mut round = Round::new_match(settings, 7, players);
-        round.advance(std::time::Duration::from_secs(4));
-        let view = round.view();
-        assert!(view.board.is_some());
-        let bytes = encode(&view);
+        let mut room = Room::new_match(settings, 7, players);
+        room.advance(Duration::from_secs(4));
+        let view = room.view();
+        assert!(view.game.board.is_some());
+        let bytes = encode(&view.to_wire());
         assert!(bytes.len() < 400, "a 30x18 match is {} bytes", bytes.len());
-        assert_eq!(decode::<RoomView>(&bytes), Some(view));
+        let wire: WireView = decode(&bytes).unwrap();
+        let back = games::get(wire.game)
+            .unwrap()
+            .decode_view(&wire.body)
+            .unwrap();
+        assert_eq!(view_of::<Snake>(back).as_deref(), Some(&view));
+    }
+
+    #[test]
+    fn a_broken_view_is_not_read() {
+        let room = Room::new(
+            RoomSettings::new(quick_rules(), RoomKind::Private).unwrap(),
+            1,
+        );
+        let wire = room.view().to_wire();
+        let snake = games::get(GameId::Snake).unwrap();
+        assert!(
+            snake
+                .decode_view(&wire.body[..wire.body.len() / 2])
+                .is_none()
+        );
+        let view: Arc<dyn AnyRoomView> = snake.decode_view(&wire.body).unwrap();
+        assert_eq!(view.game(), GameId::Snake);
     }
 
     #[test]
@@ -183,6 +205,7 @@ mod tests {
             region: "eu".into(),
             load: 3,
             draining: false,
+            games: vec![GameId::Snake],
         };
         let mut bytes = encode(&alive()).to_vec();
         assert_eq!(decode(&bytes), Some(alive()));

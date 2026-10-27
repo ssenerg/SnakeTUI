@@ -16,7 +16,9 @@ use russh::ChannelId;
 use russh::server::Handle;
 use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
-use snake_core::round::{Entrant, JoinError, PhaseView, PlayerId};
+use snake_core::round::{
+    Entrant, JoinError, PhaseView, PlayerId, Room, RoomKind, RoomSettings, Snake,
+};
 use snake_tui::online::QueueRegion;
 use snake_tui::{App, Effect, Key, Screen, ui};
 use tokio::sync::mpsc;
@@ -25,14 +27,16 @@ use tracing::{debug, info, warn};
 use self::account::{JoinedRoom, PendingInvite};
 use crate::auth::Refused;
 use crate::backend::SshBackend;
+use crate::games::snake::quick_pool;
+use crate::games::{self, AnyRoomView};
 use crate::identity::{Player, nickname};
 use crate::input::{Budget, KeyParser, STATUS_QUERY};
-use crate::lobby::{CreateError, CreateRoom, FindRoom};
+use crate::lobby::{CodeUnavailable, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::{FRAME_HOLDS, PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
-use crate::room::{RESULTS_GRACE, RoomHandle, ViewRx};
+use crate::room::{RESULTS_GRACE, RoomCmd, RoomHandle, ViewRx};
 use crate::store::{Account, AccountData, now};
 use crate::tcp::TcpState;
 use crate::{Shared, Stopping};
@@ -613,7 +617,7 @@ impl SessionActor {
         let ping = self.ping.map_or(rtt, |old| (old * 3 + rtt) / 4);
         self.ping = Some(ping);
         if let Some(link) = &self.room {
-            link.room.ping(self.id, ping);
+            link.room.send(self.id, RoomCmd::Ping(ping));
         }
     }
 
@@ -677,29 +681,17 @@ impl SessionActor {
                 Effect::JoinRoom(code) => self.join_private(None, Some(code), ctx),
                 Effect::Steer(dir) => {
                     if let Some(link) = &self.room {
-                        link.room.steer(self.id, dir);
+                        link.room.play::<Snake>(self.id, &dir);
                     }
                 }
-                Effect::ToggleReady => {
-                    if let Some(link) = &self.room {
-                        link.room.ready(self.id);
-                    }
-                }
+                Effect::ToggleReady => self.tell_room(RoomCmd::Ready),
                 Effect::RoomRules(rules) => {
                     if let Some(link) = &self.room {
-                        link.room.set_rules(self.id, rules);
+                        link.room.set_settings::<Snake>(self.id, &rules);
                     }
                 }
-                Effect::AddBot => {
-                    if let Some(link) = &self.room {
-                        link.room.bot(self.id, true);
-                    }
-                }
-                Effect::RemoveBot => {
-                    if let Some(link) = &self.room {
-                        link.room.bot(self.id, false);
-                    }
-                }
+                Effect::AddBot => self.tell_room(RoomCmd::AddBot),
+                Effect::RemoveBot => self.tell_room(RoomCmd::RemoveBot),
                 Effect::PlayBots => self.shared.matchmaker.do_send(BotMatch(self.id)),
                 Effect::Watch(name) => self.watch(name, ctx),
                 Effect::LeaveRoom => self.leave_room(ctx),
@@ -726,6 +718,12 @@ impl SessionActor {
         }
     }
 
+    fn tell_room(&self, cmd: RoomCmd) {
+        if let Some(link) = &self.room {
+            link.room.send(self.id, cmd);
+        }
+    }
+
     /// The guest name others see, such as `~alice`.
     fn guest_name(&self) -> String {
         self.player
@@ -749,6 +747,7 @@ impl SessionActor {
         }
         self.queued = true;
         self.shared.matchmaker.do_send(Enqueue {
+            pool: quick_pool(),
             who: self.entrant(),
             account: self.account_id(),
             rating: self.rating(),
@@ -769,14 +768,16 @@ impl SessionActor {
         rules: Rules,
     ) -> impl std::future::Future<Output = Result<JoinedRoom, JoinFail>> + use<> {
         let lobby = self.shared.lobby.clone();
-        let seed = self.shared.cfg.room_seed;
+        let settings = RoomSettings::new(rules, RoomKind::Private);
+        let seed = self.shared.cfg.room_seed.unwrap_or_else(rand::random);
         let who = self.entrant();
         let presence = Arc::downgrade(&self.presence);
         async move {
-            let room = match lobby.send(CreateRoom { rules, seed }).await {
+            let settings = settings.ok_or(JoinFail::BoardTooSmall)?;
+            let room = Box::new(Room::new(settings, seed));
+            let room = match lobby.send(CreateRoom { room }).await {
                 Ok(Ok((_, room))) => room,
-                Ok(Err(CreateError::BoardTooSmall)) => return Err(JoinFail::BoardTooSmall),
-                Ok(Err(CreateError::Unavailable)) => return Err(JoinFail::Unavailable),
+                Ok(Err(CodeUnavailable)) => return Err(JoinFail::Unavailable),
                 Err(_) => return Err(JoinFail::Closed),
             };
             seat(room, who, presence).await
@@ -849,7 +850,10 @@ impl SessionActor {
             room.leave(self.id);
             return;
         }
-        let current = view.borrow().clone();
+        let Some(current) = snake_view(view.borrow().clone()) else {
+            room.leave(self.id);
+            return self.join_failed(JoinFail::Closed, ctx);
+        };
         if let Some(app) = self.app.as_mut() {
             app.enter_room(self.id, current);
         }
@@ -862,7 +866,7 @@ impl SessionActor {
         let stay = self.stays;
         let watch = self.watch_room(view, stay, ctx);
         if let Some(ping) = self.ping {
-            room.ping(self.id, ping);
+            room.send(self.id, RoomCmd::Ping(ping));
         }
         self.room = Some(RoomLink { room, watch, stay });
         self.report_status();
@@ -886,7 +890,13 @@ impl SessionActor {
             room.leave(self.id);
             return;
         }
-        let current = view.borrow().clone();
+        let Some(current) = snake_view(view.borrow().clone()) else {
+            room.leave(self.id);
+            if let Some(app) = self.app.as_mut() {
+                app.watch_failed(JoinFail::Closed.message().to_string());
+            }
+            return self.render(ctx);
+        };
         if let Some(app) = self.app.as_mut() {
             app.watch_room(self.id, friend, current);
         }
@@ -907,23 +917,23 @@ impl SessionActor {
                     }
                     let latest = view.borrow_and_update().clone();
                     let Some(app) = act.app.as_mut() else { return };
-                    if open {
-                        app.update_room(latest);
-                    } else {
+                    let reason = match &latest.shell().phase {
+                        PhaseView::Closed { reason } => Some(reason.clone()),
+                        _ => None,
+                    };
+                    match snake_view(latest) {
+                        Some(latest) if open => app.update_room(latest),
                         // The room is gone. Its last view may say why.
-                        let reason = match &latest.phase {
-                            PhaseView::Closed { reason } => Some(reason.clone()),
-                            _ => None,
-                        };
-                        app.room_closed(reason);
+                        _ => app.room_closed(reason),
                     }
                     if open && app.in_room() {
                         let watch = act.watch_room(view, stay, ctx);
                         if let Some(room) = act.room.as_mut() {
                             room.watch = watch;
                         }
-                    } else {
-                        act.room = None;
+                    } else if let Some(link) = act.room.take().filter(|_| open) {
+                        // The room carries on without this player: say so.
+                        link.room.leave(act.id);
                     }
                     act.report_status();
                     act.render(ctx);
@@ -946,6 +956,11 @@ enum Loaded {
     Account(AccountData),
     /// A guest: the saved nickname, if the key has one, settings and records.
     Guest(Option<String>, GameConfig, Records),
+}
+
+/// A room's view as the Snake screens draw it; `None` for another game's.
+fn snake_view(view: Arc<dyn AnyRoomView>) -> Option<Arc<snake_core::round::RoomView>> {
+    games::view_of::<Snake>(view)
 }
 
 /// Takes a seat in `room`.
@@ -1163,7 +1178,7 @@ impl SessionActor {
                 || a.online
                     .as_ref()
                     .and_then(|o| o.room.as_ref())
-                    .is_some_and(|r| !matches!(r.view.phase, PhaseView::Waiting { .. }))
+                    .is_some_and(|r| !matches!(r.view.shell.phase, PhaseView::Waiting { .. }))
         });
         if self.app.is_some() && !playing && self.last_input.elapsed() > idle {
             info!(peer = %self.peer, "idle; logging out");
@@ -1211,7 +1226,7 @@ impl SessionActor {
             .as_ref()
             .and_then(|a| a.online.as_ref())
             .and_then(|o| o.room.as_ref())
-            .map(|r| &r.view.phase);
+            .map(|r| &r.view.shell.phase);
         match phase {
             Some(PhaseView::Countdown { .. } | PhaseView::Running { .. }) => {}
             Some(PhaseView::Results { .. }) => {

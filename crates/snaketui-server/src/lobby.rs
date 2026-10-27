@@ -1,4 +1,4 @@
-//! Private rooms: making them, and finding one by its code.
+//! Private rooms, of any game: making them, and finding one by its code.
 //!
 //! In a cluster, codes are kept in the shared database, so a code made on
 //! one server finds its room from any other.
@@ -10,12 +10,10 @@ use actix::prelude::*;
 use std::time::Duration;
 
 use rand::RngExt;
-use snake_core::config::Rules;
-use snake_core::round::{RoomKind, Round, RoundSettings};
 use tracing::warn;
 
 use crate::cluster::Cluster;
-use crate::room::{RoomActor, RoomHandle, RoomHost, RoomRef};
+use crate::room::{NewRoom, RoomHandle, RoomHost, RoomRef, RoomSetup};
 use crate::store::{Store, now};
 
 /// Codes use letters and digits that can't be mistaken for each other: no
@@ -30,22 +28,16 @@ const CODE_TRIES: usize = 10;
 const CODES_REFRESH: Duration = Duration::from_secs(10 * 60);
 const CODES_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// The cluster's database couldn't keep a code just now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreateError {
-    /// Two snakes don't fit on a board with these rules.
-    BoardTooSmall,
-    /// The cluster's database couldn't keep a code just now.
-    Unavailable,
-}
+pub struct CodeUnavailable;
 
-/// Makes a private room with `rules`, made multiplayer-safe. The creator
-/// then joins it like anyone else.
+/// Starts `room` as a private room, with a code. The creator then joins it
+/// like anyone else.
 #[derive(Message)]
-#[rtype(result = "Result<(String, RoomHandle), CreateError>")]
+#[rtype(result = "Result<(String, RoomHandle), CodeUnavailable>")]
 pub struct CreateRoom {
-    pub rules: Rules,
-    /// Fixes the room's seed, for tests.
-    pub seed: Option<u64>,
+    pub room: Box<dyn NewRoom>,
 }
 
 /// The room with this code, if it's still open.
@@ -90,7 +82,7 @@ fn fresh_since() -> i64 {
 }
 
 /// A code no room in the cluster has, now kept for `at`.
-async fn claim_code(store: Store, at: RoomRef) -> Result<String, CreateError> {
+async fn claim_code(store: Store, at: RoomRef) -> Result<String, CodeUnavailable> {
     for _ in 0..CODE_TRIES {
         let code = new_code();
         match store.claim_code(&code, at, now(), fresh_since()).await {
@@ -98,11 +90,11 @@ async fn claim_code(store: Store, at: RoomRef) -> Result<String, CreateError> {
             Ok(false) => continue,
             Err(e) => {
                 warn!(error = %e, "couldn't keep a room code");
-                return Err(CreateError::Unavailable);
+                return Err(CodeUnavailable);
             }
         }
     }
-    Err(CreateError::Unavailable)
+    Err(CodeUnavailable)
 }
 
 impl Actor for LobbyActor {
@@ -124,12 +116,9 @@ impl Actor for LobbyActor {
 }
 
 impl Handler<CreateRoom> for LobbyActor {
-    type Result = ResponseActFuture<Self, Result<(String, RoomHandle), CreateError>>;
+    type Result = ResponseActFuture<Self, Result<(String, RoomHandle), CodeUnavailable>>;
 
-    fn handle(&mut self, msg: CreateRoom, _: &mut Self::Context) -> Self::Result {
-        let Some(settings) = RoundSettings::new(msg.rules, RoomKind::Private) else {
-            return Box::pin(fut::ready(Err(CreateError::BoardTooSmall)));
-        };
+    fn handle(&mut self, CreateRoom { room }: CreateRoom, _: &mut Self::Context) -> Self::Result {
         let id = self.host.new_id();
         let code: std::pin::Pin<Box<dyn Future<Output = _>>> = match &self.cluster {
             Some(_) => Box::pin(claim_code(self.store.clone(), self.host.at(id))),
@@ -140,18 +129,13 @@ impl Handler<CreateRoom> for LobbyActor {
                 Box::pin(std::future::ready(Ok(code)))
             }
         };
-        let seed = msg.seed.unwrap_or_else(rand::random);
         Box::pin(code.into_actor(self).map(move |code, act, ctx| {
             let code = code?;
-            let round = Round::new(settings, seed);
-            let (room, _) = RoomActor::new(
-                round,
-                Some(code.clone()),
-                Some(ctx.address()),
-                HashMap::new(),
-                None,
-            );
-            let room = act.host.start_as(id, room);
+            let setup = RoomSetup {
+                code: Some((code.clone(), ctx.address())),
+                ..RoomSetup::default()
+            };
+            let (room, _) = room.start(&act.host, id, setup);
             act.rooms.insert(code.clone(), room.clone());
             Ok((code, room))
         }))

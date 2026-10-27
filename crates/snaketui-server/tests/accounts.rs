@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use common::accounts::*;
 use common::*;
-use snake_core::round::{
-    Entrant, Outcome, RoomKind, Round, RoundEvent, RoundSettings, quick_rules,
-};
+use snake_core::round::{Entrant, Room, RoomKind, RoomSettings, quick_rules};
 use snaketui_server::rating::Rating;
 use snaketui_server::store::{RatedResult, Store};
 
@@ -184,8 +182,8 @@ async fn only_friends_can_be_invited() {
 /// The first seed whose quick-play match, with nobody pressing a key, is
 /// won by the player who queued first.
 fn first_player_wins_seed() -> u64 {
-    let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
-    let tick = Duration::from_millis(settings.rules.tick_ms);
+    let settings = RoomSettings::new(quick_rules(), RoomKind::Match).unwrap();
+    let tick = Duration::from_millis(settings.game.tick_ms);
     (0..10_000)
         .find(|&seed| {
             let players = [1, 2]
@@ -194,10 +192,10 @@ fn first_player_wins_seed() -> u64 {
                     name: id.to_string(),
                 })
                 .to_vec();
-            let mut round = Round::new_match(settings.clone(), seed, players);
+            let mut round = Room::new_match(settings.clone(), seed, players);
             for _ in 0..2_000 {
-                if let [RoundEvent::Ended { outcome, .. }] = round.advance(tick).as_slice() {
-                    return matches!(outcome, Outcome::Won { winner, .. } if winner.id == 1);
+                if let Some(end) = round.advance(tick) {
+                    return game_api::winner(end.placements()).is_some_and(|w| w.id == 1);
                 }
             }
             false

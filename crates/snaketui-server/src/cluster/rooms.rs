@@ -17,15 +17,14 @@ use actix_rt::ArbiterHandle;
 use anyhow::Result;
 use async_nats::{Message, Subscriber};
 use futures::StreamExt;
-use snake_core::round::{Entrant, JoinError, PhaseView, PlayerId, RoomView};
+use game_api::{Entrant, JoinError, PhaseView, PlayerId};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use super::Cluster;
-use super::wire::{Input, InputKind, JoinReply, JoinRequest, decode};
-use crate::room::{
-    Bot, Join, Leave, Ping, Ready, RoomId, RoomRef, ServerId, SetRules, Steer, ViewRx, Watch,
-};
+use super::wire::{Input, JoinReply, JoinRequest, WireView, decode};
+use crate::games::{self, AnyRoomView};
+use crate::room::{RoomCmd, RoomId, RoomRef, ServerId, ViewRx};
 
 pub const ROOM_LOST: &str = "The server running this room went away.";
 
@@ -45,7 +44,7 @@ struct Guest {
 
 /// A room on another server, with players here.
 pub(super) struct Import {
-    view: watch::Sender<Arc<RoomView>>,
+    view: watch::Sender<Arc<dyn AnyRoomView>>,
     /// Each player's session, to notice when it's gone.
     members: HashMap<PlayerId, Weak<()>>,
     feed: AbortHandle,
@@ -91,27 +90,18 @@ impl Cluster {
     }
 
     async fn seat_guest(self: &Arc<Self>, room: RoomId, request: JoinRequest) -> JoinReply {
-        let Some((addr, thread)) = self.rooms.get_with_thread(room) else {
+        let Some((port, thread)) = self.rooms.get_with_thread(room) else {
             return Err(JoinError::Closed);
         };
         let seat = Arc::new(());
         let player = request.who.id;
         let presence = Arc::downgrade(&seat);
         let view = if request.watch {
-            addr.send(Watch {
-                id: player,
-                presence,
-            })
-            .await
+            port.watch(player, presence).await
         } else {
-            addr.send(Join {
-                who: request.who,
-                presence,
-            })
-            .await
-        };
-        let view = view.unwrap_or(Err(JoinError::Closed))?;
-        let now = (**view.borrow()).clone();
+            port.join(request.who, presence).await
+        }?;
+        let now = view.borrow().to_wire();
         self.exports
             .lock()
             .unwrap()
@@ -195,18 +185,18 @@ impl Cluster {
                 self.exports.lock().unwrap().remove(&room);
                 return;
             }
-            let latest = view.borrow_and_update().clone();
-            self.send(subject.clone(), &*latest);
+            let latest = view.borrow_and_update().to_wire();
+            self.send(subject.clone(), &latest);
         }
     }
 
     fn take_input(&self, msg: &Message) {
-        let (Some(room), Some(Input { player, kind })) =
+        let (Some(room), Some(Input { player, cmd })) =
             (room_of(&msg.subject), decode(&msg.payload))
         else {
             return;
         };
-        let Some(addr) = self.rooms.get(room) else {
+        let Some(port) = self.rooms.get(room) else {
             return;
         };
         // Only for players from other servers who are in this room: a
@@ -220,39 +210,14 @@ impl Cluster {
         if !guest {
             return;
         }
-        match kind {
-            InputKind::Steer(dir) => {
-                let _ = addr.try_send(Steer { id: player, dir });
-            }
-            InputKind::Ready => {
-                let _ = addr.try_send(Ready(player));
-            }
-            InputKind::Ping(rtt) => {
-                let _ = addr.try_send(Ping { id: player, rtt });
-            }
-            InputKind::Rules(rules) => {
-                let _ = addr.try_send(SetRules { id: player, rules });
-            }
-            InputKind::AddBot => {
-                let _ = addr.try_send(Bot {
-                    id: player,
-                    add: true,
-                });
-            }
-            InputKind::RemoveBot => {
-                let _ = addr.try_send(Bot {
-                    id: player,
-                    add: false,
-                });
-            }
-            InputKind::Leave => {
-                addr.do_send(Leave(player));
-                let mut exports = self.exports.lock().unwrap();
-                if let Some(export) = exports.get_mut(&room) {
-                    export.guests.remove(&player);
-                    if export.guests.is_empty() {
-                        exports.remove(&room);
-                    }
+        let leaving = cmd == RoomCmd::Leave;
+        port.send(player, cmd);
+        if leaving {
+            let mut exports = self.exports.lock().unwrap();
+            if let Some(export) = exports.get_mut(&room) {
+                export.guests.remove(&player);
+                if export.guests.is_empty() {
+                    exports.remove(&room);
                 }
             }
         }
@@ -289,6 +254,11 @@ impl Cluster {
         };
         let reply: Option<JoinReply> = self.request(self.room_subject(at, "join"), &request).await;
         let now = reply.unwrap_or(Err(JoinError::Closed))?;
+        let Some(now) = read_view(&now) else {
+            // A game this server doesn't know: the seat goes back.
+            self.send_input(at, player, RoomCmd::Leave);
+            return Err(JoinError::Closed);
+        };
         let mut imports = self.imports.lock().unwrap();
         let import = match imports.entry(at) {
             Entry::Occupied(e) => e.into_mut(),
@@ -296,10 +266,10 @@ impl Cluster {
                 let Some(views) = views else {
                     // Its views stopped while we asked: it has just closed.
                     drop(imports);
-                    self.send_input(at, player, InputKind::Leave);
+                    self.send_input(at, player, RoomCmd::Leave);
                     return Err(JoinError::Closed);
                 };
-                let (view, _) = watch::channel(Arc::new(now));
+                let (view, _) = watch::channel(now);
                 let feed = tokio::spawn(Arc::clone(&self).take_views(at, views, view.clone()));
                 e.insert(Import {
                     view,
@@ -317,14 +287,14 @@ impl Cluster {
         self: Arc<Self>,
         at: RoomRef,
         mut views: Subscriber,
-        view: watch::Sender<Arc<RoomView>>,
+        view: watch::Sender<Arc<dyn AnyRoomView>>,
     ) {
         while let Some(msg) = views.next().await {
-            let Some(latest) = decode::<RoomView>(&msg.payload) else {
+            let Some(latest) = decode::<WireView>(&msg.payload).and_then(|w| read_view(&w)) else {
                 continue;
             };
-            let closed = matches!(latest.phase, PhaseView::Closed { .. });
-            view.send_replace(Arc::new(latest));
+            let closed = matches!(latest.shell().phase, PhaseView::Closed { .. });
+            view.send_replace(latest);
             if closed {
                 break;
             }
@@ -339,8 +309,8 @@ impl Cluster {
     }
 
     /// A key, or leaving, for a room on another server.
-    pub fn send_input(&self, at: RoomRef, player: PlayerId, kind: InputKind) {
-        if kind == InputKind::Leave {
+    pub fn send_input(&self, at: RoomRef, player: PlayerId, cmd: RoomCmd) {
+        if cmd == RoomCmd::Leave {
             let mut imports = self.imports.lock().unwrap();
             if let Some(import) = imports.get_mut(&at) {
                 import.members.remove(&player);
@@ -351,7 +321,7 @@ impl Cluster {
                 }
             }
         }
-        self.send(self.room_subject(at, "in"), &Input { player, kind });
+        self.send(self.room_subject(at, "in"), &Input { player, cmd });
     }
 
     /// Lets go of players whose server went quiet, closes rooms whose
@@ -368,11 +338,8 @@ impl Cluster {
         let mut left = Vec::new();
         self.imports.lock().unwrap().retain(|at, import| {
             if !peers.contains(&at.server) {
-                let mut last = (**import.view.borrow()).clone();
-                last.phase = PhaseView::Closed {
-                    reason: ROOM_LOST.to_string(),
-                };
-                import.view.send_replace(Arc::new(last));
+                let last = import.view.borrow().closed(ROOM_LOST);
+                import.view.send_replace(last);
                 import.feed.abort();
                 return false;
             }
@@ -391,11 +358,16 @@ impl Cluster {
         for (at, player) in left {
             let leave = Input {
                 player,
-                kind: InputKind::Leave,
+                cmd: RoomCmd::Leave,
             };
             self.send(self.room_subject(at, "in"), &leave);
         }
     }
+}
+
+/// A room's view from another server, if this server knows its game.
+fn read_view(wire: &WireView) -> Option<Arc<dyn AnyRoomView>> {
+    games::get(wire.game)?.decode_view(&wire.body)
 }
 
 /// The room in `<prefix>.room.<server>.<room>.<what>`.

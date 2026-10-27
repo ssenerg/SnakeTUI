@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let cfg = GameConfig {
-        rules: room.view.rules.clone(),
+        rules: room.view.settings.clone(),
         ..app.cfg.clone()
     };
     let hosting = room.hosting();
@@ -58,12 +58,16 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
         (None, true) => Line::styled(
             format!(
                 "Room for {} players · a change un-readies everyone",
-                room.view.max_players
+                room.view.shell.max_players
             ),
             dim,
         ),
         (None, false) => {
-            let host = room.view.host().map_or("the host", |h| h.who.name.as_str());
+            let host = room
+                .view
+                .shell
+                .host()
+                .map_or("the host", |h| h.who.name.as_str());
             Line::styled(format!("Only {host} can change these."), dim)
         }
     };

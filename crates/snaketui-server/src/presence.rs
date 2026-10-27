@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use actix::prelude::*;
+use game_api::{GameId, PlayerId};
 use serde::{Deserialize, Serialize};
-use snake_core::round::PlayerId;
 use tracing::warn;
 
 use crate::cluster::Cluster;
@@ -44,6 +44,8 @@ impl Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Doing {
     pub status: Status,
+    /// The game they have open.
+    pub game: GameId,
     /// The room they're playing in, which friends can watch.
     pub room: Option<RoomRef>,
 }
@@ -69,6 +71,7 @@ impl Doing {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invite {
     pub from: String,
+    pub game: GameId,
     pub room: RoomRef,
 }
 
@@ -88,6 +91,7 @@ pub struct Online {
     pub session: PlayerId,
     pub notices: Recipient<Notice>,
     pub status: Status,
+    pub game: GameId,
 }
 
 #[derive(Message)]
@@ -274,6 +278,7 @@ impl Handler<Online> for PresenceActor {
             notices: msg.notices,
             doing: Doing {
                 status: msg.status,
+                game: msg.game,
                 room: None,
             },
         });
@@ -391,6 +396,7 @@ mod tests {
                     session,
                     notices: inbox.clone().recipient(),
                     status,
+                    game: GameId::Snake,
                 })
                 .await
                 .unwrap();
@@ -425,6 +431,7 @@ mod tests {
                 session: 1,
                 doing: Doing {
                     status: Status::Room,
+                    game: GameId::Snake,
                     room: Some(room),
                 },
             })
@@ -438,6 +445,7 @@ mod tests {
                 session: 1,
                 doing: Doing {
                     status: Status::Watching,
+                    game: GameId::Snake,
                     room: Some(room),
                 },
             })

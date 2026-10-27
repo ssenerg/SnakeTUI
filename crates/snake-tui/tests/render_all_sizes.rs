@@ -11,7 +11,7 @@ use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
 use snake_core::round::RatingChange;
 use snake_core::round::{
-    Entrant, Outcome, PhaseView, RoomKind, RoomView, Round, RoundSettings, bot_entrant, quick_rules,
+    Entrant, PhaseView, Room, RoomKind, RoomSettings, RoomView, bot_entrant, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
 use snake_tui::online::BOTS_OFFERED_AFTER;
@@ -109,8 +109,8 @@ fn entrant(id: u64) -> Entrant {
 fn room_views(rules: &Rules) -> Vec<RoomView> {
     let mut views = Vec::new();
     let step = Duration::from_millis(100);
-    if let Some(settings) = RoundSettings::new(rules.clone(), RoomKind::Private) {
-        let mut round = Round::new(settings.clone(), 1);
+    if let Some(settings) = RoomSettings::new(rules.clone(), RoomKind::Private) {
+        let mut round = Room::new(settings.clone(), 1);
         round.join(entrant(1)).unwrap();
         views.push(round.view());
         for id in 2..=settings.max_players as u64 {
@@ -118,66 +118,60 @@ fn room_views(rules: &Rules) -> Vec<RoomView> {
         }
         round.toggle_ready(2);
         let mut lobby = round.view();
-        lobby.code = Some("K7M2QX".into());
+        lobby.shell.code = Some("K7M2QX".into());
         views.push(lobby);
         for id in 1..=settings.max_players as u64 {
             round.toggle_ready(id);
         }
         views.push(round.view());
-        while !matches!(round.view().phase, PhaseView::Results { .. }) {
+        while !matches!(round.view().shell.phase, PhaseView::Results { .. }) {
             round.advance(step);
-            if matches!(round.view().phase, PhaseView::Running { .. }) && views.len() < 5 {
+            if matches!(round.view().shell.phase, PhaseView::Running { .. }) && views.len() < 5 {
                 views.push(round.view());
             }
         }
         views.push(round.view());
     }
     // A private lobby full of bots, and a match against bots, played out.
-    if let Some(settings) = RoundSettings::new(rules.clone(), RoomKind::Private) {
-        let mut round = Round::new(settings, 1);
+    if let Some(settings) = RoomSettings::new(rules.clone(), RoomKind::Private) {
+        let mut round = Room::new(settings, 1);
         round.join(entrant(1)).unwrap();
         while round.add_bot(1) {}
         views.push(round.view());
     }
-    let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+    let settings = RoomSettings::new(quick_rules(), RoomKind::Match).unwrap();
     let bots = (0..3).map(bot_entrant);
-    let mut round = Round::new_match(
+    let mut round = Room::new_match(
         settings.clone(),
         3,
         [entrant(1)].into_iter().chain(bots).collect(),
     );
-    while !matches!(round.view().phase, PhaseView::Results { .. }) {
+    while !matches!(round.view().shell.phase, PhaseView::Results { .. }) {
         round.advance(step);
     }
     views.push(round.view());
 
-    let mut round = Round::new_match(settings, 2, (1..=8).map(entrant).collect());
+    let mut round = Room::new_match(settings, 2, (1..=8).map(entrant).collect());
     views.push(round.view());
     for _ in 0..40 {
         round.advance(step);
     }
     round.leave(1);
     views.push(round.view());
-    while !matches!(round.view().phase, PhaseView::Results { .. }) {
+    while !matches!(round.view().shell.phase, PhaseView::Results { .. }) {
         round.advance(step);
     }
     let over = round.view();
-    for outcome in [
-        Outcome::Won {
-            winner: entrant(1),
-            time_up: false,
-        },
-        Outcome::Won {
-            winner: entrant(2),
-            time_up: true,
-        },
-        Outcome::Draw { time_up: true },
-    ] {
+    // Player 1 or 2 wins, alone or tied with the next, in time or not.
+    for (first, tied, time_up) in [(1, false, false), (2, false, true), (1, true, true)] {
         let mut view = over.clone();
-        view.phase = PhaseView::Results {
-            outcome,
-            next_in: None,
-        };
+        let placements = &mut view.shell.placements;
+        placements.sort_by_key(|p| p.who.id != first);
+        for (i, p) in placements.iter_mut().enumerate() {
+            p.place = if i == 0 || (tied && i == 1) { 1 } else { i + 1 };
+        }
+        view.shell.phase = PhaseView::Results { next_in: None };
+        view.game.time_up = time_up;
         views.push(view);
     }
     // Every room screen again, with round trips from fast to awful, and
@@ -186,7 +180,7 @@ fn room_views(rules: &Rules) -> Vec<RoomView> {
         .iter()
         .map(|view| {
             let mut view = view.clone();
-            for (i, seat) in view.seats.iter_mut().enumerate() {
+            for (i, seat) in view.shell.seats.iter_mut().enumerate() {
                 let ms = [1, 45, 120, 999, 1500, 0][i % 6];
                 seat.ping = (ms > 0).then(|| Duration::from_millis(ms));
             }
@@ -336,13 +330,13 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     // Watching player 2 in each phase, with others watching too.
     let mut phases = Vec::new();
     for view in &views {
-        let phase = std::mem::discriminant(&view.phase);
+        let phase = std::mem::discriminant(&view.shell.phase);
         if phases.contains(&phase) {
             continue;
         }
         phases.push(phase);
         let mut watched = view.clone();
-        watched.watchers = 3;
+        watched.shell.watchers = 3;
         let mut app = account(Screen::JoiningToWatch);
         app.watch_room(99, entrant(2).name, Arc::new(watched));
         apps.push(app);
@@ -351,10 +345,11 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     // Results of a rated match, with ratings up and down.
     let mut rated = views
         .iter()
-        .rfind(|v| matches!(v.phase, PhaseView::Results { .. }))
+        .rfind(|v| matches!(v.shell.phase, PhaseView::Results { .. }))
         .expect("results")
         .clone();
-    rated.ratings = rated
+    rated.shell.ratings = rated
+        .shell
         .placements
         .iter()
         .enumerate()
@@ -370,7 +365,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     // A private lobby, signed in, with a notice.
     let lobby = views
         .iter()
-        .find(|v| v.code.is_some())
+        .find(|v| v.shell.code.is_some())
         .expect("a private lobby")
         .clone();
     let mut app = account(Screen::Room);
@@ -379,7 +374,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     apps.push(app);
     // Its rules: the host's, at the top, the bottom and in between, and
     // someone else's, told what the host changed.
-    let host = lobby.host().expect("a host").who.id;
+    let host = lobby.shell.host().expect("a host").who.id;
     for selected in [0, 7, 13] {
         let mut app = new_app(Screen::Room);
         app.enter_room(host, Arc::new(lobby.clone()));
@@ -395,7 +390,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     // to leave.
     let running = views
         .iter()
-        .find(|v| matches!(v.phase, PhaseView::Running { .. }))
+        .find(|v| matches!(v.shell.phase, PhaseView::Running { .. }))
         .expect("a running round");
     for me in [1, 99] {
         let mut app = new_app(Screen::Room);
@@ -501,7 +496,7 @@ fn round_trips_show_by_each_player() {
         name: format!("~p{id}"),
     };
     let timed = |mut view: RoomView| {
-        for seat in &mut view.seats {
+        for seat in &mut view.shell.seats {
             seat.ping = match seat.who.id {
                 1 => Some(ms(45)),
                 2 => Some(ms(1500)),
@@ -510,8 +505,8 @@ fn round_trips_show_by_each_player() {
         }
         Arc::new(view)
     };
-    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
-    let mut round = Round::new(settings, 1);
+    let settings = RoomSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Room::new(settings, 1);
     for id in 1..=3 {
         round.join(short(id)).unwrap();
     }
@@ -531,7 +526,7 @@ fn round_trips_show_by_each_player() {
     for id in 1..=3 {
         round.toggle_ready(id);
     }
-    while !matches!(round.view().phase, PhaseView::Running { .. }) {
+    while !matches!(round.view().shell.phase, PhaseView::Running { .. }) {
         round.advance(ms(100));
     }
     app.update_room(timed(round.view()));
@@ -544,8 +539,8 @@ fn round_trips_show_by_each_player() {
 
 #[test]
 fn only_the_host_sees_how_to_change_the_speed() {
-    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
-    let mut round = Round::new(settings, 1);
+    let settings = RoomSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Room::new(settings, 1);
     for id in 1..=2 {
         let name = format!("~p{id}");
         round.join(Entrant { id, name }).unwrap();
@@ -661,8 +656,8 @@ fn bots_are_marked_and_offered() {
         app.screen = screen;
         app
     };
-    let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
-    let mut round = Round::new(settings, 1);
+    let settings = RoomSettings::new(Rules::default(), RoomKind::Private).unwrap();
+    let mut round = Room::new(settings, 1);
     round.join(entrant(1)).unwrap();
     round.add_bot(1);
     round.add_bot(1);
@@ -683,7 +678,7 @@ fn bots_are_marked_and_offered() {
 
 #[test]
 fn watchers_follow_their_friend_and_are_counted() {
-    let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+    let settings = RoomSettings::new(quick_rules(), RoomKind::Match).unwrap();
     let players = vec![
         Entrant {
             id: 1,
@@ -694,12 +689,12 @@ fn watchers_follow_their_friend_and_are_counted() {
             name: "bob".into(),
         },
     ];
-    let mut round = Round::new_match(settings, 1, players);
-    while !matches!(round.view().phase, PhaseView::Running { .. }) {
+    let mut round = Room::new_match(settings, 1, players);
+    while !matches!(round.view().shell.phase, PhaseView::Running { .. }) {
         round.advance(Duration::from_millis(100));
     }
     let mut view = round.view();
-    view.watchers = 2;
+    view.shell.watchers = 2;
     let mut app = App::online(
         GameConfig::default(),
         Records::default(),

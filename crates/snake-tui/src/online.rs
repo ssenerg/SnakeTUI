@@ -8,7 +8,8 @@ use std::time::Duration;
 use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::records::Records;
 use snake_core::round::{
-    PhaseView, PlayerId, RoomKind, RoomView, SeatView, is_bot, max_players_for, quick_rules,
+    PhaseView, PlayerId, RacerView, RoomKind, RoomView, SeatView, is_bot, max_players_for,
+    quick_rules,
 };
 use snake_core::settings::{SETTINGS, room_settings};
 use zeroize::{Zeroize, Zeroizing};
@@ -366,35 +367,47 @@ pub struct InRoom {
 
 impl InRoom {
     pub fn my_seat(&self) -> Option<&SeatView> {
-        self.view.seat(self.me)
+        self.view.shell.seat(self.me)
+    }
+
+    /// The snake this seat has this round.
+    pub fn racer(&self, seat: &SeatView) -> Option<&RacerView> {
+        seat.slot
+            .and_then(|slot| self.view.game.racers.get(slot as usize))
     }
 
     /// The seat this player's screen follows: their own, or the friend's
     /// they watch.
     pub fn followed(&self) -> Option<&SeatView> {
         match &self.watching {
-            Some(friend) => self.view.seats.iter().find(|s| s.who.name == *friend),
+            Some(friend) => self.view.shell.seats.iter().find(|s| s.who.name == *friend),
             None => self.my_seat(),
         }
     }
 
     /// Whether this player sets the room's rules.
     pub fn hosting(&self) -> bool {
-        self.view.host().is_some_and(|h| h.who.id == self.me)
+        self.view.shell.host().is_some_and(|h| h.who.id == self.me)
     }
 
     /// Whether this player has a snake in the round being played.
     pub fn playing(&self) -> bool {
         matches!(
-            self.view.phase,
+            self.view.shell.phase,
             PhaseView::Countdown { .. } | PhaseView::Running { .. }
-        ) && self.my_seat().is_some_and(|s| s.slot.is_some() && s.alive)
+        ) && self
+            .my_seat()
+            .and_then(|s| self.racer(s))
+            .is_some_and(|r| r.alive)
     }
 }
 
 /// What the host changed, going from `old` to the rules in `room`.
 fn rules_changed(old: &Rules, room: &RoomView) -> String {
-    let host = room.host().map_or("The host", |h| h.who.name.as_str());
+    let host = room
+        .shell
+        .host()
+        .map_or("The host", |h| h.who.name.as_str());
     let value = |rules: &Rules, i: usize| {
         GameConfig {
             rules: rules.clone(),
@@ -404,13 +417,13 @@ fn rules_changed(old: &Rules, room: &RoomView) -> String {
     };
     let changed: Vec<usize> = room_settings()
         .into_iter()
-        .filter(|&i| value(old, i) != value(&room.rules, i))
+        .filter(|&i| value(old, i) != value(&room.settings, i))
         .collect();
     match changed[..] {
         [i] => format!(
             "{host} set {} to {}.",
             SETTINGS[i].label,
-            value(&room.rules, i)
+            value(&room.settings, i)
         ),
         _ => format!("{host} changed the rules."),
     }
@@ -664,14 +677,14 @@ impl App {
                     online.friends_from_room = false;
                     self.screen = Screen::Friends { selected: 0 };
                 }
-                Key::Char('e') if matches!(room.view.phase, PhaseView::Waiting { .. }) => {
+                Key::Char('e') if matches!(room.view.shell.phase, PhaseView::Waiting { .. }) => {
                     self.screen = Screen::RoomRules { selected: 0 };
                 }
                 _ => {}
             }
             return;
         }
-        let leave = match &room.view.phase {
+        let leave = match &room.view.shell.phase {
             PhaseView::Waiting { .. } => match key {
                 Key::Enter | Key::Char(' ' | 'r') => {
                     effects.push(Effect::ToggleReady);
@@ -681,7 +694,7 @@ impl App {
                 // at a time on the settings' grid. The room decides; its
                 // next view shows the speed.
                 Key::Left | Key::Right | Key::Char('a' | 'h' | 'd' | 'l') if room.hosting() => {
-                    let now = room.view.rules.tick_ms;
+                    let now = room.view.settings.tick_ms;
                     let next = if matches!(key, Key::Left | Key::Char('a' | 'h')) {
                         now.saturating_sub(1) / TICK_MS_STEP * TICK_MS_STEP
                     } else {
@@ -691,7 +704,7 @@ impl App {
                     if next != now {
                         let rules = Rules {
                             tick_ms: next,
-                            ..room.view.rules.clone()
+                            ..room.view.settings.clone()
                         };
                         effects.push(Effect::RoomRules(rules));
                     }
@@ -703,7 +716,7 @@ impl App {
                     false
                 }
                 Key::Char('b') if room.hosting() => {
-                    if room.view.seats.len() < room.view.max_players {
+                    if room.view.shell.seats.len() < room.view.shell.max_players {
                         effects.push(Effect::AddBot);
                     } else {
                         online.notice = Some("The room is full.".to_string());
@@ -711,7 +724,7 @@ impl App {
                     false
                 }
                 Key::Char('x') if room.hosting() => {
-                    if room.view.seats.iter().any(|s| is_bot(s.who.id)) {
+                    if room.view.shell.seats.iter().any(|s| is_bot(s.who.id)) {
                         effects.push(Effect::RemoveBot);
                     }
                     false
@@ -751,7 +764,7 @@ impl App {
                 }
             }
             PhaseView::Results { .. } => match key {
-                Key::Enter | Key::Char(' ') if room.view.kind == RoomKind::Match => {
+                Key::Enter | Key::Char(' ') if room.view.shell.kind == RoomKind::Match => {
                     effects.push(Effect::LeaveRoom);
                     self.leave_room();
                     self.choose(HomeItem::QuickPlay, effects);
@@ -773,7 +786,7 @@ impl App {
             .online
             .as_mut()
             .and_then(|o| o.room.take())
-            .map(|r| r.view.kind);
+            .map(|r| r.view.shell.kind);
         let at = match kind {
             Some(RoomKind::Private) => HomeItem::CreateRoom,
             _ => HomeItem::QuickPlay,
@@ -914,15 +927,15 @@ impl App {
                     1
                 };
                 let mut cfg = GameConfig {
-                    rules: room.view.rules.clone(),
+                    rules: room.view.settings.clone(),
                     ..GameConfig::default()
                 };
                 cfg.adjust(items[selected.min(items.len() - 1)], delta);
-                if cfg.rules == room.view.rules {
+                if cfg.rules == room.view.settings {
                     return;
                 }
                 // The room would refuse these too, without a word.
-                let players = room.view.seats.len();
+                let players = room.view.shell.seats.len();
                 match max_players_for(&cfg.rules) {
                     Some(fit) if fit >= players => effects.push(Effect::RoomRules(cfg.rules)),
                     _ => online.notice = Some(format!("{players} snakes don't fit on that board.")),
@@ -1090,7 +1103,7 @@ impl App {
 
     /// The room changed.
     pub fn update_room(&mut self, view: Arc<RoomView>) {
-        if let PhaseView::Closed { reason } = &view.phase {
+        if let PhaseView::Closed { reason } = &view.shell.phase {
             return self.room_closed(Some(reason.clone()));
         }
         let Some(online) = &mut self.online else {
@@ -1099,14 +1112,14 @@ impl App {
         let Some(room) = online.room.as_mut() else {
             return;
         };
-        let lobby = matches!(view.phase, PhaseView::Waiting { .. });
+        let lobby = matches!(view.shell.phase, PhaseView::Waiting { .. });
         let old = std::mem::replace(&mut room.view, view);
         if !room.playing() {
             room.confirm_leave = false;
         }
         // Everyone but the host hears what the host changed.
-        if lobby && old.rules != room.view.rules && !room.hosting() {
-            online.notice = Some(rules_changed(&old.rules, &room.view));
+        if lobby && old.settings != room.view.settings && !room.hosting() {
+            online.notice = Some(rules_changed(&old.settings, &room.view));
         }
         // A round starting pulls the player back from the friends list and
         // the rules.
@@ -1276,7 +1289,7 @@ impl App {
 mod tests {
     use ratatui::layout::Size;
     use snake_core::geom::Direction;
-    use snake_core::round::{Entrant, Round, RoundSettings};
+    use snake_core::round::{Entrant, Room, RoomSettings};
 
     use super::*;
 
@@ -1356,20 +1369,20 @@ mod tests {
     }
 
     fn matched_view() -> Arc<RoomView> {
-        let settings = RoundSettings::new(quick_rules(), RoomKind::Match).unwrap();
+        let settings = RoomSettings::new(quick_rules(), RoomKind::Match).unwrap();
         let players = [1, 2]
             .map(|id| Entrant {
                 id,
                 name: format!("~p{id}"),
             })
             .to_vec();
-        Arc::new(Round::new_match(settings, 1, players).view())
+        Arc::new(Room::new_match(settings, 1, players).view())
     }
 
     #[test]
     fn the_host_adds_bots_and_takes_them_out() {
-        let settings = RoundSettings::new(Rules::default(), RoomKind::Private).unwrap();
-        let mut round = Round::new(settings, 1);
+        let settings = RoomSettings::new(Rules::default(), RoomKind::Private).unwrap();
+        let mut round = Room::new(settings, 1);
         for id in 1..=2 {
             let name = format!("~p{id}");
             round.join(Entrant { id, name }).unwrap();
@@ -1438,8 +1451,8 @@ mod tests {
             tick_ms,
             ..Default::default()
         };
-        let settings = RoundSettings::new(rules, RoomKind::Private).unwrap();
-        let mut round = Round::new(settings, 1);
+        let settings = RoomSettings::new(rules, RoomKind::Private).unwrap();
+        let mut round = Room::new(settings, 1);
         for id in 1..=2 {
             let name = format!("~p{id}");
             round.join(Entrant { id, name }).unwrap();
@@ -1452,7 +1465,7 @@ mod tests {
         let speed = |tick_ms| {
             let rules = Rules {
                 tick_ms,
-                ..lobby(150).rules.clone()
+                ..lobby(150).settings.clone()
             };
             [Effect::RoomRules(rules)]
         };
@@ -1493,11 +1506,11 @@ mod tests {
         }
         let open = Rules {
             wall_mode: snake_core::config::WallMode::Open,
-            ..lobby(150).rules.clone()
+            ..lobby(150).settings.clone()
         };
         assert_eq!(host.handle(Key::Right), [Effect::RoomRules(open.clone())]);
         let mut changed = (*lobby(150)).clone();
-        changed.rules = open;
+        changed.settings = open;
         host.update_room(Arc::new(changed.clone()));
         assert_eq!(notice(&host), None, "the host knows what they did");
         assert_eq!(host.handle(Key::Esc), []);
@@ -1511,13 +1524,13 @@ mod tests {
         assert_eq!(guest.screen, Screen::RoomRules { selected: 1 });
         guest.update_room(Arc::new(changed.clone()));
         assert_eq!(notice(&guest), Some("~p1 set edge walls to none (wrap)."));
-        changed.rules.width = 40;
-        changed.rules.poison_interval_s = 0;
+        changed.settings.width = 40;
+        changed.settings.poison_interval_s = 0;
         guest.update_room(Arc::new(changed.clone()));
         assert_eq!(notice(&guest), Some("~p1 changed the rules."));
 
         // The round starting closes the rules.
-        changed.phase = PhaseView::Countdown {
+        changed.shell.phase = PhaseView::Countdown {
             left: Duration::from_secs(3),
         };
         guest.update_room(Arc::new(changed));
@@ -1531,7 +1544,7 @@ mod tests {
             height: 12,
             ..Rules::default()
         };
-        let mut round = Round::new(RoundSettings::new(rules, RoomKind::Private).unwrap(), 1);
+        let mut round = Room::new(RoomSettings::new(rules, RoomKind::Private).unwrap(), 1);
         for id in 1..=4 {
             let name = format!("~p{id}");
             round.join(Entrant { id, name }).unwrap();
@@ -1543,7 +1556,7 @@ mod tests {
         for _ in 0..20 {
             match &host.handle(Key::Left)[..] {
                 [Effect::RoomRules(rules)] => {
-                    assert!(round.set_rules(1, rules.clone()));
+                    assert!(round.set_settings(1, rules.clone()));
                     host.update_room(Arc::new(round.view()));
                 }
                 [] => break,
@@ -1552,11 +1565,11 @@ mod tests {
         }
         assert_eq!(notice(&host), Some("4 snakes don't fit on that board."));
         let narrower = Rules {
-            width: round.view().rules.width - 1,
-            ..round.view().rules
+            width: round.view().settings.width - 1,
+            ..round.view().settings
         };
         assert!(max_players_for(&narrower).is_none_or(|n| n < 4));
-        assert_eq!(round.view().max_players, 4);
+        assert_eq!(round.view().shell.max_players, 4);
     }
 
     #[test]
@@ -1564,7 +1577,7 @@ mod tests {
         let mut app = online();
         app.enter_room(1, matched_view());
         let mut closed = (*matched_view()).clone();
-        closed.phase = PhaseView::Closed {
+        closed.shell.phase = PhaseView::Closed {
             reason: "The match is over.".into(),
         };
         app.update_room(Arc::new(closed));
@@ -1724,7 +1737,7 @@ mod tests {
         // Watching bob, in a match without a seat: no keys play.
         app.screen = Screen::JoiningToWatch;
         let mut view = (*matched_view()).clone();
-        view.seats[0].who.name = "bob".into();
+        view.shell.seats[0].who.name = "bob".into();
         app.watch_room(9, "bob".into(), Arc::new(view));
         assert_eq!(app.screen, Screen::Room);
         let room = app.online.as_ref().unwrap().room.as_ref().unwrap();

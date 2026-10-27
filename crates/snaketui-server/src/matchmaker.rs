@@ -1,7 +1,7 @@
 //! The quick-play queue, as each server sees it.
 //!
-//! On its own, a server runs the [`Matcher`] once a second and starts a room
-//! for every match it forms. In a cluster, it sends its waiting players to
+//! On its own, a server runs its [`Pools`] once a second and starts a room
+//! for every match they form, of the pool's game. In a cluster, it sends its waiting players to
 //! the cluster's queue (`snaketui-matchmaker`, see [`crate::queue_service`])
 //! instead. It then hosts the matches the queue gives it, and passes its
 //! players on to matches hosted elsewhere.
@@ -11,22 +11,20 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
-use snake_core::round::{
-    Entrant, PlayerId, RoomKind, Round, RoundSettings, bot_entrant, quick_rules,
-};
+use game_api::{Entrant, PlayerId, RatingKey};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::cluster::Cluster;
 use crate::cluster::wire::{
-    InputKind, MadeMatch, MakeMatch, MatchSeat, MatchedAt, QueueAlive, QueueLeave, QueueTicket,
-    RatedAt, decode,
+    MadeMatch, MakeMatch, MatchedAt, QueueAlive, QueueLeave, QueueTicket, RatedAt, decode,
 };
-use crate::matcher::{Matcher, Ticket};
+use crate::games::{self, PoolKey};
+use crate::matcher::{Pools, Ticket};
 use crate::rating::Rating;
 use crate::room::{
-    Drain, Presence, Rated, RatedMember, RatedNotify, Ratings, RoomActor, RoomHandle, RoomHost,
-    ViewRx,
+    Drain, Presence, Rated, RatedMember, RatedNotify, Ratings, RoomCmd, RoomHandle, RoomHost,
+    RoomSetup, ViewRx,
 };
 use crate::store::{AccountId, Store};
 
@@ -37,13 +35,13 @@ const RESEND_EVERY: Duration = Duration::from_secs(15);
 /// In a cluster: how long a player's server waits for news of their rating
 /// after their match started elsewhere.
 const RATED_WAIT: Duration = Duration::from_secs(15 * 60);
-/// Bots in a match against bots.
-const BOT_MATCH_BOTS: usize = 3;
 
-/// Puts a player in the queue. They get [`Matched`] once a match forms.
+/// Puts a player in `pool`'s queue. They get [`Matched`] once a match
+/// forms.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Enqueue {
+    pub pool: PoolKey,
     pub who: Entrant,
     pub account: Option<AccountId>,
     pub rating: Rating,
@@ -72,6 +70,7 @@ pub struct Matched {
 }
 
 struct Waiter {
+    pool: PoolKey,
     who: Entrant,
     account: Option<AccountId>,
     rating: Rating,
@@ -85,7 +84,7 @@ struct Waiter {
 /// Who makes the matches.
 enum Queue {
     /// This server, for its own players.
-    Here { matcher: Matcher, epoch: Instant },
+    Here { matcher: Pools, epoch: Instant },
     /// The cluster's queue.
     Cluster {
         cluster: Arc<Cluster>,
@@ -102,7 +101,6 @@ pub struct MatchmakerActor {
     waiting: HashMap<PlayerId, Waiter>,
     host: Arc<RoomHost>,
     store: Store,
-    settings: RoundSettings,
     seed: Option<u64>,
     queue_len: watch::Sender<usize>,
     /// The server is stopping: no new matches here.
@@ -127,7 +125,7 @@ impl MatchmakerActor {
                 rated: HashMap::new(),
             },
             None => Queue::Here {
-                matcher: Matcher::default(),
+                matcher: Pools::default(),
                 epoch: Instant::now(),
             },
         };
@@ -136,8 +134,6 @@ impl MatchmakerActor {
             waiting: HashMap::new(),
             host,
             store,
-            settings: RoundSettings::new(quick_rules(), RoomKind::Match)
-                .expect("the quick-play board fits a full room"),
             seed,
             queue_len,
             draining: false,
@@ -175,6 +171,7 @@ impl MatchmakerActor {
         let subject = cluster.subject("queue.join");
         for w in waiters {
             let ticket = QueueTicket {
+                pool: w.pool.clone(),
                 who: w.who.clone(),
                 account: w.account,
                 rating: w.rating,
@@ -195,7 +192,10 @@ impl MatchmakerActor {
         if self.draining {
             return;
         }
-        for group in matcher.run(epoch.elapsed()) {
+        for (pool, group) in matcher.run(epoch.elapsed()) {
+            let Some((game, info)) = pool.find() else {
+                continue;
+            };
             let waiters: Vec<Waiter> = group
                 .players
                 .iter()
@@ -218,14 +218,23 @@ impl MatchmakerActor {
                 })
                 .collect();
             let ratings = Ratings {
+                key: RatingKey {
+                    game: pool.game,
+                    category: info.category,
+                },
                 store: self.store.clone(),
                 members,
             };
             let seed = self.seed.unwrap_or_else(rand::random);
-            let round = Round::new_match(self.settings.clone(), seed, entrants);
-            let (room, view) = RoomActor::new(round, None, None, present, Some(ratings));
-            let room = self.host.start(room);
-            debug!(players = waiters.len(), region = %group.region, "match formed");
+            let setup = RoomSetup {
+                present,
+                ratings: Some(ratings),
+                ..RoomSetup::default()
+            };
+            let (room, view) =
+                game.new_match(info, seed, entrants)
+                    .start(&self.host, self.host.new_id(), setup);
+            debug!(%pool, players = waiters.len(), region = %group.region, "match formed");
             for w in waiters {
                 w.reply.do_send(Matched {
                     room: room.clone(),
@@ -238,10 +247,11 @@ impl MatchmakerActor {
 
     /// Starts a match the cluster's queue picked this server for. Players
     /// here are told at once; the others' servers are sent word.
-    fn host_match(&mut self, seats: Vec<MatchSeat>) -> MadeMatch {
+    fn host_match(&mut self, MakeMatch { pool, seats }: MakeMatch) -> MadeMatch {
         let Queue::Cluster { cluster, .. } = &self.queue else {
             return None;
         };
+        let (game, info) = pool.find()?;
         if self.draining {
             return None;
         }
@@ -283,18 +293,28 @@ impl MatchmakerActor {
             members.insert(player, member);
         }
         let ratings = Ratings {
+            key: RatingKey {
+                game: pool.game,
+                category: info.category,
+            },
             store: self.store.clone(),
             members,
         };
         let seed = self.seed.unwrap_or_else(rand::random);
         let entrants = seats.iter().map(|s| s.who.clone()).collect();
-        let round = Round::new_match(self.settings.clone(), seed, entrants);
-        let (room, view) = RoomActor::new(round, None, None, present, Some(ratings));
-        let room = self.host.start_as(id, room);
+        let setup = RoomSetup {
+            present,
+            ratings: Some(ratings),
+            ..RoomSetup::default()
+        };
+        let (room, view) = game
+            .new_match(info, seed, entrants)
+            .start(&self.host, id, setup);
         if let Some((_, thread)) = self.host.rooms().get_with_thread(id) {
             cluster.start_sending(id, &thread, view.clone());
         }
         debug!(
+            %pool,
             players = seats.len(),
             from_elsewhere = elsewhere.len(),
             "hosting a match"
@@ -331,7 +351,7 @@ impl MatchmakerActor {
             .remove(&player)
             .filter(|w| w.presence.strong_count() > 0)
         else {
-            cluster.send_input(room, player, InputKind::Leave);
+            cluster.send_input(room, player, RoomCmd::Leave);
             return;
         };
         rated.insert(player, (w.on_rated.clone(), Instant::now()));
@@ -360,6 +380,7 @@ impl MatchmakerActor {
             && let Some((session, _)) = rated.remove(&news.player)
         {
             session.do_send(Rated {
+                game: news.game,
                 rating: news.rating,
                 won: news.won,
             });
@@ -447,7 +468,7 @@ impl StreamHandler<async_nats::Message> for MatchmakerActor {
                 self.heard_queue(alive);
             }
         } else if subject.ends_with(".make_match") {
-            let made = decode::<MakeMatch>(&msg.payload).and_then(|m| self.host_match(m.seats));
+            let made = decode::<MakeMatch>(&msg.payload).and_then(|m| self.host_match(m));
             if let (Some(reply), Queue::Cluster { cluster, .. }) = (msg.reply, &self.queue) {
                 cluster.send(reply.to_string(), &made);
             }
@@ -471,6 +492,7 @@ impl Handler<Enqueue> for MatchmakerActor {
 
     fn handle(&mut self, msg: Enqueue, _: &mut Self::Context) {
         let waiter = Waiter {
+            pool: msg.pool,
             who: msg.who,
             account: msg.account,
             rating: msg.rating,
@@ -482,12 +504,15 @@ impl Handler<Enqueue> for MatchmakerActor {
         };
         match &mut self.queue {
             Queue::Here { matcher, epoch } => {
-                matcher.add(Ticket {
+                let ticket = Ticket {
                     player: waiter.who.id,
                     rating: f64::from(waiter.rating.shown()),
                     region: waiter.region.clone(),
                     since: epoch.elapsed(),
-                });
+                };
+                if !matcher.add(&waiter.pool, ticket) {
+                    return warn!(pool = %waiter.pool, "no such pool to queue in");
+                }
                 self.queue_len.send_replace(matcher.len());
             }
             Queue::Cluster { cluster, .. } => {
@@ -515,19 +540,25 @@ impl Handler<BotMatch> for MatchmakerActor {
         if self.draining {
             return;
         }
+        let seed = self.seed.unwrap_or_else(rand::random);
+        let Some(room) = self.waiting.get(&id).and_then(|w| {
+            let game = games::get(w.pool.game)?;
+            game.bot_match(seed, w.who.clone())
+        }) else {
+            // Not waiting any more, or a game without bots: as they were.
+            return;
+        };
         let Some(waiter) = self.waiting.remove(&id) else {
             return;
         };
         self.unqueue(id);
-        let seed = self.seed.unwrap_or_else(rand::random);
-        let mut entrants = vec![waiter.who.clone()];
-        entrants.extend((0..BOT_MATCH_BOTS).map(bot_entrant));
-        let round = Round::new_match(self.settings.clone(), seed, entrants);
-        let present = HashMap::from([(id, waiter.presence.clone())]);
         // No ratings: nothing about it is saved.
-        let (room, view) = RoomActor::new(round, None, None, present, None);
-        let room = self.host.start(room);
-        debug!(player = id, "a match against bots");
+        let setup = RoomSetup {
+            present: HashMap::from([(id, waiter.presence.clone())]),
+            ..RoomSetup::default()
+        };
+        let (room, view) = room.start(&self.host, self.host.new_id(), setup);
+        debug!(player = id, pool = %waiter.pool, "a match against bots");
         waiter.reply.do_send(Matched { room, view });
     }
 }

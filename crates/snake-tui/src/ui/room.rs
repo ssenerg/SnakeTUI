@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use snake_core::config::ColorSlot;
 use snake_core::geom::Point;
-use snake_core::round::{Entrant, Outcome, PhaseView, RoomKind, is_bot};
+use snake_core::round::{Entrant, PhaseView, RoomKind, is_bot};
 use snake_core::view::MatchView;
 
 use super::board::{BoardWidget, SnakeLook};
@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let Some(room) = app.online.as_ref().and_then(|o| o.room.as_ref()) else {
         return;
     };
-    match (&room.view.phase, &room.view.board) {
+    match (&room.view.shell.phase, &room.view.game.board) {
         (PhaseView::Waiting { starts_in }, _) => draw_lobby(frame, app, room, *starts_in),
         (_, Some(board)) => draw_match(frame, app, room, board),
         _ => {}
@@ -83,7 +83,8 @@ fn ping_style(ping: Duration) -> Style {
 }
 
 fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
-    let view = &room.view;
+    let view = &room.view.shell;
+    let rules = &room.view.settings;
     let online = app.online.as_ref();
     let watchers = u16::from(view.watchers > 0);
     let height = 12 + view.seats.len() as u16 + u16::from(room.hosting()) + watchers;
@@ -98,7 +99,7 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         lines.push(Line::from("Share it so friends can join.").style(dim()));
     }
     // The host can change the speed, so theirs stands out, with arrows.
-    let tick = format!("{} ms ticks", view.rules.tick_ms);
+    let tick = format!("{} ms ticks", rules.tick_ms);
     let tick = if room.hosting() {
         Span::styled(
             format!("◂ {tick} ▸"),
@@ -108,10 +109,7 @@ fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Dur
         Span::styled(tick, dim())
     };
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("{}×{} board · ", view.rules.width, view.rules.height),
-            dim(),
-        ),
+        Span::styled(format!("{}×{} board · ", rules.width, rules.height), dim()),
         tick,
         Span::styled(
             format!(" · {}/{} players", view.seats.len(), view.max_players),
@@ -253,8 +251,8 @@ fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
     let status = Rect::new(area.x, y0 + board_h, area.width, 1).intersection(area);
     let cropped = board_w < full_w || board_h < full_h;
 
-    let clock = match &room.view.phase {
-        PhaseView::Running { left } => {
+    let clock = match &room.view.shell.phase {
+        PhaseView::Running { left: Some(left) } => {
             let s = secs(*left);
             format!(" {:02}:{:02} ", s / 60, s % 60)
         }
@@ -302,9 +300,9 @@ fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
         Paragraph::new(status_line(room, cropped, need_w, need_h)).alignment(Alignment::Center),
         status,
     );
-    match &room.view.phase {
+    match &room.view.shell.phase {
         PhaseView::Countdown { left } => draw_countdown(frame, room, &looks, *left),
-        PhaseView::Results { outcome, next_in } => draw_results(frame, room, outcome, *next_in),
+        PhaseView::Results { next_in } => draw_results(frame, room, *next_in),
         _ => {}
     }
 }
@@ -317,8 +315,19 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let mut seats: Vec<_> = room.view.seats.iter().collect();
-    seats.sort_by_key(|s| std::cmp::Reverse((s.slot.is_some(), s.alive, s.length)));
+    // Each seat with whether its snake is alive, and its length.
+    let mut seats: Vec<_> = room
+        .view
+        .shell
+        .seats
+        .iter()
+        .map(|s| {
+            let racer = room.racer(s);
+            let alive = racer.is_some_and(|r| r.alive);
+            (s, alive, racer.map_or(0, |r| r.length))
+        })
+        .collect();
+    seats.sort_by_key(|&(s, alive, length)| std::cmp::Reverse((s.slot.is_some(), alive, length)));
     let followed = room.followed().map(|s| s.who.id);
     // Round trips go last, as numbers if names keep 8 columns, or else as
     // a dot in their color.
@@ -329,10 +338,10 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
     };
     let lines: Vec<Line> = seats
         .iter()
-        .map(|seat| {
+        .map(|&(seat, alive, length)| {
             let mut spans = Vec::new();
             match seat.slot.and_then(|slot| looks.get(slot as usize)) {
-                Some(look) if seat.alive => spans.push(Span::styled(
+                Some(look) if alive => spans.push(Span::styled(
                     format!(" {} ", seat.slot.unwrap_or(0) + 1),
                     Style::default()
                         .fg(Color::Black)
@@ -347,14 +356,14 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
-            } else if seat.alive {
+            } else if alive {
                 Style::default()
             } else {
                 dim()
             };
             spans.push(Span::styled(format!(" {name:<name_w$}"), style));
             if seat.slot.is_some() {
-                spans.push(Span::styled(format!("{:>4}", seat.length), style));
+                spans.push(Span::styled(format!("{length:>4}"), style));
             } else if ping_w > 0 {
                 spans.push(Span::raw("    "));
             }
@@ -371,10 +380,10 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
         })
         .collect();
     let mut lines = lines;
-    if room.view.watchers > 0 {
+    if room.view.shell.watchers > 0 {
         lines.push(Line::default());
         lines.push(Line::styled(
-            format!(" {} watching", room.view.watchers),
+            format!(" {} watching", room.view.shell.watchers),
             dim(),
         ));
     }
@@ -398,7 +407,7 @@ fn status_line(room: &InRoom, cropped: bool, need_w: u16, need_h: u16) -> Line<'
         return Line::styled(format!("Watching {friend} · Esc leave"), dim());
     }
     let seat = room.my_seat();
-    match &room.view.phase {
+    match &room.view.shell.phase {
         PhaseView::Countdown { .. } => Line::styled("Get ready…", warn),
         PhaseView::Running { .. } if seat.is_some_and(|s| s.slot.is_none()) => {
             Line::styled("Watching · you'll play the next round · Esc leave", dim())
@@ -446,21 +455,16 @@ fn draw_countdown(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], left: D
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
-fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Option<Duration>) {
-    let view = &room.view;
+fn draw_results(frame: &mut Frame, room: &InRoom, next_in: Option<Duration>) {
+    let view = &room.view.shell;
     let height = 9 + view.placements.len() as u16;
-    let (headline, color) = match outcome {
-        Outcome::Won { winner, .. } if winner.id == room.me => {
-            ("★ You win! ★".to_string(), Color::LightGreen)
-        }
-        Outcome::Won { winner, .. } => (format!("{} wins!", named(winner)), Color::LightCyan),
-        Outcome::Draw { .. } => ("Draw!".to_string(), Color::LightYellow),
+    let (headline, color) = match view.winner() {
+        Some(winner) if winner.id == room.me => ("★ You win! ★".to_string(), Color::LightGreen),
+        Some(winner) => (format!("{} wins!", named(winner)), Color::LightCyan),
+        None => ("Draw!".to_string(), Color::LightYellow),
     };
     let inner = dialog(frame, " RESULTS ", color, 48, height);
-    let time_up = matches!(
-        outcome,
-        Outcome::Won { time_up: true, .. } | Outcome::Draw { time_up: true }
-    );
+    let time_up = room.view.game.time_up;
     let mut lines = vec![
         Line::default(),
         Line::styled(
@@ -482,8 +486,9 @@ fn draw_results(frame: &mut Frame, room: &InRoom, outcome: &Outcome, next_in: Op
             Style::default()
         };
         let name: String = named(&p.who).chars().take(18).collect();
+        let length = room.view.game.racer(p.who.id).map_or(0, |r| r.length);
         let mut spans = vec![Span::styled(
-            format!("{:>2}. {name:<18} {:>4}", p.place, p.length),
+            format!("{:>2}. {name:<18} {length:>4}", p.place),
             style,
         )];
         // Rated matches: how the round moved each account's rating.

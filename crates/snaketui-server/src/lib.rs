@@ -11,6 +11,7 @@ pub mod auth;
 pub mod backend;
 pub mod cluster;
 pub mod config;
+pub mod games;
 pub mod identity;
 pub mod input;
 pub mod lobby;
@@ -89,8 +90,8 @@ impl Shared {
                 cluster: Arc::clone(cluster),
             });
         }
-        let addr = self.rooms.get(at.room)?;
-        Some(RoomHandle::Local { at, addr })
+        let port = self.rooms.get(at.room)?;
+        Some(RoomHandle::Local { at, port })
     }
 }
 
@@ -240,7 +241,7 @@ pub async fn serve(
         }
         shared.matchmaker.do_send(Drain);
         for room in shared.rooms.all() {
-            room.do_send(Drain);
+            room.drain();
         }
         let deadline = Instant::now() + drain;
         while (limits.open() > 0 || !shared.rooms.is_empty()) && Instant::now() < deadline {

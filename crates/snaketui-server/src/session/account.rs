@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix::prelude::*;
+use game_api::Game;
 use snake_core::config::GameConfig;
 use snake_core::records::Records;
-use snake_core::round::{JoinError, RoomKind};
+use snake_core::round::{JoinError, RoomKind, Snake};
 use snake_tui::Screen;
 use snake_tui::online::{
     FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile, RANKED_AFTER,
@@ -87,9 +88,11 @@ impl SessionActor {
             session: self.id,
             notices: ctx.address().recipient(),
             status: Status::Menu,
+            game: Snake::ID,
         });
         self.status = Some(Doing {
             status: Status::Menu,
+            game: Snake::ID,
             room: None,
         });
         if let Some(app) = self.app.as_mut() {
@@ -107,7 +110,7 @@ impl SessionActor {
         let room = app.online.as_ref().and_then(|o| o.room.as_ref());
         let status = match (app.screen, room) {
             (_, Some(room)) if room.watching.is_some() => Status::Watching,
-            (_, Some(room)) if room.view.kind == RoomKind::Match => Status::Match,
+            (_, Some(room)) if room.view.shell.kind == RoomKind::Match => Status::Match,
             (_, Some(_)) => Status::Room,
             (Screen::Finding, _) => Status::Queue,
             (
@@ -118,6 +121,7 @@ impl SessionActor {
         };
         let doing = Doing {
             status,
+            game: Snake::ID,
             room: self.room.as_ref().map(|link| link.room.at()),
         };
         if self.status != Some(doing) {
@@ -684,7 +688,7 @@ impl SessionActor {
             .online
             .as_ref()
             .and_then(|o| o.room.as_ref())
-            .is_some_and(|r| r.view.kind == RoomKind::Private);
+            .is_some_and(|r| r.view.shell.kind == RoomKind::Private);
         let room = self
             .room
             .as_ref()
@@ -723,6 +727,7 @@ impl SessionActor {
                 to: them.id,
                 notice: Notice::Invite(Invite {
                     from: me.username.clone(),
+                    game: Snake::ID,
                     room,
                 }),
             });
@@ -832,6 +837,10 @@ impl Handler<Rated> for SessionActor {
     type Result = ();
 
     fn handle(&mut self, msg: Rated, ctx: &mut Self::Context) {
+        // Only Snake's rating shows so far.
+        if msg.game != Snake::ID {
+            return;
+        }
         if let Some(account) = self.account.as_mut() {
             account.rating = msg.rating;
             account.games += 1;

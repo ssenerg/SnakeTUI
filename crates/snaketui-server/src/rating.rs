@@ -1,21 +1,16 @@
 //! Skill ratings for quick play: Weng-Lin, which rates free-for-all games
 //! of any size.
 
+use game_api::GameId;
 use serde::{Deserialize, Serialize};
 use skillratings::MultiTeamOutcome;
 use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
 
-/// Which rating: a game's, for one kind of play in it, such as chess's
-/// blitz. Each is rated on its own, never from another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RatingKey {
-    pub game: &'static str,
-    pub category: &'static str,
-}
+pub use game_api::RatingKey;
 
 /// Snake's quick play, every snake for itself.
 pub const SNAKE_QUICK: RatingKey = RatingKey {
-    game: "snake",
+    game: GameId::Snake,
     category: "ffa",
 };
 

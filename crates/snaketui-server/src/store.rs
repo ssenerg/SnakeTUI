@@ -25,7 +25,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 use tracing::{info, warn};
 
-use crate::rating::{self, Rating, SNAKE_QUICK};
+use crate::rating::{self, Rating, RatingKey, SNAKE_QUICK};
 use crate::room::{RoomRef, ServerId};
 
 /// The tables as they were before migrations, which is step 1. Frozen: a
@@ -315,7 +315,7 @@ ON CONFLICT DO NOTHING;
 /// The game whose settings the accounts' and players' `config` columns
 /// hold, and that their copies in `account_prefs` and `player_prefs` are
 /// kept for.
-const SNAKE: &str = SNAKE_QUICK.game;
+const SNAKE: &str = SNAKE_QUICK.game.as_str();
 
 /// Copies an account's quick-play rating, as just saved in `accounts`,
 /// into `ratings`, so the two stay the same until `ratings` is what's read.
@@ -331,7 +331,7 @@ async fn mirror_rating(conn: &mut AnyConnection, id: AccountId) -> Result<()> {
              games = excluded.games, wins = excluded.wins, rated_at = excluded.rated_at",
     )
     .bind(id)
-    .bind(SNAKE_QUICK.game)
+    .bind(SNAKE)
     .bind(SNAKE_QUICK.category)
     .bind(now())
     .execute(conn)
@@ -923,11 +923,13 @@ impl Store {
     /// ones saved now, saves them, and answers each account's rating
     /// before and after, in the same order. Rounds ending at once, with
     /// the same account in both, take turns, so neither overwrites the
-    /// other.
+    /// other. Only Snake's quick-play ratings are kept so far.
     pub async fn rate_round(
         &self,
+        key: RatingKey,
         players: &[(AccountId, usize, bool)],
     ) -> Result<Vec<(Rating, Rating)>> {
+        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
         let mut tx = self.pool.begin().await?;
         // Taking each row's lock first, in one order for every round.
         let mut ids: Vec<AccountId> = players.iter().map(|p| p.0).collect();
@@ -1818,7 +1820,7 @@ mod tests {
         // Ratings, as each account has them.
         let ben = account(&store, "ben", None).await;
         store
-            .rate_round(&[(ann.id, 1, true), (ben.id, 2, false)])
+            .rate_round(SNAKE_QUICK, &[(ann.id, 1, true), (ben.id, 2, false)])
             .await
             .unwrap();
         for id in [ann.id, ben.id] {
@@ -1935,7 +1937,7 @@ mod tests {
         store.save_rated_round(&results).await.unwrap();
 
         let changes = store
-            .rate_round(&[(ann.id, 2, false), (ben.id, 1, true)])
+            .rate_round(SNAKE_QUICK, &[(ann.id, 2, false), (ben.id, 1, true)])
             .await
             .unwrap();
         assert_eq!(changes[0].0, strong, "rated from what's saved");

@@ -7,10 +7,11 @@ publish = false
 
 [features]
 # Rooms' views as the server sends them between machines.
-serde = ["dep:serde"]
+serde = ["dep:serde", "game-api/serde"]
 
 [dependencies]
 anyhow.workspace = true
+game-api.workspace = true
 rand.workspace = true
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 
