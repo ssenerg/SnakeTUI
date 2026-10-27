@@ -137,9 +137,11 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         // Never read: once its buffers fill, what's written waits here.
-        let (_receiver, _) = listener.accept().unwrap();
+        let _receiver = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // The accepted end, as the server's are: the side that connects
+        // counts its opening (its SYN) as a byte acknowledged.
+        let (mut sender, _) = listener.accept().unwrap();
         sender.set_nonblocking(true).unwrap();
         let chunk = [7u8; 64 * 1024];
         let mut written = 0u64;
@@ -152,10 +154,12 @@ mod tests {
         }
         let state = state(&sender).unwrap();
         assert!(state.unsent > 0, "{state:?}");
-        assert_eq!(state.sent + u64::from(state.unsent), written, "{state:?}");
-        assert_eq!(state.resent, 0, "nothing is lost on loopback");
-        assert!(0 < state.acked && state.acked <= state.sent, "{state:?}");
-        assert_eq!(state.unacked(), written - state.acked);
+        // What was sent counts what was sent again: rare on loopback, but
+        // a busy machine can need it.
+        let once = state.sent - state.resent;
+        assert_eq!(once + u64::from(state.unsent), written, "{state:?}");
+        assert!(0 < state.acked && state.acked <= once, "{state:?}");
+        assert_eq!(state.unacked(), written - state.acked, "{state:?}");
         assert!(state.rtt < Duration::from_secs(1), "{state:?}");
     }
 
