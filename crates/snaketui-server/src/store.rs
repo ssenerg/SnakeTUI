@@ -9,7 +9,11 @@
 //! Guests without a key aren't stored. One server keeps everything in
 //! SQLite; several servers share one Postgres database. Both run the same
 //! queries; only the tables are declared separately.
+//!
+//! The tables change only through [`MIGRATIONS`], applied in order, once
+//! each, when a server opens the database.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,10 +23,13 @@ use snake_core::records::Records;
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
+use tracing::{info, warn};
 
 use crate::rating::{self, Rating};
 use crate::room::{RoomRef, ServerId};
 
+/// The tables as they were before migrations, which is step 1. Frozen: a
+/// change is a new step in [`MIGRATIONS`].
 const SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS players (
     fingerprint TEXT PRIMARY KEY,
@@ -179,6 +186,91 @@ CREATE INDEX IF NOT EXISTS room_codes_server ON room_codes (server);
 /// Postgres advisory lock they take.
 const SCHEMA_LOCK: &str = "SELECT pg_advisory_xact_lock(7462817301)";
 
+/// One change to the tables. Each is applied once, in order, and noted in
+/// `schema_migrations`.
+struct Migration {
+    /// What it does, as noted in `schema_migrations`.
+    name: &'static str,
+    sqlite: &'static str,
+    postgres: &'static str,
+    /// Whether code that doesn't know this step can't use the database
+    /// after it, as when it drops a column older code reads. Steps that only
+    /// add things don't: servers of the last version keep working while the
+    /// rest are upgraded.
+    breaks_older: bool,
+}
+
+/// Every change, oldest first; a step's version is its place in the list,
+/// from 1. Never edit or reorder a step that has shipped: add another.
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "the tables as first made",
+    sqlite: SQLITE_SCHEMA,
+    postgres: POSTGRES_SCHEMA,
+    breaks_older: false,
+}];
+
+/// Which steps a database has had. `needs` is the oldest code, by the
+/// number of steps it knows, that can still use it: 0 for a step that only
+/// adds things. Both databases take these types.
+const MIGRATIONS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    BIGINT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    needs      BIGINT NOT NULL,
+    applied_at BIGINT NOT NULL
+);
+";
+
+/// Applies the steps of [`MIGRATIONS`] the database hasn't had, inside the
+/// caller's transaction. Refuses a database that newer code has changed in
+/// a way this code can't work with.
+async fn migrate(conn: &mut AnyConnection, postgres: bool) -> Result<()> {
+    sqlx::raw_sql(MIGRATIONS_TABLE).execute(&mut *conn).await?;
+    let rows = sqlx::query("SELECT version, needs FROM schema_migrations")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut applied = HashSet::new();
+    let mut needs = 0;
+    for row in &rows {
+        applied.insert(row.try_get::<i64, _>(0)?);
+        needs = needs.max(row.try_get::<i64, _>(1)?);
+    }
+    let known = MIGRATIONS.len() as i64;
+    if needs > known {
+        bail!(
+            "the database was changed by newer code: it needs code that knows {needs} \
+             steps, and this server knows {known}"
+        );
+    }
+    if let Some(&newest) = applied.iter().max()
+        && newest > known
+    {
+        warn!(
+            newest,
+            known, "the database has steps this server doesn't know; carrying on"
+        );
+    }
+    for (version, step) in (1..).zip(MIGRATIONS) {
+        if applied.contains(&version) {
+            continue;
+        }
+        let sql = if postgres { step.postgres } else { step.sqlite };
+        sqlx::raw_sql(sql).execute(&mut *conn).await?;
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, needs, applied_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(version)
+        .bind(step.name)
+        .bind(if step.breaks_older { version } else { 0 })
+        .bind(now())
+        .execute(&mut *conn)
+        .await?;
+        info!(version, name = step.name, "database step applied");
+    }
+    Ok(())
+}
+
 /// Connections each server keeps to Postgres, at most.
 const POSTGRES_CONNECTIONS: u32 = 16;
 
@@ -307,7 +399,9 @@ async fn open_sqlite(url: &str) -> Result<AnyPool> {
         })
         .connect(url)
         .await?;
-    sqlx::raw_sql(SQLITE_SCHEMA).execute(&pool).await?;
+    let mut tx = pool.begin().await?;
+    migrate(&mut tx, false).await?;
+    tx.commit().await?;
     Ok(pool)
 }
 
@@ -322,7 +416,7 @@ async fn open_postgres(url: &str) -> Result<AnyPool> {
     sqlx::query("SET LOCAL client_min_messages = warning")
         .execute(&mut *tx)
         .await?;
-    sqlx::raw_sql(POSTGRES_SCHEMA).execute(&mut *tx).await?;
+    migrate(&mut tx, true).await?;
     tx.commit().await?;
     Ok(pool)
 }
@@ -1182,6 +1276,167 @@ mod tests {
         Store::open(&snaketui_test_services::postgres().await)
             .await
             .unwrap()
+    }
+
+    /// Runs each test on a new SQLite file and a new Postgres database,
+    /// given its URL, so it can open the database more than once.
+    macro_rules! on_both_urls {
+        ($($name:ident),* $(,)?) => {$(
+            mod $name {
+                #[actix_rt::test]
+                async fn sqlite() {
+                    let db = super::TempDb::new();
+                    super::$name(db.url()).await;
+                }
+
+                #[actix_rt::test]
+                async fn postgres() {
+                    super::$name(snaketui_test_services::postgres().await).await;
+                }
+            }
+        )*};
+    }
+
+    on_both_urls!(
+        steps_are_applied_once_and_noted,
+        a_database_from_before_migrations_is_taken_as_step_one,
+        newer_databases_are_refused_only_when_they_must_be,
+    );
+
+    /// A SQLite file in the temporary directory, removed afterwards.
+    struct TempDb(std::path::PathBuf);
+
+    impl TempDb {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let name = format!(
+                "snaketui-store-{}-{}.db",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            );
+            let db = Self(std::env::temp_dir().join(name));
+            db.remove();
+            db
+        }
+
+        fn url(&self) -> String {
+            format!("sqlite://{}", self.0.display())
+        }
+
+        fn remove(&self) {
+            for end in ["", "-wal", "-shm"] {
+                let mut path = self.0.clone().into_os_string();
+                path.push(end);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    /// A connection that migrates nothing, creating a SQLite file if need
+    /// be.
+    async fn raw(url: &str) -> AnyConnection {
+        sqlx::any::install_default_drivers();
+        if url.starts_with("sqlite") {
+            SqliteConnectOptions::from_str(url)
+                .unwrap()
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+        }
+        AnyConnection::connect(url).await.unwrap()
+    }
+
+    /// The steps the database at `url` has had.
+    async fn steps(url: &str) -> Vec<i64> {
+        let mut conn = raw(url).await;
+        sqlx::query("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get(0).unwrap())
+            .collect()
+    }
+
+    fn every_step() -> Vec<i64> {
+        (1..=MIGRATIONS.len() as i64).collect()
+    }
+
+    async fn steps_are_applied_once_and_noted(url: String) {
+        Store::open(&url).await.unwrap().close().await;
+        Store::open(&url).await.unwrap().close().await;
+        assert_eq!(steps(&url).await, every_step());
+    }
+
+    async fn a_database_from_before_migrations_is_taken_as_step_one(url: String) {
+        // As the code from before migrations left it, with a guest in it.
+        let mut conn = raw(&url).await;
+        let schema = if url.starts_with("sqlite") {
+            SQLITE_SCHEMA
+        } else {
+            POSTGRES_SCHEMA
+        };
+        sqlx::raw_sql(schema).execute(&mut conn).await.unwrap();
+        sqlx::query(
+            "INSERT INTO players (fingerprint, nick, config, last_seen) \
+             VALUES ('SHA256:old', 'olivia', '', 1)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = Store::open(&url).await.unwrap();
+        assert_eq!(steps(&url).await, every_step());
+        let saved = store.visit("SHA256:old", "someone").await.unwrap();
+        assert_eq!(saved.nick, "olivia", "what was there stays");
+    }
+
+    async fn newer_databases_are_refused_only_when_they_must_be(url: String) {
+        Store::open(&url).await.unwrap().close().await;
+        let known = MIGRATIONS.len() as i64;
+        let note = |version: i64, needs: i64| {
+            let url = url.clone();
+            async move {
+                let mut conn = raw(&url).await;
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, needs, applied_at) \
+                     VALUES ($1, 'from newer code', $2, 0)",
+                )
+                .bind(version)
+                .bind(needs)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            }
+        };
+        // A newer step that only adds things: this code carries on.
+        note(known + 1, 0).await;
+        Store::open(&url).await.unwrap().close().await;
+        // One that older code can't work with.
+        note(known + 2, known + 2).await;
+        let refused = Store::open(&url).await.err().unwrap().to_string();
+        assert!(refused.contains("newer code"), "{refused}");
+    }
+
+    #[actix_rt::test]
+    async fn postgres_servers_opening_at_once_take_turns() {
+        let url = snaketui_test_services::postgres().await;
+        let (a, b) = tokio::join!(Store::open(&url), Store::open(&url));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(steps(&url).await, every_step());
     }
 
     async fn settings_and_records_survive_a_reconnect(store: Store) {

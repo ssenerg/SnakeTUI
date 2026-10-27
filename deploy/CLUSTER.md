@@ -86,7 +86,13 @@ sudo ufw allow from 10.0.0.0/24 to any port 5432 proto tcp comment 'postgres'
 These ufw rules only count once ufw is on. If you turn it on for `db`, allow
 your own login first (`sudo ufw allow OpenSSH`), or you lock yourself out.
 
-The game servers create their tables on first start.
+The game servers create their tables on first start. A newer version that
+changes them does so when its first server starts, and notes each change in
+the `schema_migrations` table. Changes that only add something leave the
+servers still on the older version working, so you can upgrade them one at
+a time. A version that removes something older servers still use says so
+in its release notes. Upgrade every server to the version before it first.
+Once it has run, older servers refuse to start against that database.
 
 Each game server keeps up to 16 connections to Postgres. Postgres allows
 100 by default, which is enough for 5 servers. For more, raise
