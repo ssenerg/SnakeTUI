@@ -98,14 +98,14 @@ From then on, `ssh play-admin` is your admin login.
 ## 5. Install the game
 
 Download the server for your machine from the
-[releases page](https://github.com/ssenerg/SnakeTUI/releases). Set `VERSION`
+[releases page](https://github.com/ssenerg/game/releases). Set `VERSION`
 to the release you want:
 
 ```bash
 VERSION=v0.2.0
 NAME=snaketui-server-$VERSION-$(uname -m)-unknown-linux-gnu
 cd /tmp
-curl -fLO https://github.com/ssenerg/SnakeTUI/releases/download/$VERSION/$NAME.tar.gz
+curl -fLO https://github.com/ssenerg/game/releases/download/$VERSION/$NAME.tar.gz
 tar xzf $NAME.tar.gz
 cd $NAME
 ```

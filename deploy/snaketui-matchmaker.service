@@ -1,6 +1,6 @@
 [Unit]
 Description=SnakeTUI's quick-play queue for a cluster of servers
-Documentation=https://github.com/ssenerg/SnakeTUI/blob/main/deploy/CLUSTER.md
+Documentation=https://github.com/ssenerg/game/blob/main/deploy/CLUSTER.md
 After=network-online.target
 Wants=network-online.target
 

@@ -4,12 +4,12 @@
 # its settings change. If the game does not come up healthy, the image that
 # ran before comes back and the script fails.
 #
-#   deploy.sh IMAGE [DIGEST]   e.g. deploy.sh ghcr.io/OWNER/snaketui sha256:...
+#   deploy.sh IMAGE [DIGEST]   e.g. deploy.sh ghcr.io/OWNER/game sha256:...
 #
 # CI runs it over SSH with a key that may run nothing else, with IMAGE set
 # in authorized_keys and DIGEST sent by CI (see the README):
 #
-#   restrict,command="/opt/apps/snaketui/deploy.sh ghcr.io/OWNER/snaketui" ssh-ed25519 ...
+#   restrict,command="/opt/apps/snaketui/deploy.sh ghcr.io/OWNER/game" ssh-ed25519 ...
 #
 # The old game lets rounds in play finish before it stops, so this can take
 # a few minutes. What it prints may end up in public CI logs, so the game's

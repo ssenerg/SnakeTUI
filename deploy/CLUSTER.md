@@ -21,7 +21,7 @@ Ubuntu 24.04's own `postgresql`, `nats-server` and `haproxy` packages work.
 
 ## Try it on one machine first
 
-[deploy/cluster/](https://github.com/ssenerg/SnakeTUI/tree/main/deploy/cluster)
+[deploy/cluster/](https://github.com/ssenerg/game/tree/main/deploy/cluster)
 in the source has a docker-compose file with all of it: two game servers
 behind HAProxy, Postgres, NATS and the matchmaker. With Docker installed,
 from that directory:

@@ -1,6 +1,6 @@
 [Unit]
 Description=SnakeTUI over SSH
-Documentation=https://github.com/ssenerg/SnakeTUI/blob/main/deploy/INSTALL.md
+Documentation=https://github.com/ssenerg/game/blob/main/deploy/INSTALL.md
 After=network-online.target
 Wants=network-online.target
 

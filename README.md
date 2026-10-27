@@ -181,7 +181,7 @@ Then, in another terminal, run `ssh -p 2022 localhost`.
 
 Every push to `main` that passes CI is deployed to a Linux server with
 Docker Compose. The `image` job publishes the server's image to
-`ghcr.io/ssenerg/snaketui`, for amd64, tagged `latest` and `sha-COMMIT`; the
+`ghcr.io/ssenerg/game`, for amd64, tagged `latest` and `sha-COMMIT`; the
 `deploy` job sends its digest over SSH. The key GitHub signs in with runs
 nothing but [`deploy.sh`](deploy/docker/deploy.sh) there, which pulls
 exactly that image and restarts the game with it:
@@ -241,7 +241,7 @@ terminals and forwarding; `command` runs whatever GitHub asks for, with what
 it asked for as the digest:
 
 ```
-restrict,command="/opt/apps/snaketui/deploy.sh ghcr.io/ssenerg/snaketui" ssh-ed25519 AAAA... snaketui-deploy
+restrict,command="/opt/apps/snaketui/deploy.sh ghcr.io/ssenerg/game" ssh-ed25519 AAAA... snaketui-deploy
 ```
 
 **GitHub.** Under Settings → Environments, create the environment
