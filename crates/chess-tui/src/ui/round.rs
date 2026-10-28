@@ -235,8 +235,8 @@ impl Scene<'_> {
         }
         // A player whose connection went, while their seat waits.
         let away = piece::Color::BOTH.iter().find_map(|&side| {
-            let seat = self.seat(side)?;
-            Some((seat, seat.away?)).filter(|_| seat.who.id != self.room.me)
+            let seat = self.seat(side).filter(|s| s.who.id != self.room.me)?;
+            Some((seat, seat.away?))
         });
         if let Some((seat, left)) = away {
             let text = format!("{} is away · back within {}", seat.who.name, clock(left));
