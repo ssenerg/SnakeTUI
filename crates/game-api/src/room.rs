@@ -108,6 +108,9 @@ pub struct Room<G: Game> {
     /// This round's players, by slot: kept when they leave, for the
     /// results.
     players: Vec<Entrant>,
+    /// Their ids as the round began, by slot, which its results name them
+    /// by: some may have come back as someone new since.
+    started: Vec<PlayerId>,
     /// From the countdown until the next round's lobby.
     round: Option<G::Round>,
     placements: Vec<Placement>,
@@ -125,6 +128,7 @@ impl<G: Game> Room<G> {
             phase: Phase::Waiting { start_at: None },
             seats: Vec::new(),
             players: Vec::new(),
+            started: Vec::new(),
             round: None,
             placements: Vec::new(),
             rng: RoomRng::seed_from_u64(seed),
@@ -181,6 +185,30 @@ impl<G: Game> Room<G> {
     /// Whether a round is being played right now (including its countdown).
     pub fn in_play(&self) -> bool {
         matches!(self.phase, Phase::Countdown { .. } | Phase::Running)
+    }
+
+    /// Whether `id` has a part in the round being played.
+    pub fn plays(&self, id: PlayerId) -> bool {
+        self.in_play() && self.seat(id).is_some_and(|s| s.slot.is_some())
+    }
+
+    /// `who` takes over the seat `old` has in the round being played, as
+    /// when a player who lost their connection comes back on a new one.
+    /// Only in games whose rounds know players by slot. Says whether there
+    /// was such a seat.
+    pub fn rejoin(&mut self, old: PlayerId, who: Entrant) -> bool {
+        if !G::REJOIN || !self.plays(old) || (old != who.id && self.contains(who.id)) {
+            return false;
+        }
+        let Some(seat) = self.seat_mut(old) else {
+            return false;
+        };
+        seat.who = who.clone();
+        if let Some(slot) = seat.slot {
+            self.players[slot as usize] = who;
+        }
+        self.changed = true;
+        true
     }
 
     /// This round, from its countdown until the next round's lobby.
@@ -436,6 +464,7 @@ impl<G: Game> Room<G> {
             seat.slot = Some(i as u8);
             seat.ready = false;
         }
+        self.started = players.iter().map(|p| p.id).collect();
         self.players = players;
         self.round = Some(round);
         self.placements.clear();
@@ -446,7 +475,15 @@ impl<G: Game> Room<G> {
     }
 
     /// Shows how the round ended, and counts the win.
-    fn finish(&mut self, end: RoundEnd) -> RoundEnd {
+    fn finish(&mut self, mut end: RoundEnd) -> RoundEnd {
+        // Players who came back as someone new are named as they are now.
+        if let RoundEnd::Ranked(placements) = &mut end {
+            for p in placements {
+                if let Some(slot) = self.started.iter().position(|&id| id == p.who.id) {
+                    p.who = self.players[slot].clone();
+                }
+            }
+        }
         self.placements = end.placements().to_vec();
         if let Some(id) = winner(&self.placements).map(|w| w.id)
             && let Some(seat) = self.seat_mut(id)
@@ -465,6 +502,7 @@ impl<G: Game> Room<G> {
     fn back_to_waiting(&mut self) {
         self.round = None;
         self.players.clear();
+        self.started.clear();
         self.placements.clear();
         for seat in &mut self.seats {
             seat.slot = None;
@@ -499,6 +537,7 @@ impl<G: Game> Room<G> {
                 wins: s.wins,
                 left: false,
                 ping: None,
+                away: None,
             })
             .collect();
         // Players who left mid-round stay listed until it's over.
@@ -511,6 +550,7 @@ impl<G: Game> Room<G> {
                     wins: 0,
                     left: true,
                     ping: None,
+                    away: None,
                 });
             }
         }
@@ -561,6 +601,9 @@ mod tests {
     impl Game for Presses {
         const ID: GameId = GameId::Snake;
         const BOT_NAMES: &'static [&'static str] = &["Ann", "Bob"];
+        // Its rounds know players by slot, and name them in the results as
+        // they began.
+        const REJOIN: bool = true;
         type Settings = u8;
         type Input = ();
         type View = Scores;
@@ -701,6 +744,25 @@ mod tests {
             [0, 0],
             "the round shows from its countdown"
         );
+    }
+
+    #[test]
+    fn a_player_back_as_someone_new_takes_their_seat() {
+        let mut room = matched(2);
+        room.advance(3 * S);
+        assert!(!room.rejoin(5, who(9)), "nobody's seat");
+        assert!(!room.rejoin(2, who(1)), "someone already seated");
+        assert!(room.rejoin(1, who(11)));
+        assert!(!room.contains(1) && room.plays(11));
+        let seat = room.view().shell.seats[0].clone();
+        assert_eq!((seat.who, seat.slot, seat.left), (who(11), Some(0), false));
+        room.play(11, (), None);
+        let end = room.play(11, (), None).expect("their presses count");
+        assert_eq!(end.placements()[0].who, who(11), "named as they are now");
+        let view = room.view();
+        assert_eq!(view.shell.winner(), Some(&who(11)));
+        assert_eq!(view.shell.seats[0].wins, 1);
+        assert!(!room.rejoin(11, who(12)), "the round is over");
     }
 
     #[test]

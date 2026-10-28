@@ -16,7 +16,7 @@ use crate::rating::Rating;
 use crate::room::{RoomCmd, RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 10;
+pub const VERSION: u8 = 11;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -113,14 +113,36 @@ pub struct RatedAt {
     pub won: bool,
 }
 
-/// A player on server `from` would like a seat in a room here.
+/// A player on server `from` would like to be in a room here.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub who: Entrant,
     pub from: ServerId,
-    /// Only to watch, without a seat.
-    pub watch: bool,
+    pub how: JoinAs,
 }
+
+/// What a player joining a room is after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinAs {
+    /// A seat, signed in to `account` if any.
+    Seat { account: Option<AccountId> },
+    /// Only to watch, without a seat.
+    Watch,
+    /// The seat `account` has in the round being played, from a connection
+    /// that's gone.
+    Rejoin { account: AccountId },
+}
+
+/// Where is `account` seated in a round being played? Every other server
+/// answers with a [`SeatReply`].
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SeatQuery {
+    pub from: ServerId,
+    pub account: AccountId,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SeatReply(pub Option<RoomRef>);
 
 /// A room's view: its game, and the view as that game writes it
 /// ([`crate::games::AnyRoomView::to_wire`]).

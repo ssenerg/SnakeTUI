@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::cluster::Cluster;
 use crate::cluster::wire::{
-    MadeMatch, MakeMatch, MatchedAt, QueueAlive, QueueLeave, QueueTicket, RatedAt, decode,
+    JoinAs, MadeMatch, MakeMatch, MatchedAt, QueueAlive, QueueLeave, QueueTicket, RatedAt, decode,
 };
 use crate::games::{self, PoolKey};
 use crate::matcher::{Pools, Ticket};
@@ -355,7 +355,8 @@ impl MatchmakerActor {
             return;
         };
         rated.insert(player, (w.on_rated.clone(), Instant::now()));
-        let join = Arc::clone(&cluster).join_remote(room, w.who.clone(), w.presence.clone(), false);
+        let how = JoinAs::Seat { account: w.account };
+        let join = Arc::clone(&cluster).join_remote(room, w.who.clone(), w.presence.clone(), how);
         ctx.spawn(
             join.into_actor(self)
                 .map(move |joined, act, _| match joined {

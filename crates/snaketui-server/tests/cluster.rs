@@ -251,6 +251,20 @@ async fn friends_on_different_servers_see_each_other_and_play_together() {
 }
 
 #[tokio::test]
+async fn a_dropped_player_comes_back_to_their_game_through_another_server() {
+    let chess = "enabled_games = [\"snake\", \"chess\"]";
+    let (servers, _) = cluster_in(&["local", "local"], chess).await;
+    // ann's room runs on the first server; ben plays from the second.
+    let (mut ann, key) = common::chess::account(servers[0].addr, "ann").await;
+    let (mut ben, _) = common::chess::account(servers[1].addr, "ben").await;
+    common::chess::challenge(&mut ann, &mut ben, &[]).await;
+    common::chess::two_moves_then_ann_drops(ann, &mut ben).await;
+    let mut ann = common::chess::back(servers[1].addr, &key).await;
+    common::chess::play(&mut ann, "1. e4      e5", "Nf3").await;
+    ben.wait_for("2. Nf3").await;
+}
+
+#[tokio::test]
 async fn friends_watch_games_on_other_servers() {
     let servers = cluster(2).await;
     let (mut ann, _) = signed_up(servers[0].addr, "ann").await;

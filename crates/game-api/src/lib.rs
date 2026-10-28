@@ -145,6 +145,10 @@ pub trait Game: Sized + Send + Sync + 'static {
     /// Names for a room's bots, in the order they join. A game without
     /// bots has none.
     const BOT_NAMES: &'static [&'static str] = &[];
+    /// Whether a player who loses their connection mid-round can come back
+    /// to their seat, as someone new: see [`Room::rejoin`]. Its rounds must
+    /// know players by slot, never by id.
+    const REJOIN: bool = false;
 
     /// What a private room's host chooses, such as Snake's board.
     type Settings: Clone + Debug + PartialEq + Send + Sync + 'static;

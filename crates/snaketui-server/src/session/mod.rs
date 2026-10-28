@@ -33,7 +33,7 @@ use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::{FRAME_HOLDS, PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
 use crate::room::{RESULTS_GRACE, RoomCmd, RoomHandle, ViewRx};
-use crate::store::{self, Account, AccountData, Standing, now};
+use crate::store::{self, Account, AccountData, AccountId, Standing, now};
 use crate::tcp::TcpState;
 use crate::{Shared, Stopping};
 
@@ -405,8 +405,9 @@ impl Actor for SessionActor {
         self.count_tcp();
         self.save_now();
         self.sign_off();
+        // Not a choice to leave: a game may keep their seat for them.
         if let Some(link) = self.room.take() {
-            link.room.leave(self.id);
+            link.room.send(self.id, RoomCmd::Gone);
         }
         if self.queued {
             self.shared.matchmaker.do_send(Dequeue(self.id));
@@ -836,7 +837,7 @@ impl SessionActor {
             .filter(|_| self.shared.games.contains(&game))
             .ok_or(JoinFail::OtherGame)
             .and_then(|g| g.private_room(settings, seed).map_err(JoinFail::Refused));
-        let who = self.entrant();
+        let (who, account) = (self.entrant(), self.account_id());
         let presence = Arc::downgrade(&self.presence);
         async move {
             let room = match lobby.send(CreateRoom { room: room? }).await {
@@ -844,7 +845,7 @@ impl SessionActor {
                 Ok(Err(CodeUnavailable)) => return Err(JoinFail::Unavailable),
                 Err(_) => return Err(JoinFail::Closed),
             };
-            seat(room, who, presence).await
+            seat(room, who, account, presence).await
         }
     }
 
@@ -865,7 +866,7 @@ impl SessionActor {
                 let lobby = self.shared.lobby.clone();
                 let guesses = self.shared.guesses.clone();
                 let ip = self.peer.ip();
-                let who = self.entrant();
+                let (who, account) = (self.entrant(), self.account_id());
                 let presence = Arc::downgrade(&self.presence);
                 Box::pin(async move {
                     // Wrong codes count per address too, or reconnecting
@@ -876,7 +877,7 @@ impl SessionActor {
                         Err(_) => return Err(JoinFail::Unavailable),
                     }
                     match lobby.send(FindRoom(code)).await {
-                        Ok(Some(room)) => seat(room, who, presence).await,
+                        Ok(Some(room)) => seat(room, who, account, presence).await,
                         Ok(None) => {
                             let _ = guesses.wrong_code(ip, now()).await;
                             Err(JoinFail::NoSuchCode)
@@ -1049,13 +1050,14 @@ fn restore(app: &mut App, prefs: Vec<(GameId, String)>, records: Records) {
     }
 }
 
-/// Takes a seat in `room`.
+/// Takes a seat in `room` for `who`, signed in to `account` if any.
 async fn seat(
     room: RoomHandle,
     who: Entrant,
+    account: Option<AccountId>,
     presence: std::sync::Weak<()>,
 ) -> Result<JoinedRoom, JoinFail> {
-    match room.join(who, presence).await {
+    match room.join(who, account, presence).await {
         Ok(view) => Ok((room, view)),
         Err(JoinError::Full) => Err(JoinFail::Full),
         Err(JoinError::Closed) => Err(JoinFail::Closed),

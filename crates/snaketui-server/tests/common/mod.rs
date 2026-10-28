@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod accounts;
+pub mod chess;
 pub mod process;
 pub mod rooms;
 

@@ -78,6 +78,7 @@ pub struct Chess;
 
 impl Game for Chess {
     const ID: GameId = GameId::Chess;
+    const REJOIN: bool = true;
 
     type Settings = ChessSettings;
     type Input = ChessInput;

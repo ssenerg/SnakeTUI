@@ -99,6 +99,8 @@ struct Scene<'a> {
     /// The side this player plays, while their game goes on.
     me: Option<piece::Color>,
     bottom: piece::Color,
+    /// Something the app has to tell the player.
+    notice: Option<&'a str>,
 }
 
 impl Scene<'_> {
@@ -120,6 +122,8 @@ impl Scene<'_> {
             name.push_str(" (you)");
         } else if seat.left {
             name.push_str(" (left)");
+        } else if seat.away.is_some() {
+            name.push_str(" (away)");
         }
         name
     }
@@ -229,6 +233,15 @@ impl Scene<'_> {
             }
             return Line::styled(format!("Starting in {} s", secs(*left)), bold);
         }
+        // A player whose connection went, while their seat waits.
+        let away = piece::Color::BOTH.iter().find_map(|&side| {
+            let seat = self.seat(side)?;
+            Some((seat, seat.away?)).filter(|_| seat.who.id != self.room.me)
+        });
+        if let Some((seat, left)) = away {
+            let text = format!("{} is away · back within {}", seat.who.name, clock(left));
+            return Line::styled(text, Style::default().fg(Color::LightYellow));
+        }
         let to_move = self.position.side_to_move();
         let check = if self.position.in_check() {
             " · check"
@@ -272,8 +285,8 @@ impl Scene<'_> {
             };
             return Line::styled(hint, dim());
         }
-        if let Some(notice) = desk.notice {
-            return Line::styled(notice, Style::default().fg(Color::LightYellow));
+        if let Some(notice) = desk.notice.or(self.notice) {
+            return Line::styled(notice.to_string(), Style::default().fg(Color::LightYellow));
         }
         if desk.typed.is_empty() {
             let hint = match self.ui.prefs.input {
@@ -360,7 +373,6 @@ fn capitalized(word: &str) -> String {
 }
 
 pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &Ctx) {
-    let _ = ctx;
     let Some(view) = chess_view(room) else {
         return;
     };
@@ -381,6 +393,7 @@ pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &C
         phase,
         me: my_color(room, game).filter(|_| playing),
         bottom: bottom(room, game, ui.desk.flipped),
+        notice: ctx.notice,
     };
     let area = frame.area();
     let Some(layout) = layout(area, ui.prefs.coordinates) else {

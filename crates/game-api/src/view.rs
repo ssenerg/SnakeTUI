@@ -170,4 +170,7 @@ pub struct SeatView {
     /// The player's round trip to the server, once measured. The server
     /// fills it in; a room knows nothing about networks.
     pub ping: Option<Duration>,
+    /// Lost their connection during this round: how long their seat waits
+    /// for them. The server fills it in, like the ping.
+    pub away: Option<Duration>,
 }

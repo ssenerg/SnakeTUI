@@ -20,7 +20,7 @@ use crate::games;
 use crate::presence::{
     Deliver, Doing, Invite, Notice, Offline, Online, SetStatus, Status, StatusOf,
 };
-use crate::room::{Rated, RoomHandle};
+use crate::room::{Rated, RoomCmd, RoomHandle, RoomRef};
 use crate::store::{Account, AccountData, AccountId, Requested, Standing, now};
 
 /// Wrong passwords one connection may try before it's disconnected.
@@ -136,6 +136,58 @@ impl SessionActor {
         }
         self.account = Some(account);
         self.refresh_friends(ctx);
+        self.rejoin(ctx);
+    }
+
+    /// Takes the player back to a game they're still seated in, from a
+    /// connection that dropped or that they left mid-game, if they're free
+    /// to go: not in a room, the queue or a game of their own.
+    fn rejoin(&mut self, ctx: &mut Context<Self>) {
+        let Some(account) = self.account_id() else {
+            return;
+        };
+        let free = |act: &Self| {
+            !act.closing
+                && act.room.is_none()
+                && !act.queued
+                && act.app.as_ref().is_some_and(|a| {
+                    !a.in_room() && !a.playing_alone() && a.screen != Screen::Finding
+                })
+        };
+        if !free(self) {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let who = self.entrant();
+        let presence = Arc::downgrade(&self.presence);
+        let back = async move {
+            let at = match shared.rooms.seat_of(account) {
+                Some(room) => RoomRef {
+                    server: shared.server,
+                    room,
+                },
+                None => shared.cluster.as_ref()?.seat_of(account).await?,
+            };
+            let room = shared.room(at)?;
+            let view = room.rejoin(who, account, presence).await.ok()?;
+            Some((room, view))
+        };
+        ctx.spawn(back.into_actor(self).map(move |back, act, ctx| {
+            let Some((room, view)) = back else { return };
+            let current = view.borrow().clone();
+            let back_in = free(act)
+                && act
+                    .app
+                    .as_mut()
+                    .is_some_and(|app| app.rejoin_room(act.id, current));
+            if !back_in {
+                // Busy after all: the seat waits for them again.
+                room.send(act.id, RoomCmd::Gone);
+                return;
+            }
+            debug!(peer = %act.peer, "back in a game still being played");
+            act.link(room, view, ctx);
+        }));
     }
 
     /// Tells friends what this player is doing now, if that changed.
@@ -848,7 +900,8 @@ impl SessionActor {
         let Some(room) = self.shared.room(pending.invite.room) else {
             return self.invite_failed("That room has closed.".into(), ctx);
         };
-        let join = room.join(self.entrant(), std::sync::Arc::downgrade(&self.presence));
+        let presence = std::sync::Arc::downgrade(&self.presence);
+        let join = room.join(self.entrant(), self.account_id(), presence);
         ctx.spawn(
             join.into_actor(self)
                 .map(move |joined, act, ctx| match joined {

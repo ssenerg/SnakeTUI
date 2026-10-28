@@ -133,6 +133,14 @@ fn screens() -> Vec<App> {
     apps.push(app(ANN, &opening, |app| {
         typed(app, "Qh9\r");
     }));
+    // The other side's connection went, and their seat waits; and back
+    // in a game after one's own did.
+    let mut away = opening.clone();
+    away.shell.seats[1].away = Some(Duration::from_secs(75));
+    apps.push(app(ANN, &away, |_| {}));
+    apps.push(app(ANN, &opening, |app| {
+        app.notify("Welcome back: your game went on.".into());
+    }));
     // Esc in the countdown asks about leaving.
     apps.push(app(ANN, &views[2], |app| {
         app.handle(Key::Esc);
@@ -203,6 +211,18 @@ fn every_screen_draws_at_every_size() {
         apps.len(),
         sizes.len(),
         started.elapsed()
+    );
+}
+
+#[test]
+fn an_away_player_shows_how_long_their_seat_waits() {
+    let mut view = playing(&["e2e4", "e7e5"]).view();
+    view.shell.seats[1].away = Some(Duration::from_secs(75));
+    let screen = shown(&app(ANN, &view, |_| {}), 80, 24);
+    assert!(screen.contains("ben (away)"), "{screen}");
+    assert!(
+        screen.contains("ben is away · back within 1:15"),
+        "{screen}"
     );
 }
 

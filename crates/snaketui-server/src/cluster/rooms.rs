@@ -22,11 +22,14 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use super::Cluster;
-use super::wire::{Input, JoinReply, JoinRequest, WireView, decode};
+use super::wire::{Input, JoinAs, JoinReply, JoinRequest, SeatQuery, SeatReply, WireView, decode};
 use crate::games::{self, AnyRoomView};
 use crate::room::{RoomCmd, RoomId, RoomRef, ServerId, ViewRx};
+use crate::store::AccountId;
 
 pub const ROOM_LOST: &str = "The server running this room went away.";
+/// Where servers ask each other where an account is seated.
+const SEATS: &str = "rooms.seat";
 
 /// Players from other servers in a room here.
 #[derive(Default)]
@@ -60,11 +63,30 @@ impl Cluster {
         )
     }
 
-    /// Answers other servers' players: their joins, and their keys.
+    /// Answers other servers' players: their joins, and their keys; and
+    /// other servers asking where an account is seated.
     pub(super) async fn serve_rooms(self: &Arc<Self>) -> Result<()> {
         let mine = format!("{}.room.{:016x}", self.prefix, self.server);
         let mut joins = self.subscribe(format!("{mine}.*.join")).await?;
         let mut inputs = self.subscribe(format!("{mine}.*.in")).await?;
+        let mut seats = self.subscribe(self.subject(SEATS)).await?;
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(msg) = seats.next().await {
+                let (Some(reply), Some(SeatQuery { from, account })) =
+                    (msg.reply, decode(&msg.payload))
+                else {
+                    continue;
+                };
+                if from != me.server {
+                    let at = me.rooms.seat_of(account).map(|room| RoomRef {
+                        server: me.server,
+                        room,
+                    });
+                    me.send(reply.to_string(), &SeatReply(at));
+                }
+            }
+        });
         let me = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(msg) = joins.next().await {
@@ -96,10 +118,10 @@ impl Cluster {
         let seat = Arc::new(());
         let player = request.who.id;
         let presence = Arc::downgrade(&seat);
-        let view = if request.watch {
-            port.watch(player, presence).await
-        } else {
-            port.join(request.who, presence).await
+        let view = match request.how {
+            JoinAs::Watch => port.watch(player, presence).await,
+            JoinAs::Seat { account } => port.join(request.who, account, presence).await,
+            JoinAs::Rejoin { account } => port.rejoin(request.who, account, presence).await,
         }?;
         let now = view.borrow().to_wire();
         self.exports
@@ -210,7 +232,7 @@ impl Cluster {
         if !guest {
             return;
         }
-        let leaving = cmd == RoomCmd::Leave;
+        let leaving = cmd.ends_stay();
         port.send(player, cmd);
         if leaving {
             let mut exports = self.exports.lock().unwrap();
@@ -223,14 +245,13 @@ impl Cluster {
         }
     }
 
-    /// Takes a seat for `who` in the room at `at`, on another server, or
-    /// with `watch`, lets them watch it.
+    /// Puts `who` in the room at `at`, on another server, as `how` says.
     pub async fn join_remote(
         self: Arc<Self>,
         at: RoomRef,
         who: Entrant,
         presence: Weak<()>,
-        watch: bool,
+        how: JoinAs,
     ) -> Result<ViewRx, JoinError> {
         if !self.alive(at.server) {
             return Err(JoinError::Closed);
@@ -250,7 +271,7 @@ impl Cluster {
         let request = JoinRequest {
             who,
             from: self.server,
-            watch,
+            how,
         };
         let reply: Option<JoinReply> = self.request(self.room_subject(at, "join"), &request).await;
         let now = reply.unwrap_or(Err(JoinError::Closed))?;
@@ -310,7 +331,7 @@ impl Cluster {
 
     /// A key, or leaving, for a room on another server.
     pub fn send_input(&self, at: RoomRef, player: PlayerId, cmd: RoomCmd) {
-        if cmd == RoomCmd::Leave {
+        if cmd.ends_stay() {
             let mut imports = self.imports.lock().unwrap();
             if let Some(import) = imports.get_mut(&at) {
                 import.members.remove(&player);
@@ -322,6 +343,25 @@ impl Cluster {
             }
         }
         self.send(self.room_subject(at, "in"), &Input { player, cmd });
+    }
+
+    /// The room, on any server, where `account` has a seat in the round
+    /// being played.
+    pub async fn seat_of(&self, account: AccountId) -> Option<RoomRef> {
+        if let Some(room) = self.rooms.seat_of(account) {
+            return Some(RoomRef {
+                server: self.server,
+                room,
+            });
+        }
+        let question = SeatQuery {
+            from: self.server,
+            account,
+        };
+        let answers: Vec<SeatReply> = self.ask_all(self.subject(SEATS), &question).await;
+        answers
+            .into_iter()
+            .find_map(|SeatReply(at)| at.filter(|at| self.alive(at.server)))
     }
 
     /// Lets go of players whose server went quiet, closes rooms whose
@@ -356,9 +396,10 @@ impl Cluster {
             !import.members.is_empty()
         });
         for (at, player) in left {
+            // They didn't choose to go: a game may keep their seat.
             let leave = Input {
                 player,
-                cmd: RoomCmd::Leave,
+                cmd: RoomCmd::Gone,
             };
             self.send(self.room_subject(at, "in"), &leave);
         }

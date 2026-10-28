@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::cluster::Cluster;
-use crate::cluster::wire::RatedAt;
+use crate::cluster::wire::{JoinAs, RatedAt};
 use crate::games::{self, AnyRoomView, Served};
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
@@ -44,6 +44,9 @@ const MAILBOX: usize = 256;
 const MATCH_LINGER: Duration = Duration::from_secs(60);
 /// People who may watch one room at once.
 const MAX_WATCHERS: usize = 20;
+/// How long a signed-in player who lost their connection mid-round keeps
+/// their seat, in games that take them back. Their clock, if any, runs on.
+pub const REJOIN_WITHIN: Duration = Duration::from_secs(90);
 const BROKEN: &str = "Something went wrong in this room, so it closed. Sorry!";
 const MATCH_OVER: &str = "The match is over.";
 const DRAINED: &str = "This room's server is restarting. Reconnect to keep playing.";
@@ -68,11 +71,16 @@ type Running = (Arc<dyn RoomPort>, ArbiterHandle);
 
 /// The rooms this server runs.
 #[derive(Clone, Default)]
-pub struct LocalRooms(Arc<Mutex<HashMap<RoomId, Running>>>);
+pub struct LocalRooms {
+    running: Arc<Mutex<HashMap<RoomId, Running>>>,
+    /// Accounts seated in a round being played here that would take them
+    /// back if they lost their connection, and the room.
+    seated: Arc<Mutex<HashMap<AccountId, RoomId>>>,
+}
 
 impl LocalRooms {
     pub fn get(&self, id: RoomId) -> Option<Arc<dyn RoomPort>> {
-        self.0
+        self.running
             .lock()
             .unwrap()
             .get(&id)
@@ -81,23 +89,38 @@ impl LocalRooms {
 
     /// The room, and the thread it runs on, for work that belongs with it.
     pub fn get_with_thread(&self, id: RoomId) -> Option<Running> {
-        self.0.lock().unwrap().get(&id).cloned()
+        self.running.lock().unwrap().get(&id).cloned()
     }
 
     fn insert(&self, id: RoomId, port: Arc<dyn RoomPort>, thread: ArbiterHandle) {
-        self.0.lock().unwrap().insert(id, (port, thread));
+        self.running.lock().unwrap().insert(id, (port, thread));
     }
 
     fn remove(&self, id: RoomId) {
-        self.0.lock().unwrap().remove(&id);
+        self.running.lock().unwrap().remove(&id);
+    }
+
+    /// The room here where `account` has a seat in the round being played.
+    pub fn seat_of(&self, account: AccountId) -> Option<RoomId> {
+        self.seated.lock().unwrap().get(&account).copied()
+    }
+
+    /// Notes that `room` has, or no longer has, a seat for `account`.
+    fn seat(&self, account: AccountId, room: RoomId, seated: bool) {
+        let mut all = self.seated.lock().unwrap();
+        if seated {
+            all.insert(account, room);
+        } else if all.get(&account) == Some(&room) {
+            all.remove(&account);
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.running.lock().unwrap().len()
     }
 
     pub fn all(&self) -> Vec<Arc<dyn RoomPort>> {
-        self.0
+        self.running
             .lock()
             .unwrap()
             .values()
@@ -174,6 +197,10 @@ pub enum RoomCmd {
     Ready,
     /// Gives up a seat, or stops watching.
     Leave,
+    /// The player's connection is gone; they didn't choose to leave. In a
+    /// game that takes them back, a signed-in player keeps their seat in
+    /// the round for [`REJOIN_WITHIN`]; otherwise it's [`RoomCmd::Leave`].
+    Gone,
     /// The player's round trip, measured by their session.
     Ping(Duration),
     /// The host adds a bot.
@@ -187,10 +214,31 @@ pub enum RoomCmd {
     Settings(Vec<u8>),
 }
 
+impl RoomCmd {
+    /// Whether the player is done with the room, by choice or not: never
+    /// dropped, and the end of their part in it.
+    pub fn ends_stay(&self) -> bool {
+        matches!(self, RoomCmd::Leave | RoomCmd::Gone)
+    }
+}
+
 /// A room running here, of whichever game.
 pub trait RoomPort: Send + Sync {
-    /// Takes a seat for `who`; `presence` shows the player is still there.
-    fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined>;
+    /// Takes a seat for `who`, signed in to `account` if any; `presence`
+    /// shows the player is still there.
+    fn join(
+        &self,
+        who: Entrant,
+        account: Option<AccountId>,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined>;
+    /// `who` takes back the seat `account` has in the round being played.
+    fn rejoin(
+        &self,
+        who: Entrant,
+        account: AccountId,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined>;
     /// Lets `id` watch without a seat.
     fn watch(&self, id: PlayerId, presence: Presence) -> BoxFuture<'static, Joined>;
     /// Keys wait in the room's mailbox, and a full one drops them; leaving
@@ -203,8 +251,31 @@ pub trait RoomPort: Send + Sync {
 pub type Joined = Result<ViewRx, JoinError>;
 
 impl<G: Served> RoomPort for Addr<RoomActor<G>> {
-    fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined> {
-        let joined = self.send(Join { who, presence });
+    fn join(
+        &self,
+        who: Entrant,
+        account: Option<AccountId>,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined> {
+        let joined = self.send(Join {
+            who,
+            account,
+            presence,
+        });
+        Box::pin(async move { joined.await.unwrap_or(Err(JoinError::Closed)) })
+    }
+
+    fn rejoin(
+        &self,
+        who: Entrant,
+        account: AccountId,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined> {
+        let joined = self.send(Rejoin {
+            who,
+            account,
+            presence,
+        });
         Box::pin(async move { joined.await.unwrap_or(Err(JoinError::Closed)) })
     }
 
@@ -214,7 +285,7 @@ impl<G: Served> RoomPort for Addr<RoomActor<G>> {
     }
 
     fn send(&self, id: PlayerId, cmd: RoomCmd) {
-        if cmd == RoomCmd::Leave {
+        if cmd.ends_stay() {
             self.do_send(Cmd { id, cmd });
         } else {
             let _ = self.try_send(Cmd { id, cmd });
@@ -286,17 +357,40 @@ impl RoomHandle {
         match self {
             RoomHandle::Local { port, .. } => port.watch(who.id, presence),
             RoomHandle::Remote { at, cluster } => {
-                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, true))
+                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, JoinAs::Watch))
             }
         }
     }
 
-    /// Takes a seat for `who`; `presence` shows the player is still there.
-    pub fn join(&self, who: Entrant, presence: Presence) -> BoxFuture<'static, Joined> {
+    /// Takes a seat for `who`, signed in to `account` if any; `presence`
+    /// shows the player is still there.
+    pub fn join(
+        &self,
+        who: Entrant,
+        account: Option<AccountId>,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined> {
         match self {
-            RoomHandle::Local { port, .. } => port.join(who, presence),
+            RoomHandle::Local { port, .. } => port.join(who, account, presence),
             RoomHandle::Remote { at, cluster } => {
-                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, false))
+                let how = JoinAs::Seat { account };
+                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, how))
+            }
+        }
+    }
+
+    /// `who` takes back the seat `account` has in the round being played.
+    pub fn rejoin(
+        &self,
+        who: Entrant,
+        account: AccountId,
+        presence: Presence,
+    ) -> BoxFuture<'static, Joined> {
+        match self {
+            RoomHandle::Local { port, .. } => port.rejoin(who, account, presence),
+            RoomHandle::Remote { at, cluster } => {
+                let how = JoinAs::Rejoin { account };
+                Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, how))
             }
         }
     }
@@ -383,6 +477,16 @@ pub struct Ratings {
 #[rtype(result = "Result<ViewRx, JoinError>")]
 struct Join {
     who: Entrant,
+    account: Option<AccountId>,
+    presence: Presence,
+}
+
+/// A player back on a new connection takes their seat again.
+#[derive(Message)]
+#[rtype(result = "Result<ViewRx, JoinError>")]
+struct Rejoin {
+    who: Entrant,
+    account: AccountId,
     presence: Presence,
 }
 
@@ -419,6 +523,15 @@ pub struct RoomActor<G: Served> {
     watchers: HashMap<PlayerId, Presence>,
     /// Each player's round trip, as their session last measured it.
     pings: HashMap<PlayerId, Duration>,
+    /// The account each signed-in player is signed in to.
+    accounts: HashMap<PlayerId, AccountId>,
+    /// Players whose connection went mid-round, and when their seat stops
+    /// waiting for them.
+    away: HashMap<PlayerId, Instant>,
+    /// The accounts [`LocalRooms`] lists as seated here.
+    seated: Vec<AccountId>,
+    /// How long a seat waits: [`REJOIN_WITHIN`], or less in tests.
+    rejoin_within: Duration,
     ratings: Option<Ratings>,
     /// The last rated round's changes, shown with its results.
     changes: Vec<RatingChange>,
@@ -443,6 +556,9 @@ impl<G: Served> Actor for RoomActor<G> {
     fn stopped(&mut self, _: &mut Self::Context) {
         debug!(game = %G::ID, code = ?self.code, "room closed");
         if let Some((id, rooms)) = self.registered.take() {
+            for &account in &self.seated {
+                rooms.seat(account, id, false);
+            }
             rooms.remove(id);
         }
         if let (Some(lobby), Some(code)) = (&self.lobby, self.code.take()) {
@@ -461,7 +577,14 @@ impl<G: Served> RoomActor<G> {
         } = setup;
         let (code, lobby) = code.unzip();
         let pings = HashMap::new();
-        let first: Arc<dyn AnyRoomView> = Arc::new(view_of(&room, &code, &[], &pings, 0));
+        let away = HashMap::new();
+        let first: Arc<dyn AnyRoomView> = Arc::new(view_of(&room, &code, &[], &pings, &away, 0));
+        // A matched room knows its players' accounts from the start.
+        let accounts = ratings
+            .iter()
+            .flat_map(|r| &r.members)
+            .filter_map(|(&id, m)| Some((id, m.account?)))
+            .collect();
         let (view, rx) = watch::channel(first);
         let now = Instant::now();
         let room = Self {
@@ -473,6 +596,10 @@ impl<G: Served> RoomActor<G> {
             present,
             watchers: HashMap::new(),
             pings,
+            accounts,
+            away,
+            seated: Vec::new(),
+            rejoin_within: REJOIN_WITHIN,
             ratings,
             changes: Vec::new(),
             last: now,
@@ -501,6 +628,7 @@ impl<G: Served> RoomActor<G> {
         let dt = now - self.last;
         self.last = now;
         self.drop_absent(ctx);
+        self.give_up_on_away(now, ctx);
         let Some(end) = self.guarded(ctx, |room| room.advance(dt)) else {
             return;
         };
@@ -533,6 +661,41 @@ impl<G: Served> RoomActor<G> {
             .map(|(id, _)| *id)
             .collect();
         for id in gone {
+            self.gone(id, ctx);
+        }
+    }
+
+    /// `id`'s connection is gone. A signed-in player in a round of a game
+    /// that takes them back keeps their seat a while; anyone else leaves.
+    fn gone(&mut self, id: PlayerId, ctx: &mut Context<Self>) {
+        let waits = G::REJOIN
+            && !self.watchers.contains_key(&id)
+            && self.accounts.contains_key(&id)
+            && self.room.plays(id);
+        if !waits {
+            return self.leave(id, ctx);
+        }
+        self.present.remove(&id);
+        self.pings.remove(&id);
+        if !self.away.contains_key(&id) {
+            debug!(game = %G::ID, code = ?self.code, player = id, "away; the seat waits");
+            self.away.insert(id, Instant::now() + self.rejoin_within);
+            self.publish_now();
+        }
+    }
+
+    /// Players away too long leave, and so do all those away once their
+    /// round is over: the next one starts without them.
+    fn give_up_on_away(&mut self, now: Instant, ctx: &mut Context<Self>) {
+        let in_play = self.room.in_play();
+        let gone: Vec<PlayerId> = self
+            .away
+            .iter()
+            .filter(|&(_, &until)| until <= now || !in_play)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            debug!(game = %G::ID, code = ?self.code, player = id, "didn't come back");
             self.leave(id, ctx);
         }
     }
@@ -543,6 +706,8 @@ impl<G: Served> RoomActor<G> {
         }
         self.present.remove(&id);
         self.pings.remove(&id);
+        self.away.remove(&id);
+        self.accounts.remove(&id);
         if let Some(end) = self.guarded(ctx, |room| room.leave(id)) {
             self.on_end(end, ctx);
         }
@@ -629,13 +794,43 @@ impl<G: Served> RoomActor<G> {
     }
 
     fn publish_now(&mut self) {
+        self.list_seated();
         self.view.send_replace(Arc::new(view_of(
             &self.room,
             &self.code,
             &self.changes,
             &self.pings,
+            &self.away,
             self.watchers.len(),
         )));
+    }
+
+    /// Keeps [`LocalRooms`]' list of the accounts seated in this room's
+    /// round up to date, for players coming back on a new connection.
+    fn list_seated(&mut self) {
+        let Some((id, rooms)) = &self.registered else {
+            return;
+        };
+        let mut now: Vec<AccountId> = Vec::new();
+        if G::REJOIN {
+            now = self
+                .accounts
+                .iter()
+                .filter(|&(&player, _)| self.room.plays(player))
+                .map(|(_, &account)| account)
+                .collect();
+            now.sort_unstable();
+        }
+        if now == self.seated {
+            return;
+        }
+        for &account in self.seated.iter().filter(|a| !now.contains(a)) {
+            rooms.seat(account, *id, false);
+        }
+        for &account in now.iter().filter(|a| !self.seated.contains(a)) {
+            rooms.seat(account, *id, true);
+        }
+        self.seated = now;
     }
 
     fn close(&mut self, reason: &str, ctx: &mut Context<Self>) {
@@ -650,8 +845,12 @@ impl<G: Served> RoomActor<G> {
                 self.guarded(ctx, |room| room.toggle_ready(id));
                 self.publish();
             }
-            RoomCmd::Leave => {
-                self.leave(id, ctx);
+            RoomCmd::Leave | RoomCmd::Gone => {
+                if cmd == RoomCmd::Leave {
+                    self.leave(id, ctx);
+                } else {
+                    self.gone(id, ctx);
+                }
                 self.publish();
                 if self.room.is_empty() {
                     ctx.stop();
@@ -733,6 +932,7 @@ fn view_of<G: Served>(
     code: &Option<String>,
     changes: &[RatingChange],
     pings: &HashMap<PlayerId, Duration>,
+    away: &HashMap<PlayerId, Instant>,
     watchers: usize,
 ) -> RoomView<G> {
     let mut view = room.view();
@@ -742,8 +942,12 @@ fn view_of<G: Served>(
     if !shell.placements.is_empty() {
         shell.ratings = changes.to_vec();
     }
+    let now = Instant::now();
     for seat in &mut shell.seats {
         seat.ping = pings.get(&seat.who.id).copied();
+        seat.away = away
+            .get(&seat.who.id)
+            .map(|until| until.saturating_duration_since(now));
     }
     view
 }
@@ -758,7 +962,43 @@ impl<G: Served> Handler<Join> for RoomActor<G> {
             .unwrap_or(Err(JoinError::Closed));
         joined?;
         self.present.insert(id, msg.presence);
+        if let Some(account) = msg.account {
+            self.accounts.insert(id, account);
+        }
         self.publish();
+        Ok(self.view.subscribe())
+    }
+}
+
+impl<G: Served> Handler<Rejoin> for RoomActor<G> {
+    type Result = Result<ViewRx, JoinError>;
+
+    /// The account's seat in the round goes to its new connection, whether
+    /// the old one is known to be gone yet or not.
+    fn handle(&mut self, msg: Rejoin, ctx: &mut Self::Context) -> Self::Result {
+        let new = msg.who.id;
+        let old = self
+            .accounts
+            .iter()
+            .find(|&(&id, &account)| account == msg.account && self.room.plays(id))
+            .map(|(&id, _)| id)
+            .ok_or(JoinError::Closed)?;
+        if self.guarded(ctx, |room| room.rejoin(old, msg.who)) != Some(true) {
+            return Err(JoinError::Closed);
+        }
+        self.present.remove(&old);
+        self.pings.remove(&old);
+        self.away.remove(&old);
+        self.accounts.remove(&old);
+        self.accounts.insert(new, msg.account);
+        self.present.insert(new, msg.presence);
+        if let Some(ratings) = &mut self.ratings
+            && let Some(member) = ratings.members.remove(&old)
+        {
+            ratings.members.insert(new, member);
+        }
+        debug!(game = %G::ID, code = ?self.code, player = new, "back in their seat");
+        self.publish_now();
         Ok(self.view.subscribe())
     }
 }
@@ -812,10 +1052,183 @@ impl<G: Served> Handler<Drain> for RoomActor<G> {
 
 #[cfg(test)]
 mod tests {
-    use snake_core::round::{Placement, RoomKind, RoomSettings, Snake, quick_rules};
+    use std::sync::Arc;
+
+    use actix_rt::Arbiter;
+    use chess_core::moves::Move;
+    use chess_core::round::{Chess, ChessInput, ChessSettings, Side};
+    use game_api::{PhaseView, Room, RoomKind, SeatView};
+    use snake_core::round::{Placement, RoomSettings, Snake, quick_rules};
 
     use super::*;
-    use crate::games::view_of;
+    use crate::games::{self, view_of};
+
+    /// A private chess room started on this thread as room 7, where player
+    /// 1 hosts as white, as it's listed among [`LocalRooms`].
+    fn chess_room(rejoin_within: Duration) -> (RoomHandle, ViewRx, LocalRooms) {
+        let mut settings = game_api::RoomSettings::<Chess>::new(
+            ChessSettings {
+                side: Side::White,
+                ..ChessSettings::default()
+            },
+            RoomKind::Private,
+        )
+        .unwrap();
+        settings.countdown = Duration::ZERO;
+        let (mut room, view) =
+            RoomActor::new(Room::<Chess>::new(settings, 1), RoomSetup::default());
+        room.rejoin_within = rejoin_within;
+        let rooms = LocalRooms::default();
+        let host = RoomHost::new(0, rooms.clone(), vec![Arbiter::current()]);
+        (host.start_as(7, room), view, rooms)
+    }
+
+    fn who(id: PlayerId) -> Entrant {
+        Entrant {
+            id,
+            name: format!("p{}", id % 10),
+        }
+    }
+
+    fn chess(view: &ViewRx) -> Arc<RoomView<Chess>> {
+        view_of::<Chess>(Arc::clone(&*view.borrow())).unwrap()
+    }
+
+    /// Waits for a view of the room that `done` likes.
+    async fn until(
+        view: &mut ViewRx,
+        done: impl Fn(&RoomView<Chess>) -> bool,
+    ) -> Arc<RoomView<Chess>> {
+        let wait = async {
+            loop {
+                let now = chess(view);
+                if done(&now) {
+                    return now;
+                }
+                view.changed().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the room got there")
+    }
+
+    fn seat(view: &RoomView<Chess>, id: PlayerId) -> Option<&SeatView> {
+        view.shell.seats.iter().find(|s| s.who.id == id)
+    }
+
+    fn play(room: &RoomHandle, id: PlayerId, uci: &str) {
+        let mv = ChessInput::Move(Move::parse_uci(uci).unwrap());
+        room.send(id, RoomCmd::Play(games::encode(&mv)));
+    }
+
+    /// Players 1 and 2, signed in to accounts 10 and 20 unless `guest`,
+    /// sit down and start the game.
+    async fn started(room: &RoomHandle, view: &mut ViewRx, guest: bool) -> [Arc<()>; 2] {
+        let here = [Arc::new(()), Arc::new(())];
+        for (id, presence) in [1, 2].into_iter().zip(&here) {
+            let account = (!guest).then_some(id as AccountId * 10);
+            room.join(who(id), account, Arc::downgrade(presence))
+                .await
+                .unwrap();
+            room.send(id, RoomCmd::Ready);
+        }
+        until(view, |v| matches!(v.shell.phase, PhaseView::Running { .. })).await;
+        here
+    }
+
+    #[actix_rt::test]
+    async fn a_dropped_player_keeps_their_seat_and_takes_it_back() {
+        let (room, mut view, rooms) = chess_room(REJOIN_WITHIN);
+        let mut here = started(&room, &mut view, false).await;
+        assert_eq!(rooms.seat_of(10), Some(7), "listed as seated");
+        play(&room, 1, "e2e4");
+        play(&room, 2, "e7e5");
+        until(&mut view, |v| {
+            v.game.as_ref().is_some_and(|g| g.moves.len() == 2)
+        })
+        .await;
+
+        // Player 1's connection goes; the seat waits.
+        here[0] = Arc::new(());
+        room.send(1, RoomCmd::Gone);
+        let away = until(&mut view, |v| seat(v, 1).is_some_and(|s| s.away.is_some())).await;
+        assert!(seat(&away, 1).unwrap().away.unwrap() > Duration::from_secs(80));
+        assert!(matches!(away.shell.phase, PhaseView::Running { .. }));
+
+        // Back as player 11, signed in to account 10 again, they play on.
+        let back = Arc::new(());
+        let rejoined = room.rejoin(who(11), 10, Arc::downgrade(&back)).await;
+        assert!(rejoined.is_ok());
+        let now = until(&mut view, |v| seat(v, 11).is_some()).await;
+        let seat = seat(&now, 11).unwrap();
+        assert_eq!((seat.slot, seat.away, seat.left), (Some(0), None, false));
+        assert!(!now.shell.seats.iter().any(|s| s.who.id == 1));
+        play(&room, 11, "g1f3");
+        until(&mut view, |v| {
+            v.game.as_ref().is_some_and(|g| g.moves.len() == 3)
+        })
+        .await;
+        let nobody = room.rejoin(who(12), 30, Arc::downgrade(&back)).await;
+        assert!(
+            matches!(nobody, Err(JoinError::Closed)),
+            "account 30 has no seat"
+        );
+
+        // Resigning ends the game, and the room no longer lists them.
+        room.send(2, RoomCmd::Play(games::encode(&ChessInput::Resign)));
+        let over = until(&mut view, |v| {
+            matches!(v.shell.phase, PhaseView::Results { .. })
+        })
+        .await;
+        assert_eq!(over.shell.winner(), Some(&who(11)), "named as they are now");
+        assert_eq!(rooms.seat_of(10), None);
+    }
+
+    #[actix_rt::test]
+    async fn a_seat_waits_only_so_long_and_never_for_guests() {
+        let (room, mut view, _) = chess_room(Duration::from_millis(300));
+        let _here = started(&room, &mut view, false).await;
+        play(&room, 1, "e2e4");
+        play(&room, 2, "e7e5");
+        room.send(2, RoomCmd::Gone);
+        let over = until(&mut view, |v| {
+            matches!(v.shell.phase, PhaseView::Results { .. })
+        })
+        .await;
+        let outcome = over.game.as_ref().unwrap().outcome.unwrap();
+        assert_eq!(outcome.to_string(), "White won by abandonment");
+
+        let (room, mut view, rooms) = chess_room(REJOIN_WITHIN);
+        let _here = started(&room, &mut view, true).await;
+        assert_eq!(rooms.seat_of(10), None, "guests aren't listed");
+        room.send(2, RoomCmd::Gone);
+        until(&mut view, |v| {
+            matches!(v.shell.phase, PhaseView::Results { .. })
+        })
+        .await;
+    }
+
+    #[actix_rt::test]
+    async fn a_new_connection_takes_over_from_an_old_one_still_seated() {
+        let (room, mut view, _) = chess_room(REJOIN_WITHIN);
+        let _here = started(&room, &mut view, false).await;
+        let back = Arc::new(());
+        assert!(
+            room.rejoin(who(11), 10, Arc::downgrade(&back))
+                .await
+                .is_ok()
+        );
+        until(&mut view, |v| seat(v, 11).is_some()).await;
+        // The old connection's goodbye is nobody's now.
+        room.send(1, RoomCmd::Gone);
+        play(&room, 11, "e2e4");
+        let now = until(&mut view, |v| {
+            v.game.as_ref().is_some_and(|g| g.moves.len() == 1)
+        })
+        .await;
+        assert!(matches!(now.shell.phase, PhaseView::Running { .. }));
+    }
 
     #[test]
     fn only_accounts_are_rated_each_once() {
@@ -858,7 +1271,7 @@ mod tests {
             id: 1,
             name: "~p1".into(),
         };
-        room.join(who, Arc::downgrade(&seat)).await.unwrap();
+        room.join(who, None, Arc::downgrade(&seat)).await.unwrap();
 
         let here: Vec<Arc<()>> = (0..=MAX_WATCHERS).map(|_| Arc::new(())).collect();
         let watch = |i: usize| room.watch(100 + i as PlayerId, Arc::downgrade(&here[i]));
@@ -910,7 +1323,7 @@ mod tests {
                 id,
                 name: format!("p{id}"),
             };
-            room.join(who, Arc::downgrade(seat)).await.unwrap();
+            room.join(who, None, Arc::downgrade(seat)).await.unwrap();
             room.send(id, RoomCmd::Ready);
         }
         let game = |view: &ViewRx| view_of::<Chess>(Arc::clone(&*view.borrow())).unwrap();
@@ -949,7 +1362,7 @@ mod tests {
             id: 1,
             name: "~p1".into(),
         };
-        room.join(who, Arc::downgrade(&seat)).await.unwrap();
+        room.join(who, None, Arc::downgrade(&seat)).await.unwrap();
         let faster = snake_core::config::Rules {
             tick_ms: 100,
             ..quick_rules()

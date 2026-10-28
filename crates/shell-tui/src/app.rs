@@ -1031,6 +1031,16 @@ impl App {
         true
     }
 
+    /// The player is back in a game they're still playing, from a
+    /// connection that dropped: it opens, whatever was showing.
+    pub fn rejoin_room(&mut self, me: PlayerId, view: Arc<dyn AnyView>) -> bool {
+        if !self.enter_room(me, view) {
+            return false;
+        }
+        self.online.notice = Some("Welcome back: your game went on.".to_string());
+        true
+    }
+
     /// This player now watches `friend` play, in a room with no seat for
     /// them. `false` if the app has no screens for its game.
     pub fn watch_room(&mut self, me: PlayerId, friend: String, view: Arc<dyn AnyView>) -> bool {

@@ -5,61 +5,19 @@ mod common;
 
 use std::time::Duration;
 
+use common::accounts::line_of;
 use common::accounts::{DOWN, UP, connect_as, make_friends, sign_up};
+use common::chess::{LEFT, RIGHT, account, back, challenge, play, start, two_moves_then_ann_drops};
 use common::rooms::{create_room, join_room};
 use common::*;
-
-const LEFT: &[u8] = b"\x1b[D";
-const RIGHT: &[u8] = b"\x1b[C";
 
 fn chess_server() -> TestServer {
     TestServer::with(|cfg| cfg.enabled_games = vec!["snake".into(), "chess".into()])
 }
 
-/// A guest who typed `ssh chess@host`, on chess's home menu.
+/// A chess guest on `server`.
 async fn guest(server: &TestServer) -> Player {
-    let mut p = Player::join(server.addr, Login::GuestNamed("chess"), 100, 30).await;
-    p.wait_for("Board and pieces").await;
-    p
-}
-
-/// `ann` makes a room where she plays white, `keys` set its time control,
-/// and `ben` joins it.
-async fn challenge(ann: &mut Player, ben: &mut Player, keys: &[&[u8]]) {
-    let code = create_room(ann).await;
-    ann.send(b"e").await;
-    ann.wait_for("Challenge").await;
-    for &key in keys {
-        ann.send(key).await;
-    }
-    // The host's side: random, then white.
-    ann.send(DOWN).await;
-    ann.send(DOWN).await;
-    ann.send(RIGHT).await;
-    ann.wait_for("◂ white ▸").await;
-    ann.send(ESC).await;
-    ann.wait_for("you play white").await;
-    join_room(ben, &code).await;
-    ben.wait_for("plays white").await;
-}
-
-/// Both say they're ready, and the game starts.
-async fn start(ann: &mut Player, ben: &mut Player) {
-    ann.send(ENTER).await;
-    ben.send(ENTER).await;
-    ann.wait_for("Your move within").await;
-    ben.wait_for("White to move within").await;
-}
-
-/// `who` plays `san` once the moves so far end with `after`, as the
-/// panel lists them.
-async fn play(who: &mut Player, after: &str, san: &str) {
-    if !after.is_empty() {
-        who.wait_for(after).await;
-    }
-    who.wait_for("Your move").await;
-    who.send(san.as_bytes()).await;
-    who.send(ENTER).await;
+    common::chess::guest(server.addr).await
 }
 
 #[tokio::test]
@@ -152,6 +110,30 @@ async fn a_draw_is_agreed_and_a_rematch_follows() {
     })
     .await;
     start(&mut ann, &mut ben).await;
+}
+
+#[tokio::test]
+async fn a_dropped_player_comes_back_to_their_game() {
+    let server = chess_server();
+    let (mut ann, key) = account(server.addr, "ann").await;
+    let (mut ben, _) = account(server.addr, "ben").await;
+    challenge(&mut ann, &mut ben, &[]).await;
+    two_moves_then_ann_drops(ann, &mut ben).await;
+
+    // Her key signs her in, and she's back where she was, with her clock
+    // having run while she was gone.
+    let mut ann = back(server.addr, &key).await;
+    ann.wait_for("1. e4      e5").await;
+    ann.wait_until("her clock to have run", Duration::from_secs(5), |p| {
+        line_of(&p.text(), "ann (you)").contains("9:5")
+    })
+    .await;
+    play(&mut ann, "", "Nf3").await;
+    ben.wait_for("2. Nf3").await;
+    ben.wait_until("ann to be back", Duration::from_secs(5), |p| {
+        !p.text().contains("away")
+    })
+    .await;
 }
 
 #[tokio::test]

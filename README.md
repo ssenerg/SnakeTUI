@@ -149,6 +149,12 @@ opens it, and new players choose between the two.
   for the pieces (some terminals draw the glyphs badly), coordinates,
   promoting to a queen without asking, whether letter keys type moves or
   move the cursor like WASD and HJKL, and asking before resigning.
+- **Dropped connections.** If a signed-in player's connection drops
+  mid-game, or they quit, their seat waits 90 seconds while their clock
+  runs on; the other player sees how long. Connecting again, with their
+  key or by signing in, on any of the servers, takes them straight back to
+  the game. After 90 seconds they lose by abandonment, or the game is
+  aborted if they hadn't moved yet. A guest who goes loses at once.
 - **Watching** works as in Snake: `v` on a friend who's playing.
 
 ### Accounts, friends and ratings
