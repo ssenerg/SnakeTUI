@@ -201,6 +201,14 @@ mod tests {
     }
 
     #[test]
+    fn the_image_serves_both_games() {
+        let image = include_str!("../../../deploy/docker/server.toml");
+        let cfg: ServerConfig = toml::from_str(image).unwrap();
+        assert!(cfg.check().is_ok());
+        assert_eq!(cfg.games(), [GameId::Snake, GameId::Chess]);
+    }
+
+    #[test]
     fn enabled_games_are_known_and_listed_in_order() {
         let cfg = |text: &str| toml::from_str::<ServerConfig>(text).unwrap();
         let both = cfg("enabled_games = [\"chess\", \"snake\"]");

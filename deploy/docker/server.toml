@@ -9,3 +9,6 @@ admin_listen = "0.0.0.0:9022"
 # Both in the volume at /var/lib/snaketui: keep it.
 host_key = "/var/lib/snaketui/host_ed25519_key"
 database = "sqlite:///var/lib/snaketui/snaketui.db"
+
+# Snake and chess: new players pick one, and `ssh chess@host` opens chess.
+enabled_games = ["snake", "chess"]
