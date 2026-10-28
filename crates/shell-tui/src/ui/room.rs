@@ -100,7 +100,7 @@ fn draw_lobby(
             secs(left)
         )),
         None if view.seats.len() < 2 => Line::from("Waiting for another player…"),
-        None => Line::default(),
+        None => Line::from("Starting when everyone is ready"),
     });
     lines.push(match &app.online.notice {
         Some(notice) => Line::styled(notice.clone(), Style::default().fg(Color::LightYellow)),
@@ -137,6 +137,8 @@ fn draw_results(frame: &mut Frame, ui: &dyn GameUi, room: &InRoom, next_in: Opti
     let (headline, color) = match view.winner() {
         Some(winner) if winner.id == room.me => ("★ You win! ★".to_string(), Color::LightGreen),
         Some(winner) => (format!("{} wins!", named(winner)), Color::LightCyan),
+        // Called off before it counted.
+        None if view.placements.is_empty() => ("No result".to_string(), Color::Gray),
         None => ("Draw!".to_string(), Color::LightYellow),
     };
     let inner = dialog(frame, " RESULTS ", color, 48, height);

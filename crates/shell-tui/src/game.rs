@@ -140,7 +140,7 @@ pub trait GameUi: Any + Send + Sync {
     }
 
     /// A note beside "Create a private room", such as what it's made with.
-    fn room_note(&self) -> Option<&'static str> {
+    fn room_note(&self) -> Option<String> {
         None
     }
 
@@ -148,8 +148,9 @@ pub trait GameUi: Any + Send + Sync {
     /// this player makes.
     fn room_settings(&self) -> Vec<u8>;
 
-    /// How this player, on a terminal of `size`, gets into quick play.
-    fn quick_play(&self, size: Size) -> QuickPlay;
+    /// How this player, on a terminal of `size`, gets into quick play; or
+    /// why they can't yet.
+    fn quick_play(&self, size: Size) -> Result<QuickPlay, String>;
 
     /// Its ratings, at least one, each with its own leaderboard; the first
     /// is the one the home menu shows.
@@ -161,7 +162,8 @@ pub trait GameUi: Any + Send + Sync {
     }
 
     // The game's own screens: what shows while the app's screen is
-    // [`crate::Screen::Game`].
+    // [`crate::Screen::Game`]. Keys come to a game as typed, Shift and all;
+    // one that doesn't care makes them [`Key::lower`].
 
     fn key(&mut self, key: Key, ctx: &Ctx) -> Reply {
         let _ = (key, ctx);

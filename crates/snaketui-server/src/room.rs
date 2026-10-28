@@ -687,10 +687,10 @@ impl<G: Served> RoomActor<G> {
                     return;
                 };
                 let rtt = self.pings.get(&id).copied();
-                if let Some(end) = self.guarded(ctx, |room| room.play(id, input, rtt))
-                    && end.is_some()
-                {
+                if let Some(end) = self.guarded(ctx, |room| room.play(id, input, rtt)) {
                     self.on_end(end, ctx);
+                    // A move that shows, such as chess's, goes out at once;
+                    // Snake's turns show on the next tick.
                     self.publish();
                 }
             }
@@ -885,6 +885,57 @@ mod tests {
         assert!(watch(MAX_WATCHERS).await.is_ok());
         let snake = view_of::<Snake>(Arc::clone(&*view.borrow())).expect("a Snake room");
         assert_eq!(snake.settings.width, quick_rules().width);
+    }
+
+    #[actix_rt::test]
+    async fn a_chess_move_shows_at_once() {
+        use chess_core::moves::Move;
+        use chess_core::round::{Chess, ChessInput, ChessSettings, Side};
+
+        let mut settings = game_api::RoomSettings::<Chess>::new(
+            ChessSettings {
+                side: Side::White,
+                ..ChessSettings::default()
+            },
+            RoomKind::Private,
+        )
+        .unwrap();
+        settings.countdown = Duration::ZERO;
+        let room = Room::<Chess>::new(settings, 1);
+        let (room, mut view) = RoomActor::new(room, RoomSetup::default());
+        let room: Arc<dyn RoomPort> = Arc::new(room.start());
+        let seats = [Arc::new(()), Arc::new(())];
+        for (id, seat) in [1, 2].into_iter().zip(&seats) {
+            let who = Entrant {
+                id,
+                name: format!("p{id}"),
+            };
+            room.join(who, Arc::downgrade(seat)).await.unwrap();
+            room.send(id, RoomCmd::Ready);
+        }
+        let game = |view: &ViewRx| view_of::<Chess>(Arc::clone(&*view.borrow())).unwrap();
+        while !matches!(game(&view).shell.phase, PhaseView::Running { .. }) {
+            view.changed().await.unwrap();
+        }
+        // Just after a second's tick of the first-move timer, the next is
+        // most of a second away.
+        view.changed().await.unwrap();
+        let e4 = Move::parse_uci("e2e4").unwrap();
+        room.send(1, RoomCmd::Play(games::encode(&ChessInput::Move(e4))));
+        let shown = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                view.changed().await.unwrap();
+                if game(&view)
+                    .game
+                    .as_ref()
+                    .is_some_and(|g| g.moves.len() == 1)
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(shown.is_ok(), "the move waited for the room's next tick");
     }
 
     #[actix_rt::test]

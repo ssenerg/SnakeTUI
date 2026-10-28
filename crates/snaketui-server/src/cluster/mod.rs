@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use async_nats::{Client, ConnectOptions, Subscriber};
 use bytes::Bytes;
 use futures::StreamExt;
+use game_api::GameId;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
@@ -28,7 +29,6 @@ use tracing::{debug, info, warn};
 use self::rooms::{Export, Import};
 use self::wire::{Alive, decode, encode};
 use crate::config::ClusterConfig;
-use crate::games::GAMES;
 use crate::room::{LocalRooms, RoomRef, ServerId};
 
 /// How often a server says it's alive.
@@ -51,6 +51,8 @@ pub struct Cluster {
     pub server: ServerId,
     pub region: String,
     load: Load,
+    /// The games this server serves, and hosts matches of.
+    games: Vec<GameId>,
     /// Stopping: other servers and the queue are told, so no new matches
     /// come here.
     draining: AtomicBool,
@@ -105,6 +107,7 @@ impl Cluster {
         server: ServerId,
         rooms: LocalRooms,
         load: Load,
+        games: Vec<GameId>,
     ) -> Result<Arc<Self>> {
         let client = nats_options(&cfg.nats)?
             .name(format!("snaketui-server {server:016x}"))
@@ -117,6 +120,7 @@ impl Cluster {
             server,
             region: cfg.region.clone(),
             load,
+            games,
             draining: AtomicBool::new(false),
             prefix: prefix(&cfg.name),
             client,
@@ -291,7 +295,7 @@ impl Cluster {
                         region: self.region.clone(),
                         load: (self.load)(),
                         draining: self.draining.load(Ordering::Relaxed),
-                        games: GAMES.iter().map(|g| g.info().id).collect(),
+                        games: self.games.clone(),
                     };
                     self.send(alive.clone(), &beat);
                 }

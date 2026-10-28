@@ -1,0 +1,12 @@
+[package]
+name = "chess-tui"
+description = "Chess's screens: its settings, a room's challenge, and the board games are played on"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+chess-core = { path = "../chess-core", features = ["serde"] }
+game-api = { workspace = true, features = ["serde"] }
+ratatui.workspace = true
+shell-tui.workspace = true

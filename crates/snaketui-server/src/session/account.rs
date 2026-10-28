@@ -85,9 +85,10 @@ impl SessionActor {
         let ratings = every_rating()
             .map(|key| {
                 let standing = self.standing(key);
+                let system = games::get(key.game).map(|g| g.info().rating);
                 ShownRating {
                     key,
-                    rating: standing.rating.shown(),
+                    rating: system.map_or(0, |s| s.shown(&standing)),
                     games: standing.games,
                     wins: standing.wins,
                 }

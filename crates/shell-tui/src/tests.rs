@@ -86,11 +86,11 @@ impl GameUi for ToyUi {
         Vec::new()
     }
 
-    fn quick_play(&self, _: Size) -> QuickPlay {
-        QuickPlay {
+    fn quick_play(&self, _: Size) -> Result<QuickPlay, String> {
+        Ok(QuickPlay {
             pool: "duel",
             too_small: None,
-        }
+        })
     }
 
     fn ratings(&self) -> &'static [Category] {

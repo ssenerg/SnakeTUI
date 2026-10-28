@@ -135,6 +135,8 @@ pub type Client = client::Handle<TrustAnyHost>;
 #[derive(Clone, Copy)]
 pub enum Login<'a> {
     Key(&'a PrivateKey),
+    /// With a key, as `ssh <user>@host`.
+    KeyAs(&'a PrivateKey, &'a str),
     Guest,
     /// A guest who typed `ssh <name>@host`.
     GuestNamed(&'a str),
@@ -148,10 +150,14 @@ pub async fn connect(addr: SocketAddr) -> Client {
 
 pub async fn sign_in(client: &mut Client, login: Login<'_>) -> bool {
     match login {
-        Login::Key(key) => {
+        Login::Key(key) | Login::KeyAs(key, _) => {
+            let user = match login {
+                Login::KeyAs(_, user) => user,
+                _ => "alice",
+            };
             let key = PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None);
             client
-                .authenticate_publickey("alice", key)
+                .authenticate_publickey(user, key)
                 .await
                 .unwrap()
                 .success()

@@ -65,8 +65,8 @@ no account on the machine, and quitting the game ends their connection at once.
 - **Which game.** `ssh snake@play.example.com` opens Snake. Plain
   `ssh play.example.com` opens the game you had open last time, kept for
   your key or account. Once a server has more than one game, new players
-  pick one, and `g` on the home menu switches. Snake is the only one so
-  far.
+  pick one, and `g` on the home menu switches. Chess is the second, on
+  servers that turn it on (see [Chess](#chess)).
 - **Only the game.** Commands (`ssh host ls`), file transfer and port
   forwarding are refused with a message.
 - **Limits.** Connections are capped in total and per IP address. Logins time
@@ -120,6 +120,36 @@ gives no speed boost.
   next tick. The scoreboard shows the number when it's wide enough, and a
   colored dot otherwise. The server times it by asking the terminal for a
   status report every 2 seconds, which every terminal answers.
+
+### Chess
+
+Chess is off unless the server's `server.toml` turns it on:
+`enabled_games = ["snake", "chess"]`. Then `ssh chess@play.example.com`
+opens it, and new players choose between the two.
+
+- **Challenges.** Make a private room and share its code, or invite a
+  friend. The host's challenge says the time control and which side they
+  play: ←→ in the lobby steps through 1+0, 2+1, 3+0, 3+2, 5+0, 5+3, 10+0,
+  10+5, 15+10, 30+0 and 30+20, and `e` sets any starting time from a
+  quarter of a minute to 3 hours, any increment up to 3 minutes, and the
+  host's side: white, black or drawn. A game starts once both players are
+  ready, and the room's next game is the rematch. Challenges are unrated
+  for now, and quick pairing comes later.
+- **The board** fits an 80×24 terminal with the clocks, what each side has
+  taken and the moves beside it. Smaller terminals get a smaller board.
+- **Moves.** Type them, as `Nf3`, `exd5`, `O-O` or `e7e8q`: as you type,
+  the squares the move could mean light up, and Enter plays it once only
+  one move fits. Or pick a piece with the arrows and Enter, then its
+  square. Esc opens a menu to offer or accept a draw, resign (it asks
+  first), abort before both sides have moved, and flip the board.
+- **Clocks** are the server's, with the increment added after each move
+  and a little of each move's lag given back. Each side has 30 seconds for
+  their first move, or the game is aborted.
+- **Settings**, on chess's home menu: the board's colors, glyphs or letters
+  for the pieces (some terminals draw the glyphs badly), coordinates,
+  promoting to a queen without asking, whether letter keys type moves or
+  move the cursor like WASD and HJKL, and asking before resigning.
+- **Watching** works as in Snake: `v` on a friend who's playing.
 
 ### Accounts, friends and ratings
 
@@ -353,9 +383,10 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/game-api` | What every game shares: players, the `Game` and `Round` traits a game implements, and `Room`, which runs any game's lobby, countdown and results |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), multiplayer rounds (`Snake`, a `Game`), settings, records. No terminal or file access |
-| `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess. Not playable yet |
+| `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess; and rooms' chess (`Chess`, a `Game`) |
 | `crates/shell-tui` | The app around every game, drawn through any ratatui backend: the home menu, accounts, friends, the leaderboard, the game picker, and rooms' lobby and results. Each game adds its screens through `GameUi` |
 | `crates/snake-tui` | Snake's screens: single player, and its part of rooms (`SnakeUi`, a `GameUi`). The local game drives them on their own |
+| `crates/chess-tui` | Chess's screens: the board, typed and picked moves, the game menu, a room's challenge and the settings (`ChessUi`, a `GameUi`) |
 | `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room of any game (actix), the games it serves (`games/`), the quick-play matcher with a pool per game and kind of match, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, draining on shutdown, health and metrics over HTTP, the PROXY protocol, `server.toml`; and `snaketui-matchmaker`, the quick-play queue for a cluster of servers |
 | `crates/loadbot` | `snaketui-loadbot`: thousands of bot players, to see how servers hold up |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |

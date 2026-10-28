@@ -315,6 +315,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: Key, effects: &mut Vec<Effect>) {
+        // Games read keys as typed; the app's own screens only care about
+        // case in what's typed into a field.
+        let raw = key;
         let typing = matches!(self.screen, Screen::Input(_) | Screen::Form(_));
         let key = if typing { key } else { key.lower() };
         if key == Key::CtrlC {
@@ -332,12 +335,12 @@ impl App {
             Screen::Finding => self.finding_key(key, effects),
             // Nothing to do until the room answers.
             Screen::Joining { .. } | Screen::JoiningToWatch => {}
-            Screen::Room => self.room_key(key, effects),
+            Screen::Room => self.room_key(raw, effects),
             Screen::Form(kind) => self.form_key(kind, key, effects),
             Screen::Account { selected } => self.account_key(selected, key, effects),
             Screen::Friends { selected } => self.friends_key(selected, key, effects),
             Screen::Leaderboard { category } => self.leaderboard_keys(category, key, effects),
-            Screen::Game => self.game_key(key, effects),
+            Screen::Game => self.game_key(raw, effects),
         }
     }
 
@@ -511,8 +514,14 @@ impl App {
                 self.screen = Screen::Game;
             }
             HomeItem::QuickPlay => {
-                let quick = self.ui().quick_play(self.size);
                 let online = &mut self.online;
+                let quick = match self.games[self.open].quick_play(self.size) {
+                    Ok(quick) => quick,
+                    Err(why) => {
+                        online.notice = Some(why);
+                        return;
+                    }
+                };
                 if let Some(warning) = quick.too_small
                     && !online.confirm_small
                 {
@@ -639,6 +648,7 @@ impl App {
         if let Some(reply) = self.games[i].room_key(key, room) {
             return self.follow(i, reply, effects);
         }
+        let key = key.lower();
         let ui = &*self.games[i];
         let playing = ui.in_play(room);
         let bots = ui.bots();

@@ -564,7 +564,7 @@ impl SessionActor {
         };
         let asked = self.player.as_ref().and_then(|p| p.game);
         let mut app = App::online(
-            games::uis(),
+            games::uis(&self.shared.games),
             asked.or(last_game),
             self.guest_name(),
             self.fingerprint().is_some(),
@@ -833,6 +833,7 @@ impl SessionActor {
         let lobby = self.shared.lobby.clone();
         let seed = self.shared.cfg.room_seed.unwrap_or_else(rand::random);
         let room = games::get(game)
+            .filter(|_| self.shared.games.contains(&game))
             .ok_or(JoinFail::OtherGame)
             .and_then(|g| g.private_room(settings, seed).map_err(JoinFail::Refused));
         let who = self.entrant();

@@ -52,6 +52,10 @@ stall_timeout_secs = 20
 # service's TimeoutStopSec above this. 0 logs everyone out at once.
 drain_timeout_secs = 200
 
+# The games players can open: "snake", and "chess". With more than one, new
+# players choose, and `ssh chess@play.example.com` opens chess directly.
+enabled_games = ["snake"]
+
 # Several servers working as one: players on any of them share private
 # rooms, see their friends online, invite them, and wait in one quick-play
 # queue. Each server needs the same Postgres database (above) and the same

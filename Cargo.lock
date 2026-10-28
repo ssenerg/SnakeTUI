@@ -527,10 +527,21 @@ name = "chess-core"
 version = "0.2.0"
 dependencies = [
  "cozy-chess",
+ "game-api",
  "postcard",
  "rand 0.10.2",
  "serde",
  "skillratings",
+]
+
+[[package]]
+name = "chess-tui"
+version = "0.2.0"
+dependencies = [
+ "chess-core",
+ "game-api",
+ "ratatui",
+ "shell-tui",
 ]
 
 [[package]]
@@ -3441,6 +3452,8 @@ dependencies = [
  "argon2",
  "async-nats",
  "bytes",
+ "chess-core",
+ "chess-tui",
  "clap",
  "futures",
  "game-api",

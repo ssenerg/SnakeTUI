@@ -250,15 +250,15 @@ impl GameUi for SnakeUi {
         self.screen = SnakeScreen::Menu;
     }
 
-    fn room_note(&self) -> Option<&'static str> {
-        Some("your settings")
+    fn room_note(&self) -> Option<String> {
+        Some("your settings".to_string())
     }
 
     fn room_settings(&self) -> Vec<u8> {
         encode(&self.cfg.rules)
     }
 
-    fn quick_play(&self, size: Size) -> QuickPlay {
+    fn quick_play(&self, size: Size) -> Result<QuickPlay, String> {
         let rules = quick_rules();
         let too_small = (!ui::room_fits(rules.width, rules.height, size)).then(|| {
             let (w, h) = ui::room_size(rules.width, rules.height);
@@ -268,10 +268,10 @@ impl GameUi for SnakeUi {
                 size.width, size.height
             )
         });
-        QuickPlay {
+        Ok(QuickPlay {
             pool: QUICK_POOL,
             too_small,
-        }
+        })
     }
 
     fn ratings(&self) -> &'static [Category] {
@@ -381,6 +381,7 @@ impl GameUi for SnakeUi {
     }
 
     fn room_key(&mut self, key: Key, room: &InRoom) -> Option<Reply> {
+        let key = key.lower();
         let view = snake_view(room)?;
         match &view.shell.phase {
             PhaseView::Waiting { .. } => match key {

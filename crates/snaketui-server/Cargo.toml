@@ -13,6 +13,8 @@ anyhow.workspace = true
 argon2 = "0.6.0"
 async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs"] }
 bytes = "1"
+chess-core = { path = "../chess-core", features = ["serde"] }
+chess-tui.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 game-api = { workspace = true, features = ["serde"] }

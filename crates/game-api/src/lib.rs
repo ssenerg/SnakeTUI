@@ -41,7 +41,6 @@ pub fn is_bot(id: PlayerId) -> bool {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GameId {
     Snake,
-    /// Not served yet.
     Chess,
 }
 

@@ -7,6 +7,7 @@
 //! matched and rated, and reads its views when they come from another
 //! server.
 
+pub mod chess;
 pub mod snake;
 
 use std::any::Any;
@@ -89,6 +90,20 @@ fn decode_view<G: Served>(body: &[u8]) -> Option<Arc<dyn AnyRoomView>> {
 pub enum RatingSystem {
     /// Free-for-all games of any size: see [`crate::rating`].
     WengLin,
+    /// Games between two: see [`chess_core::rating`].
+    Glicko2,
+}
+
+impl RatingSystem {
+    /// The rating `standing` shows.
+    pub fn shown(self, standing: &crate::store::Standing) -> u32 {
+        match self {
+            RatingSystem::WengLin => standing.rating.shown(),
+            // No game of these is rated yet, so everyone shows where
+            // they start.
+            RatingSystem::Glicko2 => chess_core::rating::Rating::default().shown(),
+        }
+    }
 }
 
 /// One way to be matched in quick play, such as Snake's free-for-all.
@@ -143,8 +158,9 @@ pub trait GameServer: Send + Sync + 'static {
     fn ui(&self) -> Box<dyn GameUi>;
 }
 
-/// Every game this server serves.
-pub static GAMES: &[&dyn GameServer] = &[&snake::SnakeServer];
+/// Every game this server knows. It serves those its config enables, and
+/// reads the rest's rooms and ratings.
+pub static GAMES: &[&dyn GameServer] = &[&snake::SnakeServer, &chess::ChessServer];
 
 pub fn get(id: GameId) -> Option<&'static dyn GameServer> {
     GAMES.iter().copied().find(|g| g.info().id == id)
@@ -172,9 +188,13 @@ pub fn for_ssh_user(user: &str) -> Option<GameId> {
         .map(|info| info.id)
 }
 
-/// Every game's screens, for a new player.
-pub fn uis() -> Vec<Box<dyn GameUi>> {
-    GAMES.iter().map(|g| g.ui()).collect()
+/// The screens of every game in `enabled`, for a new player.
+pub fn uis(enabled: &[GameId]) -> Vec<Box<dyn GameUi>> {
+    GAMES
+        .iter()
+        .filter(|g| enabled.contains(&g.info().id))
+        .map(|g| g.ui())
+        .collect()
 }
 
 /// A pool players wait in for quick play: one of a game's.

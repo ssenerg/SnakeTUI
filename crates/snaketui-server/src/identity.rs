@@ -135,9 +135,9 @@ mod tests {
         assert_eq!(snake.nick, format!("player-{}", snake.tag));
         assert_eq!(Player::guest("SNAKE").game, Some(GameId::Snake));
         assert_eq!(Player::guest("alice").game, None);
-        // Not served yet, so it opens nothing, but nobody is called it.
+        // Asked for whether or not this server has chess turned on.
         let chess = Player::guest("chess");
-        assert_eq!(chess.game, None);
+        assert_eq!(chess.game, Some(GameId::Chess));
         assert_eq!(chess.nick, format!("player-{}", chess.tag));
     }
 

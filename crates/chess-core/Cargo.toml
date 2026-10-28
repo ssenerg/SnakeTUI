@@ -7,13 +7,14 @@ publish = false
 
 [features]
 # Games' views as the server sends them between machines.
-serde = ["dep:serde"]
+serde = ["dep:serde", "game-api/serde"]
 
 [dependencies]
 cozy-chess = "0.3.4"
+game-api.workspace = true
+rand.workspace = true
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 skillratings = "0.29.2"
 
 [dev-dependencies]
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
-rand.workspace = true

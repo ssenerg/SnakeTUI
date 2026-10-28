@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use actix::{Actor, Addr};
 use actix_rt::Arbiter;
 use anyhow::Result;
+use game_api::GameId;
 use russh::keys::PrivateKey;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -78,6 +79,8 @@ pub struct Shared {
     pub queue_len: watch::Receiver<usize>,
     /// Hands out each session's player id.
     pub next_player: AtomicU64,
+    /// The games players can open here.
+    pub games: Vec<GameId>,
 }
 
 impl Shared {
@@ -126,7 +129,8 @@ pub async fn serve(
             let server = rand::random::<ServerId>().max(1);
             let open = Arc::clone(&limits);
             let load = Box::new(move || open.open() as u32);
-            let joined = Cluster::connect(cluster, server, rooms.clone(), load).await?;
+            let joined =
+                Cluster::connect(cluster, server, rooms.clone(), load, cfg.games()).await?;
             (server, Some(joined))
         }
         None => (0, None),
@@ -164,6 +168,7 @@ pub async fn serve(
     let shared = Arc::new(Shared {
         ssh: Arc::new(ssh::config(host_key)),
         proxies: Trusted::parse(&cfg.trusted_proxies)?,
+        games: cfg.games(),
         cfg,
         server,
         rooms,

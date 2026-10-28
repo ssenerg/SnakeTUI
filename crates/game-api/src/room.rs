@@ -22,8 +22,8 @@ pub struct RoomSettings<G: Game> {
     pub kind: RoomKind,
     pub max_players: usize,
     /// Private rooms: how long after the second player arrives the countdown
-    /// starts by itself.
-    pub start_after: Duration,
+    /// starts by itself; `None` waits until everyone is ready.
+    pub start_after: Option<Duration>,
     pub countdown: Duration,
     /// Private rooms: how long the results show before the next round.
     pub results_for: Duration,
@@ -39,7 +39,7 @@ impl<G: Game> RoomSettings<G> {
             game,
             kind,
             max_players,
-            start_after: Duration::from_secs(15),
+            start_after: Some(Duration::from_secs(15)),
             countdown: Duration::from_secs(3),
             results_for: Duration::from_secs(8),
         })
@@ -305,9 +305,9 @@ impl<G: Game> Room<G> {
     /// didn't see.
     fn lobby_changed(&mut self) {
         let enough = self.seats.len() >= MIN_PLAYERS;
-        let restart = self.clock + self.settings.start_after;
+        let restart = self.settings.start_after.map(|after| self.clock + after);
         if let Phase::Waiting { start_at } = &mut self.phase {
-            *start_at = enough.then_some(restart);
+            *start_at = restart.filter(|_| enough);
         }
         for seat in &mut self.seats {
             seat.ready = false;
@@ -422,7 +422,7 @@ impl<G: Game> Room<G> {
             && start_at.is_none()
             && self.seats.len() >= MIN_PLAYERS
         {
-            *start_at = Some(self.clock + self.settings.start_after);
+            *start_at = self.settings.start_after.map(|after| self.clock + after);
         }
     }
 
@@ -701,6 +701,20 @@ mod tests {
             [0, 0],
             "the round shows from its countdown"
         );
+    }
+
+    #[test]
+    fn a_room_without_a_timer_waits_for_everyone() {
+        let mut settings = RoomSettings::<Presses>::new(3, RoomKind::Private).unwrap();
+        settings.start_after = None;
+        let mut room = Room::new(settings, 1);
+        room.join(who(1)).unwrap();
+        room.join(who(2)).unwrap();
+        room.advance(60 * S);
+        assert_eq!(phase(&room), PhaseView::Waiting { starts_in: None });
+        room.toggle_ready(1);
+        room.toggle_ready(2);
+        assert!(matches!(phase(&room), PhaseView::Countdown { .. }));
     }
 
     #[test]

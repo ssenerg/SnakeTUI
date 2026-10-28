@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use game_api::GameId;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +44,9 @@ pub struct ServerConfig {
     /// When stopping: seconds players in a round may finish it, before
     /// everyone is logged out. 0 logs everyone out at once.
     pub drain_timeout_secs: u64,
+    /// The games players can open, by name: `snake`, and `chess`. Rooms
+    /// and ratings of the others still work for players already in them.
+    pub enabled_games: Vec<String>,
     /// Servers that share rooms, friends and the queue. Without it, this
     /// server plays on its own.
     pub cluster: Option<ClusterConfig>,
@@ -66,6 +70,7 @@ impl Default for ServerConfig {
             idle_timeout_secs: 600,
             stall_timeout_secs: 20,
             drain_timeout_secs: 200,
+            enabled_games: vec!["snake".to_string()],
             cluster: None,
             room_seed: None,
         }
@@ -112,6 +117,15 @@ impl ServerConfig {
     /// Settings that parse but can't work together.
     pub fn check(&self) -> Result<()> {
         crate::proxy::Trusted::parse(&self.trusted_proxies).context("in trusted_proxies")?;
+        for name in &self.enabled_games {
+            let known = GameId::from_name(name).and_then(crate::games::get);
+            if known.is_none() {
+                bail!("enabled_games: there's no game called {name:?}");
+            }
+        }
+        if self.games().is_empty() {
+            bail!("enabled_games needs at least one game");
+        }
         let Some(cluster) = &self.cluster else {
             return Ok(());
         };
@@ -133,6 +147,15 @@ impl ServerConfig {
             );
         }
         Ok(())
+    }
+
+    /// The games players can open, in the order the picker lists them.
+    pub fn games(&self) -> Vec<GameId> {
+        crate::games::GAMES
+            .iter()
+            .map(|g| g.info().id)
+            .filter(|id| self.enabled_games.iter().any(|n| n == id.as_str()))
+            .collect()
     }
 
     pub fn workers(&self) -> usize {
@@ -170,6 +193,21 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(example).unwrap();
         assert_eq!(cfg.listen.port(), 22);
         assert!(toml::from_str::<ServerConfig>("listn = \"0.0.0.0:22\"").is_err());
+        assert_eq!(
+            cfg.games(),
+            [GameId::Snake],
+            "chess is off until it's turned on"
+        );
+    }
+
+    #[test]
+    fn enabled_games_are_known_and_listed_in_order() {
+        let cfg = |text: &str| toml::from_str::<ServerConfig>(text).unwrap();
+        let both = cfg("enabled_games = [\"chess\", \"snake\"]");
+        assert!(both.check().is_ok());
+        assert_eq!(both.games(), [GameId::Snake, GameId::Chess]);
+        assert!(cfg("enabled_games = [\"checkers\"]").check().is_err());
+        assert!(cfg("enabled_games = []").check().is_err());
     }
 
     #[test]
