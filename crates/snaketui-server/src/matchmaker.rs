@@ -20,7 +20,7 @@ use crate::cluster::wire::{
     JoinAs, MadeMatch, MakeMatch, MatchedAt, QueueAlive, QueueLeave, QueueTicket, RatedAt, decode,
 };
 use crate::games::{self, PoolKey};
-use crate::matcher::{Pools, Ticket};
+use crate::matcher::{Pools, Ticket, Waiting};
 use crate::rating::Skill;
 use crate::room::{
     Drain, Presence, Rated, RatedMember, RatedNotify, Ratings, RoomCmd, RoomHandle, RoomHost,
@@ -97,19 +97,20 @@ pub struct MatchmakerActor {
     host: Arc<RoomHost>,
     store: Store,
     seed: Option<u64>,
-    queue_len: watch::Sender<usize>,
+    /// How many wait in each pool, for sessions to show.
+    counts: watch::Sender<Waiting>,
     /// The server is stopping: no new matches here.
     draining: bool,
 }
 
 impl MatchmakerActor {
-    /// `queue_len` is kept up to date with how many are waiting. `seed`
+    /// `counts` is kept up to date with how many wait in each pool. `seed`
     /// fixes every match's seed, for tests. With `cluster`, the cluster's
     /// queue makes the matches.
     pub fn new(
         host: Arc<RoomHost>,
         store: Store,
-        queue_len: watch::Sender<usize>,
+        counts: watch::Sender<Waiting>,
         seed: Option<u64>,
         cluster: Option<Arc<Cluster>>,
     ) -> Self {
@@ -129,7 +130,7 @@ impl MatchmakerActor {
             host,
             store,
             seed,
-            queue_len,
+            counts,
             draining: false,
         }
     }
@@ -152,7 +153,7 @@ impl MatchmakerActor {
         match &mut self.queue {
             Queue::Here { matcher, .. } => {
                 matcher.remove(player);
-                self.queue_len.send_replace(matcher.len());
+                self.counts.send_replace(matcher.waiting());
             }
             Queue::Cluster { cluster, .. } => {
                 cluster.send(cluster.subject("queue.leave"), &QueueLeave { player });
@@ -236,7 +237,7 @@ impl MatchmakerActor {
                 });
             }
         }
-        self.queue_len.send_replace(matcher.len());
+        self.counts.send_replace(matcher.waiting());
     }
 
     /// Starts a match the cluster's queue picked this server for. Players
@@ -384,7 +385,7 @@ impl MatchmakerActor {
     }
 
     fn heard_queue(&mut self, alive: QueueAlive) {
-        self.queue_len.send_replace(alive.waiting as usize);
+        self.counts.send_replace(alive.waiting.clone());
         if let Queue::Cluster { cluster, heard, .. } = &mut self.queue
             && *heard != Some(alive.instance)
         {
@@ -431,14 +432,10 @@ impl MatchmakerActor {
         ctx.run_interval(RESEND_EVERY, |act, _| {
             if let Queue::Cluster { cluster, .. } = &act.queue {
                 Self::send_tickets(cluster, act.waiting.values());
-            }
-        });
-        ctx.run_interval(RUN_EVERY, |act, _| {
-            act.drop_gone();
-            if let Queue::Cluster { cluster, .. } = &act.queue {
                 cluster.forget_closed_sessions();
             }
         });
+        ctx.run_interval(RUN_EVERY, |act, _| act.drop_gone());
     }
 }
 
@@ -509,7 +506,7 @@ impl Handler<Enqueue> for MatchmakerActor {
                 if !matcher.add(&waiter.pool, ticket) {
                     return warn!(pool = %waiter.pool, "no such pool to queue in");
                 }
-                self.queue_len.send_replace(matcher.len());
+                self.counts.send_replace(matcher.waiting());
             }
             Queue::Cluster { cluster, .. } => {
                 Self::send_tickets(cluster, std::iter::once(&waiter));

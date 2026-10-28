@@ -27,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App, category: usize) {
         Some(view) if view.rows.is_empty() => vec![
             Line::default(),
             Line::from(format!("Nobody has played {RANKED_AFTER} rated games yet.")).centered(),
-            Line::styled(format!("{label} is rated."), dim).centered(),
+            Line::styled("Quick play's matches are rated.", dim).centered(),
             Line::default(),
         ],
         Some(view) => {

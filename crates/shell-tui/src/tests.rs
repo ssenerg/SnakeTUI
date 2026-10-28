@@ -384,7 +384,8 @@ fn each_rating_has_its_own_leaderboard() {
     app.set_leaderboard(board(brawls));
     assert!(app.online.leaderboard.is_some());
     let brawl = shown(&app);
-    assert!(brawl.contains("Brawls is rated."), "{brawl}");
+    assert!(brawl.contains("· Brawls "), "{brawl}");
+    assert!(brawl.contains("Quick play's matches are rated."), "{brawl}");
     assert!(brawl.contains("←→ rating · Esc back"), "{brawl}");
 
     assert_eq!(app.handle(Key::Char('d')), [Effect::LoadLeaderboard(duels)]);
@@ -398,8 +399,9 @@ fn each_rating_has_its_own_leaderboard() {
 fn the_account_shows_the_open_games_ratings() {
     let mut app = app(Some(GameId::Snake));
     sign_in(&mut app);
+    // Home names the rating played most, of the two.
     let home = shown(&app);
-    assert!(home.contains("Signed in as ann · rating 1100"), "{home}");
+    assert!(home.contains("Signed in as ann · duels 1100"), "{home}");
     app.screen = Screen::Account { selected: 0 };
     let account = shown(&app);
     assert!(
@@ -426,5 +428,6 @@ fn the_account_shows_the_open_games_ratings() {
     app.handle(Key::Down);
     app.handle(Key::Enter);
     assert_eq!(app.game(), Some(GameId::Chess));
-    assert!(shown(&app).contains("rating 1500"));
+    let home = shown(&app);
+    assert!(home.contains("Signed in as ann · duels 1500"), "{home}");
 }

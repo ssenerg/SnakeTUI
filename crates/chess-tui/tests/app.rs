@@ -290,7 +290,7 @@ fn pairing_shows_the_ratings_of_a_signed_in_player() {
             category,
         },
         rating,
-        games: 3,
+        games: if provisional { 1 } else { 30 },
         wins: 1,
         provisional,
     };
@@ -303,7 +303,10 @@ fn pairing_shows_the_ratings_of_a_signed_in_player() {
             rating("classical", 1500, true),
         ],
     });
+    // Home shows the rating played most.
     app.go_home(HomeItem::QuickPlay, None);
+    let home = shown(&app, 80, 24);
+    assert!(home.contains("Signed in as ann · blitz 1712"), "{home}");
     app.handle(Key::Enter);
     let screen = shown(&app, 80, 24);
     let blitz = screen.lines().find(|l| l.contains("Blitz")).unwrap();

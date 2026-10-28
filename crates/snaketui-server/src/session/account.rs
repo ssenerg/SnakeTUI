@@ -152,7 +152,7 @@ impl SessionActor {
         let free = |act: &Self| {
             !act.closing
                 && act.room.is_none()
-                && !act.queued
+                && act.queued.is_none()
                 && act.app.as_ref().is_some_and(|a| {
                     !a.in_room() && !a.playing_alone() && a.screen != Screen::Finding
                 })

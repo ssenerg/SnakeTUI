@@ -140,7 +140,9 @@ async fn quick_pairing_keeps_presets_apart_and_rates_each_category_alone() {
     choose_pool(&mut ben, &[DOWN, LEFT, LEFT], "10+0 rapid").await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     for p in [&ann, &ben] {
-        assert!(p.text().contains("Finding a match"), "{}", p.text());
+        let text = p.text();
+        assert!(text.contains("Finding a match"), "{text}");
+        assert!(text.contains("1 in queue"), "each alone in theirs: {text}");
     }
 
     // Ben goes to bullet instead, from 10+0 where pairing opens now.

@@ -207,7 +207,8 @@ impl PoolKey {
         Some((game, game.info().pool(&self.pool)?))
     }
 
-    /// The rating its matches change.
+    /// The rating its matches change; `None` if this server doesn't have
+    /// the pool.
     pub fn rating(&self) -> Option<RatingKey> {
         let (_, pool) = self.find()?;
         Some(RatingKey {

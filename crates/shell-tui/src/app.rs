@@ -879,10 +879,20 @@ impl App {
         }
     }
 
-    /// The account's rating that the home menu shows: the open game's
-    /// first.
-    pub fn main_rating(&self) -> Option<&ShownRating> {
-        self.online.account.as_ref()?.rating(self.rating_key(0))
+    /// The account's rating that the home menu shows, as written: the open
+    /// game's most played, else its first, named if the game has several.
+    pub fn main_rating(&self) -> Option<String> {
+        let profile = self.online.account.as_ref()?;
+        let ratings = self.ui().ratings();
+        let (i, shown) = (0..ratings.len())
+            .filter_map(|i| Some((i, profile.rating(self.rating_key(i))?)))
+            // Of the most played, the first.
+            .rev()
+            .max_by_key(|(_, shown)| shown.games)?;
+        Some(match ratings {
+            [_] => format!("rating {}", shown.text()),
+            _ => format!("{} {}", ratings[i].label.to_lowercase(), shown.text()),
+        })
     }
 
     fn show_leaderboard(&mut self, category: usize, effects: &mut Vec<Effect>) {

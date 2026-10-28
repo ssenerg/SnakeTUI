@@ -10,6 +10,7 @@ use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use game_api::PlayerId;
+use serde::{Deserialize, Serialize};
 
 use crate::games::{PoolInfo, PoolKey};
 
@@ -183,6 +184,22 @@ pub struct Pools {
     rules: fn(&PoolKey) -> Option<PoolRules>,
 }
 
+/// How many players wait in each pool; a pool nobody waits in is left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting(pub BTreeMap<PoolKey, u32>);
+
+impl Waiting {
+    /// Players waiting, in every pool.
+    pub fn total(&self) -> usize {
+        self.0.values().map(|&n| n as usize).sum()
+    }
+
+    /// Players waiting in `pool`.
+    pub fn of(&self, pool: &PoolKey) -> usize {
+        self.0.get(pool).map_or(0, |&n| n as usize)
+    }
+}
+
 impl Default for Pools {
     /// The pools of the games this server serves.
     fn default() -> Self {
@@ -224,6 +241,15 @@ impl Pools {
     /// Players waiting, in every pool.
     pub fn len(&self) -> usize {
         self.of.len()
+    }
+
+    /// How many wait in each pool.
+    pub fn waiting(&self) -> Waiting {
+        let counts = self.pools.iter().filter_map(|(pool, matcher)| {
+            let n = u32::try_from(matcher.len()).unwrap_or(u32::MAX);
+            (n > 0).then(|| (pool.clone(), n))
+        });
+        Waiting(counts.collect())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -427,9 +453,22 @@ mod tests {
         // Queueing in another pool leaves the first.
         assert!(pools.add(&pool("duel"), ticket(2, 1000.0, "eu", S)));
         assert_eq!(pools.len(), 2);
+        // Each is counted where they wait.
+        let waiting = pools.waiting();
+        assert_eq!(
+            (waiting.of(&pool("duel")), waiting.of(&pool("ffa"))),
+            (1, 1)
+        );
+        assert_eq!((waiting.of(&pool("chess")), waiting.total()), (0, 2));
         assert!(pools.run(20 * S).is_empty(), "alone in each pool");
         assert!(pools.remove(4));
         assert!(!pools.remove(4));
         assert_eq!(pools.len(), 1);
+        let waiting = pools.waiting();
+        assert_eq!(
+            waiting.0.len(),
+            1,
+            "an empty pool isn't listed: {waiting:?}"
+        );
     }
 }

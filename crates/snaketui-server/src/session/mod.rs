@@ -318,7 +318,8 @@ pub struct SessionActor {
     presence: Arc<()>,
     room: Option<RoomLink>,
     stays: u64,
-    queued: bool,
+    /// The quick-play pool they wait in.
+    queued: Option<PoolKey>,
     wrong_codes: u8,
     /// Signed in to this account.
     account: Option<Account>,
@@ -409,7 +410,7 @@ impl Actor for SessionActor {
         if let Some(link) = self.room.take() {
             link.room.send(self.id, RoomCmd::Gone);
         }
-        if self.queued {
+        if self.queued.is_some() {
             self.shared.matchmaker.do_send(Dequeue(self.id));
         }
     }
@@ -426,7 +427,7 @@ impl SessionActor {
             presence: Arc::new(()),
             room: None,
             stays: 0,
-            queued: false,
+            queued: None,
             wrong_codes: 0,
             account: None,
             ratings: HashMap::new(),
@@ -689,7 +690,7 @@ impl SessionActor {
                     self.enqueue(pool, ctx);
                 }
                 Effect::LeaveQueue => {
-                    self.queued = false;
+                    self.queued = None;
                     self.shared.matchmaker.do_send(Dequeue(self.id));
                 }
                 Effect::CreateRoom { game, settings } => {
@@ -799,18 +800,16 @@ impl SessionActor {
         if self.room.is_some() {
             return;
         }
-        if pool.find().is_none() {
+        // A pool this server has, rated as every pool is.
+        let Some(key) = pool.rating() else {
             warn!(peer = %self.peer, %pool, "quick play in a pool this server doesn't have");
             if let Some(app) = self.app.as_mut() {
                 app.go_home(HomeItem::QuickPlay, Some(TRY_AGAIN.to_string()));
             }
             return self.render(ctx);
-        }
-        let Some(key) = pool.rating() else {
-            return;
         };
         let rating = self.standing(key).rating;
-        self.queued = true;
+        self.queued = Some(pool.clone());
         self.shared.matchmaker.do_send(Enqueue {
             pool,
             who: self.entrant(),
@@ -1260,7 +1259,11 @@ impl SessionActor {
         let Some(app) = self.app.as_mut() else { return };
         let now = Instant::now();
         let effects = app.tick(now - self.last_tick);
-        app.set_queue_len(*self.shared.queue_len.borrow());
+        let waiting = self
+            .queued
+            .as_ref()
+            .map(|p| self.shared.waiting.borrow().of(p));
+        app.set_queue_len(waiting.unwrap_or_default());
         self.last_tick = now;
         self.apply(effects, ctx);
         self.render(ctx);
@@ -1507,7 +1510,7 @@ impl Handler<Matched> for SessionActor {
     type Result = ();
 
     fn handle(&mut self, msg: Matched, ctx: &mut Self::Context) {
-        self.queued = false;
+        self.queued = None;
         self.entered(msg.room, msg.view, ctx);
     }
 }

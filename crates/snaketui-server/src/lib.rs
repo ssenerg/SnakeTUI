@@ -46,6 +46,7 @@ use crate::auth::{GuessLimits, Hasher};
 use crate::cluster::Cluster;
 use crate::config::ServerConfig;
 use crate::lobby::LobbyActor;
+use crate::matcher::Waiting;
 use crate::matchmaker::MatchmakerActor;
 use crate::metrics::TICK_LAG;
 use crate::presence::PresenceActor;
@@ -75,8 +76,9 @@ pub struct Shared {
     pub hasher: Hasher,
     /// Wrong passwords and new accounts, for the guessing limits.
     pub guesses: GuessLimits,
-    /// How many players are waiting in the quick-play queue.
-    pub queue_len: watch::Receiver<usize>,
+    /// How many players wait in each quick-play pool: this server's, or
+    /// the whole cluster's.
+    pub waiting: watch::Receiver<Waiting>,
     /// Hands out each session's player id.
     pub next_player: AtomicU64,
     /// The games players can open here.
@@ -149,7 +151,7 @@ pub async fn serve(
         let cluster = cluster.clone();
         move |_| PresenceActor::new(cluster)
     });
-    let (queue_tx, queue_len) = watch::channel(0);
+    let (queue_tx, waiting) = watch::channel(Waiting::default());
     let seed = cfg.room_seed;
     let matchmaker = MatchmakerActor::start_in_arbiter(&room_arbiters[0].handle(), {
         let store = store.clone();
@@ -180,7 +182,7 @@ pub async fn serve(
         presence,
         hasher: Hasher::new()?,
         guesses,
-        queue_len,
+        waiting,
         // In a cluster, ids from different servers meet in rooms. The top
         // bit stays clear: it marks bots.
         next_player: AtomicU64::new(if cluster.is_some() {

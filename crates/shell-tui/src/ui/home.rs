@@ -54,8 +54,8 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 ));
             }
             HomeItem::Account => {
-                if let Some(shown) = app.main_rating() {
-                    spans.push(Span::styled(format!("  rating {}", shown.text()), dim));
+                if let Some(rating) = app.main_rating() {
+                    spans.push(Span::styled(format!("  {rating}"), dim));
                 }
             }
             _ => {}
@@ -78,8 +78,8 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 Span::styled("Signed in as ", dim),
                 Span::styled(profile.username.clone(), name),
             ];
-            if let Some(shown) = app.main_rating() {
-                spans.push(Span::styled(format!(" · rating {}", shown.text()), dim));
+            if let Some(rating) = app.main_rating() {
+                spans.push(Span::styled(format!(" · {rating}"), dim));
             }
             Line::from(spans)
         }

@@ -99,7 +99,7 @@ fn metrics(shared: &Shared, limits: &Limits) -> String {
     gauge(
         "snaketui_queue_waiting",
         "Players waiting for a quick-play match (the whole cluster's, in a cluster).",
-        *shared.queue_len.borrow() as f64,
+        shared.waiting.borrow().total() as f64,
     );
     let draining = *shared.shutdown.borrow() != Stopping::No;
     gauge(

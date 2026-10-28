@@ -27,7 +27,7 @@ use crate::cluster::wire::{
 use crate::cluster::{HEARTBEAT, PEER_TIMEOUT, nats_options, prefix};
 use crate::config::ClusterConfig;
 use crate::games::PoolKey;
-use crate::matcher::{Pools, Ticket};
+use crate::matcher::{Pools, Ticket, Waiting};
 use crate::room::{RoomRef, ServerId};
 
 /// How often the queue looks for matches.
@@ -98,6 +98,11 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.matcher.len()
+    }
+
+    /// How many wait in each pool.
+    pub fn waiting(&self) -> Waiting {
+        self.matcher.waiting()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -290,7 +295,7 @@ pub async fn run(cfg: &ClusterConfig, speed: f64, stop: impl Future<Output = ()>
             _ = beat.tick() => {
                 let news = QueueAlive {
                     instance,
-                    waiting: queue.len() as u32,
+                    waiting: queue.waiting(),
                 };
                 if let Err(e) = client.publish(format!("{prefix}.queue.alive"), encode(&news)).await {
                     warn!(error = %e, "couldn't send to NATS");

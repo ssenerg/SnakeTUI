@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::games::PoolKey;
+use crate::matcher::Waiting;
 use crate::presence::Doing;
 use crate::rating::Skill;
 use crate::room::{RoomCmd, RoomRef, ServerId};
@@ -55,7 +56,7 @@ pub struct Alive {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueueAlive {
     pub instance: u64,
-    pub waiting: u32,
+    pub waiting: Waiting,
 }
 
 /// A player waiting for a match, sent to the cluster's queue.
@@ -220,6 +221,25 @@ mod tests {
         );
         let view: Arc<dyn AnyRoomView> = snake.decode_view(&wire.body).unwrap();
         assert_eq!(view.game(), GameId::Snake);
+    }
+
+    #[test]
+    fn the_queue_says_how_many_wait_in_each_pool() {
+        let pool = |name: &str| PoolKey {
+            game: GameId::Chess,
+            pool: name.into(),
+        };
+        let waiting = Waiting([(pool("1+0"), 2), (pool("10+0"), 1)].into());
+        let alive = QueueAlive {
+            instance: 4,
+            waiting,
+        };
+        let back: QueueAlive = decode(&encode(&alive)).unwrap();
+        assert_eq!(back, alive);
+        assert_eq!(
+            (back.waiting.of(&pool("1+0")), back.waiting.total()),
+            (2, 3)
+        );
     }
 
     #[test]
