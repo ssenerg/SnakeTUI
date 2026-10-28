@@ -1,22 +1,30 @@
+//! Snake as the app shows it: single player on its own screens, and its
+//! part of rooms. The local game drives the same [`SnakeUi`] on its own.
+
 use std::time::Duration;
 
+use game_api::codec::encode;
+use game_api::{AnyView, PlayerId, RatingKey};
+use ratatui::Frame;
 use ratatui::layout::Size;
-use snake_core::config::{GameConfig, Rules};
+use ratatui::style::Color;
+use ratatui::text::Span;
+use shell_tui::online::InRoom;
+use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickPlay, Reply, Saved};
+use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::geom::Direction;
 use snake_core::records::Records;
-use snake_core::settings::SETTINGS;
+use snake_core::round::{
+    PhaseView, QUICK_POOL, QUICK_RATING, RacerView, RoomView, SeatView, Snake, max_players_for,
+    quick_rules,
+};
+use snake_core::settings::{SETTINGS, room_settings};
 use snake_core::solo::SoloGame;
 
-use crate::key::Key;
-use crate::online::{Field, Form, FormKind, Online, Secret};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Screen {
-    /// Online: the main menu, at the [`App::home_items`] entry `selected`.
-    Home {
-        selected: usize,
-    },
+pub enum SnakeScreen {
     /// Single-player settings. The local game starts here.
     Menu,
     Playing,
@@ -26,140 +34,48 @@ pub enum Screen {
     GameOver {
         new_record: bool,
     },
-    /// Online: typing into [`App::input`].
-    Input(Field),
-    /// Online: in the quick-play queue.
-    Finding,
-    /// Online: waiting to get into a private room.
-    Joining {
-        by_code: bool,
-    },
-    /// Online: in a room. What shows follows the room's phase.
-    Room,
-    /// Online: filling in [`App::form`].
-    Form(FormKind),
-    /// Online: the signed-in account.
-    Account {
-        selected: usize,
-    },
-    /// Online: friends and friend requests.
-    Friends {
-        selected: usize,
-    },
-    /// Online: the best players by rating.
-    Leaderboard,
-    /// Online: on the way to watching a friend's game.
-    JoiningToWatch,
-    /// Online: a private room's rules, at [`snake_core::settings::room_settings`]
-    /// entry `selected`. The host changes them.
+    /// A private room's rules, at [`room_settings`] entry `selected`. The
+    /// host changes them.
     RoomRules {
         selected: usize,
     },
 }
 
-/// Work the app leaves to whoever runs it, in the order given.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Effect {
-    /// Persist [`App::cfg`].
-    SaveConfig,
-    /// A new best was just set in [`App::records`]. By the time this is
-    /// handled the game may be gone, so it says which record changed.
-    RecordSet {
-        key: String,
-        best: u32,
-    },
-    /// Leave the app.
-    Quit,
-    /// Join the quick-play queue; answer with [`App::enter_room`].
-    QuickPlay,
-    LeaveQueue,
-    /// Make a private room with these rules and join it; answer with
-    /// [`App::enter_room`] or [`App::join_failed`].
-    CreateRoom(Rules),
-    /// Join the private room with this code.
-    JoinRoom(String),
-    Steer(Direction),
-    ToggleReady,
-    /// The host's rules for the room's next rounds.
-    RoomRules(Rules),
-    /// The host adds a bot to the room.
-    AddBot,
-    /// The host takes the last bot out.
-    RemoveBot,
-    /// Leave the queue for an unrated match against bots; answer with
-    /// [`App::enter_room`].
-    PlayBots,
-    /// Watch this friend's game; answer with [`App::watch_room`] or
-    /// [`App::watch_failed`].
-    Watch(String),
-    LeaveRoom,
-    /// Answer with [`App::set_name`].
-    SetNickname(String),
-    /// Answer with [`App::signed_up`] or [`App::form_failed`].
-    SignUp {
-        username: String,
-        password: Secret,
-    },
-    /// Answer with [`App::signed_in`] or [`App::form_failed`].
-    SignIn {
-        username: String,
-        password: Secret,
-        /// Remember this machine's key for the account.
-        remember: bool,
-    },
-    /// Answer with [`App::signed_out`].
-    SignOut,
-    /// Answer with [`App::password_changed`] or [`App::form_failed`].
-    ChangePassword(Secret),
-    /// Stop remembering the account by this key; answer with
-    /// [`App::set_keys`].
-    ForgetKey(String),
-    /// Answer with [`App::set_keys`].
-    LoadAccount,
-    /// Answer with [`App::set_friends`].
-    LoadFriends,
-    /// Answer with [`App::set_leaderboard`].
-    LoadLeaderboard,
-    AddFriend(String),
-    AnswerFriend {
-        name: String,
-        accept: bool,
-    },
-    /// Ends a friendship, or takes back a request.
-    RemoveFriend(String),
-    /// Invite this friend to the private room the player is in, or to a
-    /// new one.
-    Invite(String),
-    AcceptInvite,
-    DismissInvite,
-}
-
-/// What's being typed on an input screen.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Input {
-    pub text: String,
-    pub error: Option<String>,
-}
-
-pub struct App {
+pub struct SnakeUi {
     pub cfg: GameConfig,
+    /// The setting picked on the settings screen, by its place in
+    /// [`SETTINGS`].
     pub selected: usize,
     pub game: Option<SoloGame>,
     pub records: Records,
+    /// The best on the rules being played, as the game started.
     pub record: u32,
-    pub screen: Screen,
+    pub screen: SnakeScreen,
     /// Set by the first press of the reset key; a second press resets.
     pub confirm_reset: bool,
-    /// The terminal the app is drawn on. Set it with [`Self::resize`].
+    /// The terminal the game is drawn on. Set it with [`GameUi::resize`].
     pub size: Size,
-    /// Only when played over the network.
-    pub online: Option<Online>,
-    pub input: Input,
-    pub form: Form,
 }
 
-impl App {
-    /// The local game: single player only, starting at the settings.
+impl Default for SnakeUi {
+    fn default() -> Self {
+        Self::new(GameConfig::default(), Records::default())
+    }
+}
+
+/// A room's view, if it's Snake's.
+pub(crate) fn snake_view(room: &InRoom) -> Option<&RoomView> {
+    room.view.of::<Snake>()
+}
+
+/// The snake `seat` has this round.
+pub(crate) fn racer<'a>(view: &'a RoomView, seat: &SeatView) -> Option<&'a RacerView> {
+    seat.slot
+        .and_then(|slot| view.game.racers.get(slot as usize))
+}
+
+impl SnakeUi {
+    /// Snake with these settings and records, at the settings screen.
     pub fn new(cfg: GameConfig, records: Records) -> Self {
         Self {
             cfg,
@@ -167,203 +83,111 @@ impl App {
             game: None,
             records,
             record: 0,
-            screen: Screen::Menu,
+            screen: SnakeScreen::Menu,
             confirm_reset: false,
             size: Size::new(0, 0),
-            online: None,
-            input: Input::default(),
-            form: Form::default(),
         }
     }
 
-    /// The game played over the network, starting at the home menu, as the
-    /// guest `name`. `has_key` says whether the player connected with an
-    /// SSH key, which an account can then remember.
-    pub fn online(cfg: GameConfig, records: Records, name: String, has_key: bool) -> Self {
-        let mut app = Self::new(cfg, records);
-        app.screen = Screen::Home { selected: 0 };
-        app.online = Some(Online::new(name, has_key));
-        app
-    }
-
-    /// How long the runner may wait for a key before calling [`Self::tick`].
+    /// How long the local game may wait for a key before ticking.
     pub fn poll_interval(&self) -> Duration {
-        if matches!(self.screen, Screen::Playing) {
+        if self.screen == SnakeScreen::Playing {
             Duration::from_millis(15)
         } else {
             Duration::from_millis(100)
         }
     }
 
-    pub fn resize(&mut self, size: Size) {
-        self.size = size;
-        self.pause_if_hidden();
-    }
-
     /// The snake must never move while its board isn't on screen.
     fn pause_if_hidden(&mut self) {
-        if matches!(self.screen, Screen::Playing)
+        if self.screen == SnakeScreen::Playing
             && self
                 .game
                 .as_ref()
                 .is_some_and(|g| !ui::board_fits(g.world.width, g.world.height, self.size))
         {
-            self.screen = Screen::Paused { selected: 0 };
+            self.screen = SnakeScreen::Paused { selected: 0 };
         }
     }
 
-    /// Advances a running game, or the time spent in the queue, by `dt` of
-    /// real time.
-    pub fn tick(&mut self, dt: Duration) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        match self.screen {
-            Screen::Playing => {
-                if let Some(game) = &mut self.game {
-                    game.advance(dt);
-                }
-                if self.game.as_ref().is_some_and(|g| g.over.is_some()) {
-                    let new_record = self.save_record(&mut effects);
-                    self.screen = Screen::GameOver { new_record };
-                }
-            }
-            Screen::Finding => {
-                if let Some(online) = &mut self.online {
-                    online.waited += dt;
-                }
-            }
-            _ => {}
-        }
-        effects
-    }
-
-    fn start_game(&mut self, effects: &mut Vec<Effect>) {
+    fn start_game(&mut self, fx: &mut Vec<GameFx>) {
         if let Ok(game) = SoloGame::new(self.cfg.rules.clone()) {
-            effects.push(Effect::SaveConfig);
+            fx.push(GameFx::SavePrefs(self.cfg.to_saved_text()));
             self.record = self.records.get(&game.rules().record_key());
             self.game = Some(game);
-            self.screen = Screen::Playing;
+            self.screen = SnakeScreen::Playing;
             self.pause_if_hidden();
         }
     }
 
-    pub(crate) fn save_record(&mut self, effects: &mut Vec<Effect>) -> bool {
+    fn save_record(&mut self, fx: &mut Vec<GameFx>) -> bool {
         let Some(game) = &self.game else { return false };
         let len = game.len() as u32;
         let key = game.rules().record_key();
         let new_record = self.records.update(&key, len);
         if new_record {
-            effects.push(Effect::RecordSet { key, best: len });
+            fx.push(GameFx::Record { key, best: len });
         }
         self.record = self.record.max(len);
         new_record
     }
 
-    fn quit_to_menu(&mut self, effects: &mut Vec<Effect>) {
-        self.save_record(effects);
+    fn quit_to_menu(&mut self, fx: &mut Vec<GameFx>) {
+        self.save_record(fx);
         self.game = None;
-        self.screen = Screen::Menu;
+        self.screen = SnakeScreen::Menu;
     }
 
-    /// Online, back to the home menu; locally, out of the app.
-    fn back_out(&mut self, effects: &mut Vec<Effect>) {
-        if self.online.is_some() {
-            self.go_home(crate::online::HomeItem::SinglePlayer, None);
-        } else {
-            effects.push(Effect::Quit);
+    fn menu_key(&mut self, key: Key, reply: &mut Reply) {
+        let confirm_reset = std::mem::take(&mut self.confirm_reset);
+        match key {
+            Key::Esc | Key::Char('q') => reply.next = Next::Home,
+            Key::Up | Key::Down | Key::Char('w' | 'k' | 's' | 'j') => {
+                self.selected = key.step(self.selected, SETTINGS.len()).unwrap_or(0);
+            }
+            Key::Left | Key::Char('a' | 'h') => self.cfg.adjust(self.selected, -1),
+            Key::Right | Key::Char('d' | 'l') => self.cfg.adjust(self.selected, 1),
+            Key::Char('r') if confirm_reset => self.cfg = GameConfig::default(),
+            Key::Char('r') => self.confirm_reset = true,
+            Key::Enter => self.start_game(&mut reply.fx),
+            _ => {}
         }
     }
 
-    pub fn handle(&mut self, key: Key) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        self.handle_key(key, &mut effects);
-        self.pause_if_hidden();
-        effects
-    }
-
-    fn handle_key(&mut self, key: Key, effects: &mut Vec<Effect>) {
-        // Shift and Caps Lock don't change what a letter key does, except
-        // while typing.
-        let typing = matches!(self.screen, Screen::Input(_) | Screen::Form(_));
-        let key = match key {
-            Key::Char(c) if !typing => Key::Char(c.to_ascii_lowercase()),
-            key => key,
+    /// The room's rules, in the lobby: the host changes them with ←→.
+    fn room_rules_key(&mut self, selected: usize, key: Key, room: Option<&InRoom>) -> Reply {
+        let Some((room, view)) = room.and_then(|r| Some((r, snake_view(r)?))) else {
+            return Reply::to(Next::Room);
         };
-        if key == Key::CtrlC {
-            self.save_record(effects);
-            effects.push(Effect::Quit);
-            return;
+        let items = room_settings();
+        if let Some(selected) = key.step(selected, items.len()) {
+            self.screen = SnakeScreen::RoomRules { selected };
+            return Reply::default();
         }
-        if self.invite_key(key, effects) {
-            return;
-        }
-        match self.screen {
-            Screen::Home { selected } => self.home_key(selected, key, effects),
-            Screen::Menu => {
-                let confirm_reset = std::mem::take(&mut self.confirm_reset);
-                match key {
-                    Key::Esc | Key::Char('q') => self.back_out(effects),
-                    Key::Up | Key::Char('w' | 'k') => {
-                        self.selected = self.selected.checked_sub(1).unwrap_or(SETTINGS.len() - 1);
-                    }
-                    Key::Down | Key::Char('s' | 'j') => {
-                        self.selected = (self.selected + 1) % SETTINGS.len();
-                    }
-                    Key::Left | Key::Char('a' | 'h') => self.cfg.adjust(self.selected, -1),
-                    Key::Right | Key::Char('d' | 'l') => self.cfg.adjust(self.selected, 1),
-                    Key::Char('r') if confirm_reset => self.cfg = GameConfig::default(),
-                    Key::Char('r') => self.confirm_reset = true,
-                    Key::Enter => self.start_game(effects),
-                    _ => {}
+        match key {
+            Key::Left | Key::Right | Key::Char('a' | 'h' | 'd' | 'l') if room.hosting() => {
+                let delta = if matches!(key, Key::Left | Key::Char('a' | 'h')) {
+                    -1
+                } else {
+                    1
+                };
+                let mut cfg = GameConfig {
+                    rules: view.settings.clone(),
+                    ..GameConfig::default()
+                };
+                cfg.adjust(items[selected.min(items.len() - 1)], delta);
+                if cfg.rules == view.settings {
+                    return Reply::default();
+                }
+                // The room would refuse these too, without a word.
+                let players = view.shell.seats.len();
+                match max_players_for(&cfg.rules) {
+                    Some(fit) if fit >= players => Reply::fx(GameFx::Settings(encode(&cfg.rules))),
+                    _ => Reply::notice(format!("{players} snakes don't fit on that board.")),
                 }
             }
-            Screen::Playing => {
-                if matches!(key, Key::Esc | Key::Char('p')) {
-                    self.screen = Screen::Paused { selected: 0 };
-                    return;
-                }
-                if let (Some(dir), Some(game)) = (direction(key), &mut self.game) {
-                    game.turn(dir);
-                }
-            }
-            Screen::Paused { selected } => match key {
-                Key::Esc | Key::Char('r' | 'p') => self.screen = Screen::Playing,
-                Key::Up | Key::Down | Key::Char('w' | 's' | 'k' | 'j') => {
-                    self.screen = Screen::Paused {
-                        selected: 1 - selected,
-                    };
-                }
-                Key::Enter => {
-                    if selected == 0 {
-                        self.screen = Screen::Playing;
-                    } else {
-                        self.quit_to_menu(effects);
-                    }
-                }
-                Key::Char('q') => self.quit_to_menu(effects),
-                _ => {}
-            },
-            Screen::GameOver { .. } => match key {
-                Key::Enter | Key::Esc | Key::Char(' ') => {
-                    self.game = None;
-                    self.screen = Screen::Menu;
-                }
-                Key::Char('r') => self.start_game(effects),
-                Key::Char('q') => {
-                    self.game = None;
-                    self.back_out(effects);
-                }
-                _ => {}
-            },
-            Screen::Input(field) => self.input_key(field, key, effects),
-            Screen::Finding => self.finding_key(key, effects),
-            // Nothing to do until the room answers.
-            Screen::Joining { .. } | Screen::JoiningToWatch => {}
-            Screen::Room => self.room_key(key, effects),
-            Screen::Form(kind) => self.form_key(kind, key, effects),
-            Screen::Account { selected } => self.account_key(selected, key, effects),
-            Screen::Friends { selected } => self.friends_key(selected, key, effects),
-            Screen::Leaderboard => self.leaderboard_key(key),
-            Screen::RoomRules { selected } => self.room_rules_key(selected, key, effects),
+            Key::Esc | Key::Enter | Key::Char('q' | 'e') => Reply::to(Next::Room),
+            _ => Reply::default(),
         }
     }
 }
@@ -378,62 +202,365 @@ pub(crate) fn direction(key: Key) -> Option<Direction> {
     }
 }
 
+/// What the host changed, going from the rules `old` to those in `room`.
+fn rules_changed(old: &Rules, room: &RoomView) -> String {
+    let host = room
+        .shell
+        .host()
+        .map_or("The host", |h| h.who.name.as_str());
+    let value = |rules: &Rules, i: usize| {
+        GameConfig {
+            rules: rules.clone(),
+            ..GameConfig::default()
+        }
+        .value_str(i)
+    };
+    let changed: Vec<usize> = room_settings()
+        .into_iter()
+        .filter(|&i| value(old, i) != value(&room.settings, i))
+        .collect();
+    match changed[..] {
+        [i] => format!(
+            "{host} set {} to {}.",
+            SETTINGS[i].label,
+            value(&room.settings, i)
+        ),
+        _ => format!("{host} changed the rules."),
+    }
+}
+
+impl GameUi for SnakeUi {
+    fn id(&self) -> game_api::GameId {
+        game_api::GameId::Snake
+    }
+
+    fn title(&self) -> &'static str {
+        "Snake"
+    }
+
+    fn logo(&self) -> (&'static [&'static str], Color) {
+        (&ui::LOGO, Color::LightGreen)
+    }
+
+    fn home_items(&self) -> &'static [&'static str] {
+        &["Single player"]
+    }
+
+    fn open(&mut self, _: usize) {
+        self.screen = SnakeScreen::Menu;
+    }
+
+    fn room_note(&self) -> Option<&'static str> {
+        Some("your settings")
+    }
+
+    fn room_settings(&self) -> Vec<u8> {
+        encode(&self.cfg.rules)
+    }
+
+    fn quick_play(&self, size: Size) -> QuickPlay {
+        let rules = quick_rules();
+        let too_small = (!ui::room_fits(rules.width, rules.height, size)).then(|| {
+            let (w, h) = ui::room_size(rules.width, rules.height);
+            format!(
+                "Your terminal is {}×{}; matches need {w}×{h} to show the whole board. \
+                 Press Enter again to play anyway.",
+                size.width, size.height
+            )
+        });
+        QuickPlay {
+            pool: QUICK_POOL,
+            too_small,
+        }
+    }
+
+    fn leaderboard(&self) -> RatingKey {
+        QUICK_RATING
+    }
+
+    fn bots(&self) -> bool {
+        true
+    }
+
+    fn key(&mut self, key: Key, ctx: &Ctx) -> Reply {
+        // Snake's screens type nothing, so case never matters.
+        let key = key.lower();
+        let mut reply = Reply::default();
+        match self.screen {
+            SnakeScreen::Menu => self.menu_key(key, &mut reply),
+            SnakeScreen::Playing => {
+                if matches!(key, Key::Esc | Key::Char('p')) {
+                    self.screen = SnakeScreen::Paused { selected: 0 };
+                } else if let (Some(dir), Some(game)) = (direction(key), &mut self.game) {
+                    game.turn(dir);
+                }
+            }
+            SnakeScreen::Paused { selected } => match key {
+                Key::Esc | Key::Char('r' | 'p') => self.screen = SnakeScreen::Playing,
+                Key::Up | Key::Down | Key::Char('w' | 's' | 'k' | 'j') => {
+                    self.screen = SnakeScreen::Paused {
+                        selected: 1 - selected,
+                    };
+                }
+                Key::Enter if selected == 0 => self.screen = SnakeScreen::Playing,
+                Key::Enter | Key::Char('q') => self.quit_to_menu(&mut reply.fx),
+                _ => {}
+            },
+            SnakeScreen::GameOver { .. } => match key {
+                Key::Enter | Key::Esc | Key::Char(' ') => {
+                    self.game = None;
+                    self.screen = SnakeScreen::Menu;
+                }
+                Key::Char('r') => self.start_game(&mut reply.fx),
+                Key::Char('q') => {
+                    self.game = None;
+                    self.screen = SnakeScreen::Menu;
+                    reply.next = Next::Home;
+                }
+                _ => {}
+            },
+            SnakeScreen::RoomRules { selected } => {
+                reply = self.room_rules_key(selected, key, ctx.room);
+            }
+        }
+        self.pause_if_hidden();
+        reply
+    }
+
+    fn tick(&mut self, dt: Duration) -> Vec<GameFx> {
+        let mut fx = Vec::new();
+        if self.screen == SnakeScreen::Playing {
+            if let Some(game) = &mut self.game {
+                game.advance(dt);
+            }
+            if self.game.as_ref().is_some_and(|g| g.over.is_some()) {
+                let new_record = self.save_record(&mut fx);
+                self.screen = SnakeScreen::GameOver { new_record };
+            }
+        }
+        fx
+    }
+
+    fn next_wake(&self) -> Option<Duration> {
+        match (&self.screen, &self.game) {
+            // Frozen until the first key; nothing to wake for.
+            (SnakeScreen::Playing, Some(game)) if game.started => {
+                Some(game.until_next_step().unwrap_or_default())
+            }
+            _ => None,
+        }
+    }
+
+    fn resize(&mut self, size: Size) {
+        self.size = size;
+        self.pause_if_hidden();
+    }
+
+    fn playing(&self) -> bool {
+        self.screen == SnakeScreen::Playing
+    }
+
+    fn draw(&self, frame: &mut Frame, ctx: &Ctx) {
+        ui::draw(frame, self, ctx);
+    }
+
+    fn in_play(&self, room: &InRoom) -> bool {
+        let Some(view) = snake_view(room) else {
+            return false;
+        };
+        matches!(
+            view.shell.phase,
+            PhaseView::Countdown { .. } | PhaseView::Running { .. }
+        ) && room
+            .my_seat()
+            .and_then(|s| racer(view, s))
+            .is_some_and(|r| r.alive)
+    }
+
+    fn room_key(&mut self, key: Key, room: &InRoom) -> Option<Reply> {
+        let view = snake_view(room)?;
+        match &view.shell.phase {
+            PhaseView::Waiting { .. } => match key {
+                // The host makes the next round faster or slower, a step
+                // at a time on the settings' grid. The room decides; its
+                // next view shows the speed.
+                Key::Left | Key::Right | Key::Char('a' | 'h' | 'd' | 'l') if room.hosting() => {
+                    let now = view.settings.tick_ms;
+                    let next = if matches!(key, Key::Left | Key::Char('a' | 'h')) {
+                        now.saturating_sub(1) / TICK_MS_STEP * TICK_MS_STEP
+                    } else {
+                        (now / TICK_MS_STEP + 1) * TICK_MS_STEP
+                    }
+                    .clamp(TICK_MS_MIN, TICK_MS_MAX);
+                    if next == now {
+                        return Some(Reply::default());
+                    }
+                    let rules = Rules {
+                        tick_ms: next,
+                        ..view.settings.clone()
+                    };
+                    Some(Reply::fx(GameFx::Settings(encode(&rules))))
+                }
+                // Everyone can read the rules; the host changes them there.
+                Key::Char('e') => {
+                    self.screen = SnakeScreen::RoomRules { selected: 0 };
+                    Some(Reply::to(Next::Game))
+                }
+                _ => None,
+            },
+            PhaseView::Countdown { .. } | PhaseView::Running { .. } if self.in_play(room) => {
+                direction(key).map(|dir| Reply::fx(GameFx::Play(encode(&dir))))
+            }
+            _ => None,
+        }
+    }
+
+    fn settings_note(&self, old: &dyn AnyView, room: &InRoom) -> Option<String> {
+        let (old, now) = (old.of::<Snake>()?, snake_view(room)?);
+        (old.settings != now.settings).then(|| rules_changed(&old.settings, now))
+    }
+
+    fn lobby_line(&self, room: &InRoom) -> Vec<Span<'static>> {
+        let Some(view) = snake_view(room) else {
+            return Vec::new();
+        };
+        let rules = &view.settings;
+        let dim = shell_tui::ui::dim();
+        // The host can change the speed, so theirs stands out, with arrows.
+        let tick = format!("{} ms ticks", rules.tick_ms);
+        let tick = if room.hosting() {
+            Span::styled(
+                format!("◂ {tick} ▸"),
+                ratatui::style::Style::default().fg(Color::LightYellow),
+            )
+        } else {
+            Span::styled(tick, dim)
+        };
+        vec![
+            Span::styled(format!("{}×{} board · ", rules.width, rules.height), dim),
+            tick,
+        ]
+    }
+
+    fn lobby_keys(&self) -> Option<&'static str> {
+        Some("e rules")
+    }
+
+    fn host_keys(&self) -> Option<&'static str> {
+        Some("←→ speed")
+    }
+
+    fn draw_round(&self, frame: &mut Frame, room: &InRoom, ctx: &Ctx) {
+        let _ = ctx;
+        ui::draw_round(frame, self, room);
+    }
+
+    fn result_note(&self, room: &InRoom) -> Option<String> {
+        snake_view(room)?
+            .game
+            .time_up
+            .then(|| "Time's up".to_string())
+    }
+
+    fn score(&self, room: &InRoom, who: PlayerId) -> String {
+        let length = snake_view(room)
+            .and_then(|v| v.game.racer(who))
+            .map_or(0, |r| r.length);
+        length.to_string()
+    }
+
+    fn restore(&mut self, saved: Saved) {
+        self.cfg = GameConfig::from_saved_text(&saved.prefs);
+        self.records = saved.records;
+    }
+
+    fn saved(&self) -> Saved {
+        Saved {
+            prefs: self.cfg.to_saved_text(),
+            records: self.records.clone(),
+        }
+    }
+
+    fn quit(&mut self) -> Vec<GameFx> {
+        let mut fx = Vec::new();
+        self.save_record(&mut fx);
+        fx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn app() -> App {
-        let mut app = App::new(GameConfig::default(), Records::default());
-        app.resize(Size::new(120, 40));
-        app
+    fn snake() -> SnakeUi {
+        let mut ui = SnakeUi::default();
+        ui.resize(Size::new(120, 40));
+        ui
+    }
+
+    fn key(ui: &mut SnakeUi, key: Key) -> Reply {
+        ui.key(key, &Ctx::alone(ui.size))
     }
 
     #[test]
     fn menu_d_adjusts_and_r_twice_resets() {
-        let mut app = app();
-        app.handle(Key::Char('d'));
-        app.handle(Key::Char('D'));
-        assert_eq!(app.cfg.rules.width, 32);
-        app.handle(Key::Char('r'));
-        assert!(app.confirm_reset);
-        app.handle(Key::Char('x'));
-        assert_eq!(app.cfg.rules.width, 32, "any other key cancels the reset");
-        app.handle(Key::Char('r'));
-        app.handle(Key::Char('r'));
-        assert_eq!(app.cfg, GameConfig::default());
+        let mut ui = snake();
+        key(&mut ui, Key::Char('d'));
+        key(&mut ui, Key::Char('D'));
+        assert_eq!(ui.cfg.rules.width, 32);
+        key(&mut ui, Key::Char('r'));
+        assert!(ui.confirm_reset);
+        key(&mut ui, Key::Char('x'));
+        assert_eq!(ui.cfg.rules.width, 32, "any other key cancels the reset");
+        key(&mut ui, Key::Char('r'));
+        key(&mut ui, Key::Char('r'));
+        assert_eq!(ui.cfg, GameConfig::default());
     }
 
     #[test]
-    fn ctrl_c_quits_from_every_screen() {
-        let mut app = app();
-        assert_eq!(app.handle(Key::CtrlC), [Effect::Quit]);
-        let effects = app.handle(Key::Enter);
-        assert_eq!(effects, [Effect::SaveConfig]);
-        assert_eq!(app.screen, Screen::Playing);
-        // The first game on these rules is a new record, saved before quitting.
-        let len = app.game.as_ref().unwrap().len() as u32;
-        let key = GameConfig::default().rules.record_key();
+    fn quitting_keeps_a_new_record() {
+        let mut ui = snake();
+        assert_eq!(ui.quit(), [], "nothing played yet");
+        let reply = key(&mut ui, Key::Enter);
         assert_eq!(
-            app.handle(Key::CtrlC),
-            [Effect::RecordSet { key, best: len }, Effect::Quit]
+            reply.fx,
+            [GameFx::SavePrefs(GameConfig::default().to_saved_text())]
         );
+        assert_eq!(ui.screen, SnakeScreen::Playing);
+        // The first game on these rules is a new record, saved on the way
+        // out.
+        let len = ui.game.as_ref().unwrap().len() as u32;
+        let key = GameConfig::default().rules.record_key();
+        assert_eq!(ui.quit(), [GameFx::Record { key, best: len }]);
     }
 
     #[test]
     fn pauses_when_the_board_stops_fitting() {
-        let mut app = app();
-        app.handle(Key::Enter);
-        assert_eq!(app.screen, Screen::Playing);
-        app.resize(Size::new(40, 15));
-        assert_eq!(app.screen, Screen::Paused { selected: 0 });
-        app.handle(Key::Esc);
+        let mut ui = snake();
+        key(&mut ui, Key::Enter);
+        assert_eq!(ui.screen, SnakeScreen::Playing);
+        ui.resize(Size::new(40, 15));
+        assert_eq!(ui.screen, SnakeScreen::Paused { selected: 0 });
+        key(&mut ui, Key::Esc);
         assert_eq!(
-            app.screen,
-            Screen::Paused { selected: 0 },
+            ui.screen,
+            SnakeScreen::Paused { selected: 0 },
             "can't resume yet"
         );
-        app.resize(Size::new(120, 40));
-        app.handle(Key::Esc);
-        assert_eq!(app.screen, Screen::Playing);
+        ui.resize(Size::new(120, 40));
+        key(&mut ui, Key::Esc);
+        assert_eq!(ui.screen, SnakeScreen::Playing);
+    }
+
+    #[test]
+    fn the_settings_and_a_finished_game_go_home_on_q() {
+        let mut ui = snake();
+        assert_eq!(key(&mut ui, Key::Char('q')).next, Next::Home);
+        key(&mut ui, Key::Enter);
+        ui.game.as_mut().unwrap().over = Some(snake_core::solo::GameOverReason::HitWall);
+        ui.tick(Duration::from_millis(1));
+        assert!(matches!(ui.screen, SnakeScreen::GameOver { .. }));
+        assert_eq!(key(&mut ui, Key::Char('q')).next, Next::Home);
+        assert_eq!(ui.screen, SnakeScreen::Menu);
     }
 }

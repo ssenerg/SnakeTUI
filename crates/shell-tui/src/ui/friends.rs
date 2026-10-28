@@ -11,7 +11,7 @@ use crate::app::App;
 use crate::online::FriendsRow;
 
 pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
-    let Some(online) = &app.online else { return };
+    let online = &app.online;
     let view = &online.friends;
     let rows = view.rows();
     let [body_area, footer_area] =

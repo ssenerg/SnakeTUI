@@ -1,12 +1,16 @@
-//! Who a connection belongs to.
+//! Who a connection belongs to, and which game they asked for.
 
+use game_api::GameId;
 use russh::keys::{HashAlg, PublicKey};
+
+use crate::games;
 
 /// Longest nickname shown to other players.
 pub const MAX_NICK: usize = 16;
 
 /// User names that say nothing about the person: whoever typed
 /// `ssh root@…` or kept their machine's login is given a generated name.
+/// So are games' names, which `ssh snake@…` and the like open.
 pub const GENERIC_USERS: &[&str] = &[
     "root",
     "admin",
@@ -22,6 +26,7 @@ pub const GENERIC_USERS: &[&str] = &[
     "git",
     "play",
     "snake",
+    "chess",
     "snaketui",
 ];
 
@@ -40,6 +45,8 @@ pub struct Player {
     pub nick: String,
     /// Four hex characters, for names that would otherwise say nothing.
     pub tag: String,
+    /// The game asked for by connecting as `ssh snake@…` or the like.
+    pub game: Option<GameId>,
 }
 
 impl Player {
@@ -50,6 +57,7 @@ impl Player {
             nick: nickname(ssh_user, &tag),
             identity: Identity::Key(fingerprint),
             tag,
+            game: games::for_ssh_user(ssh_user),
         }
     }
 
@@ -59,6 +67,7 @@ impl Player {
             nick: nickname(ssh_user, &tag),
             identity: Identity::Guest,
             tag,
+            game: games::for_ssh_user(ssh_user),
         }
     }
 
@@ -117,6 +126,19 @@ mod tests {
         assert_eq!(nickname("ubuntu", "0a1b"), "player-0a1b");
         assert_eq!(nickname("", "0a1b"), "player-0a1b");
         assert_eq!(nickname("日本", "0a1b"), "player-0a1b");
+    }
+
+    #[test]
+    fn games_names_open_their_game_and_say_nothing_about_the_person() {
+        let snake = Player::guest("snake");
+        assert_eq!(snake.game, Some(GameId::Snake));
+        assert_eq!(snake.nick, format!("player-{}", snake.tag));
+        assert_eq!(Player::guest("SNAKE").game, Some(GameId::Snake));
+        assert_eq!(Player::guest("alice").game, None);
+        // Not served yet, so it opens nothing, but nobody is called it.
+        let chess = Player::guest("chess");
+        assert_eq!(chess.game, None);
+        assert_eq!(chess.nick, format!("player-{}", chess.tag));
     }
 
     #[test]

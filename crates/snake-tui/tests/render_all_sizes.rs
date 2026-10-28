@@ -4,9 +4,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use game_api::GameId;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Size;
+use shell_tui::app::BOTS_OFFERED_AFTER;
+use shell_tui::online::{
+    Field, FormKind, FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile,
+    QueueRegion,
+};
+use shell_tui::{App, Screen};
 use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
 use snake_core::round::RatingChange;
@@ -14,12 +21,18 @@ use snake_core::round::{
     Entrant, PhaseView, Room, RoomKind, RoomSettings, RoomView, bot_entrant, quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
-use snake_tui::online::BOTS_OFFERED_AFTER;
-use snake_tui::online::{
-    Field, FormKind, FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile,
-    QueueRegion,
-};
-use snake_tui::{App, Screen, ui};
+use snake_tui::{SnakeScreen, SnakeUi, ui};
+
+/// The app with Snake as its game, with these settings, as the guest
+/// `name`.
+fn app_with(cfg: GameConfig, name: &str) -> App {
+    let snake = SnakeUi::new(cfg, Records::default());
+    App::online(vec![Box::new(snake)], None, name.into(), true)
+}
+
+fn snake(app: &mut App) -> &mut SnakeUi {
+    app.game_ui_mut().expect("Snake")
+}
 
 /// A leaderboard of `len` players with long names, and `me`.
 fn leaderboard(len: u32, me: MyPlace) -> LeaderboardView {
@@ -51,35 +64,38 @@ fn screens(rules: &Rules) -> Vec<App> {
         rules: rules.clone(),
         ..GameConfig::default()
     };
-    let new_app = |screen: Screen| {
-        let mut app = App::new(cfg.clone(), Records::default());
-        app.screen = screen;
-        if screen != Screen::Menu {
-            app.game = Some(SoloGame::new(rules.clone()).unwrap());
+    let new_app = |screen: SnakeScreen| {
+        let mut app = app_with(cfg.clone(), "~player-0123456789");
+        app.screen = Screen::Game;
+        let snake = snake(&mut app);
+        snake.screen = screen;
+        if screen != SnakeScreen::Menu {
+            snake.game = Some(SoloGame::new(rules.clone()).unwrap());
         }
         app
     };
 
-    let mut apps = vec![new_app(Screen::Menu)];
-    let mut confirming = new_app(Screen::Menu);
-    confirming.confirm_reset = true;
-    confirming.selected = snake_core::settings::SETTINGS.len() - 1;
+    let mut apps = vec![new_app(SnakeScreen::Menu)];
+    let mut confirming = new_app(SnakeScreen::Menu);
+    let snake_ui = snake(&mut confirming);
+    snake_ui.confirm_reset = true;
+    snake_ui.selected = snake_core::settings::SETTINGS.len() - 1;
     apps.push(confirming);
 
-    apps.push(new_app(Screen::Playing));
-    let mut started = new_app(Screen::Playing);
-    started.game.as_mut().unwrap().started = true;
+    apps.push(new_app(SnakeScreen::Playing));
+    let mut started = new_app(SnakeScreen::Playing);
+    snake(&mut started).game.as_mut().unwrap().started = true;
     apps.push(started);
     // Every kind of food on the board, without moving the snake.
-    let mut with_food = new_app(Screen::Playing);
-    let game = with_food.game.as_mut().unwrap();
+    let mut with_food = new_app(SnakeScreen::Playing);
+    let game = snake(&mut with_food).game.as_mut().unwrap();
     game.started = true;
     game.world.advance_clock(Duration::from_secs(20));
     assert!(game.world.foods.len() >= 3);
     apps.push(with_food);
 
     for selected in [0, 1] {
-        apps.push(new_app(Screen::Paused { selected }));
+        apps.push(new_app(SnakeScreen::Paused { selected }));
     }
     for reason in [
         GameOverReason::HitWall,
@@ -88,8 +104,8 @@ fn screens(rules: &Rules) -> Vec<App> {
         GameOverReason::MaxLength,
     ] {
         for new_record in [false, true] {
-            let mut app = new_app(Screen::GameOver { new_record });
-            app.game.as_mut().unwrap().over = Some(reason);
+            let mut app = new_app(SnakeScreen::GameOver { new_record });
+            snake(&mut app).game.as_mut().unwrap().over = Some(reason);
             apps.push(app);
         }
     }
@@ -197,12 +213,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         ..GameConfig::default()
     };
     let new_app = |screen: Screen| {
-        let mut app = App::online(
-            cfg.clone(),
-            Records::default(),
-            "~player-0123456789".into(),
-            true,
-        );
+        let mut app = app_with(cfg.clone(), "~player-0123456789");
         app.screen = screen;
         app
     };
@@ -215,7 +226,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
             games: 12,
             wins: 4,
         }));
-        let online = app.online.as_mut().unwrap();
+        let online = &mut app.online;
         online.requests = 2;
         online.keys = (0..10)
             .map(|i| KeyRow {
@@ -246,6 +257,11 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     let mut apps: Vec<App> = (0..guest_items)
         .map(|selected| new_app(Screen::Home { selected }))
         .collect();
+    // The picker, and with something to say.
+    apps.push(new_app(Screen::Picker { selected: 0 }));
+    let mut picking = new_app(Screen::Picker { selected: 0 });
+    picking.notify("Pick one to play.".into());
+    apps.push(picking);
     let account_items = account(Screen::Home { selected: 0 }).home_items().len();
     apps.extend((0..account_items).map(|selected| account(Screen::Home { selected })));
     for selected in [0, 3, 10, 12] {
@@ -286,13 +302,13 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     busy.form.busy = true;
     apps.push(busy);
     let mut invited = account(Screen::Home { selected: 0 });
-    invited.invited("someone-with-a-long-name".into());
+    invited.invited("someone-with-a-long-name".into(), GameId::Snake);
     apps.push(invited);
     let mut adding = account(Screen::Input(Field::FriendName));
     adding.input.text = "bob".into();
     apps.push(adding);
     let mut notice = new_app(Screen::Home { selected: 1 });
-    notice.online.as_mut().unwrap().notice = Some(
+    notice.online.notice = Some(
         "Your terminal is 60×20; matches need 80×21 to show the whole board. \
          Press Enter again to play anyway."
             .into(),
@@ -307,7 +323,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     apps.push(new_app(Screen::Finding));
     // Long enough for bots to be offered.
     let mut bored = new_app(Screen::Finding);
-    bored.online.as_mut().unwrap().waited = BOTS_OFFERED_AFTER;
+    bored.online.waited = BOTS_OFFERED_AFTER;
     apps.push(bored);
     // In a cluster, after the queue has opened to every region.
     let mut regional = new_app(Screen::Finding);
@@ -315,10 +331,8 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         name: "eu-west-somewhere-long".into(),
         widens_after: Duration::from_secs(20),
     });
-    if let Some(online) = regional.online.as_mut() {
-        online.waited = Duration::from_secs(95);
-        online.queue_len = 1234;
-    }
+    regional.online.waited = Duration::from_secs(95);
+    regional.online.queue_len = 1234;
     apps.push(regional);
     apps.push(new_app(Screen::Joining { by_code: true }));
     let views = room_views(rules);
@@ -375,15 +389,19 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     // Its rules: the host's, at the top, the bottom and in between, and
     // someone else's, told what the host changed.
     let host = lobby.shell.host().expect("a host").who.id;
+    let rules_of = |mut app: App, selected| {
+        app.screen = Screen::Game;
+        snake(&mut app).screen = SnakeScreen::RoomRules { selected };
+        app
+    };
     for selected in [0, 7, 13] {
         let mut app = new_app(Screen::Room);
         app.enter_room(host, Arc::new(lobby.clone()));
-        app.screen = Screen::RoomRules { selected };
-        apps.push(app);
+        apps.push(rules_of(app, selected));
     }
     let mut app = account(Screen::Room);
     app.enter_room(host + 1000, Arc::new(lobby.clone()));
-    app.screen = Screen::RoomRules { selected: 13 };
+    let mut app = rules_of(app, 13);
     app.notify("~player-0123456789 set super food lifetime to 120 s.".into());
     apps.push(app);
     // While a round runs: as one who left, as someone watching, and asking
@@ -399,14 +417,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     }
     let mut leaving = new_app(Screen::Room);
     leaving.enter_room(2, Arc::new(running.clone()));
-    leaving
-        .online
-        .as_mut()
-        .unwrap()
-        .room
-        .as_mut()
-        .unwrap()
-        .confirm_leave = true;
+    leaving.online.room.as_mut().unwrap().confirm_leave = true;
     apps.push(leaving);
     apps
 }
@@ -416,7 +427,7 @@ fn draw_all(apps: &[App], sizes: &[(u16, u16)]) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         for app in apps {
             terminal
-                .draw(|frame| ui::draw(frame, app))
+                .draw(|frame| shell_tui::ui::draw(frame, app))
                 .unwrap_or_else(|e| panic!("{:?} at {w}x{h}: {e}", app.screen));
         }
     }
@@ -480,7 +491,9 @@ fn smallest_and_largest_boards_draw() {
 /// What a `w`×`h` terminal shows of `app`.
 fn shown(app: &App, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    terminal
+        .draw(|frame| shell_tui::ui::draw(frame, app))
+        .unwrap();
     let buffer = terminal.backend().buffer();
     (0..h)
         .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
@@ -510,12 +523,7 @@ fn round_trips_show_by_each_player() {
     for id in 1..=3 {
         round.join(short(id)).unwrap();
     }
-    let mut app = App::online(
-        GameConfig::default(),
-        Records::default(),
-        "~p1".into(),
-        true,
-    );
+    let mut app = app_with(GameConfig::default(), "~p1");
     app.screen = Screen::Room;
     app.enter_room(1, timed(round.view()));
     let lobby = shown(&app, 80, 24);
@@ -546,12 +554,7 @@ fn only_the_host_sees_how_to_change_the_speed() {
         round.join(Entrant { id, name }).unwrap();
     }
     let lobby_of = |me| {
-        let mut app = App::online(
-            GameConfig::default(),
-            Records::default(),
-            format!("~p{me}"),
-            true,
-        );
+        let mut app = app_with(GameConfig::default(), &format!("~p{me}"));
         app.screen = Screen::Room;
         app.enter_room(me, Arc::new(round.view()));
         shown(&app, 80, 24)
@@ -569,14 +572,10 @@ fn only_the_host_sees_how_to_change_the_speed() {
     assert!(guest.contains("e rules"), "everyone can read them: {guest}");
 
     let rules_of = |me| {
-        let mut app = App::online(
-            GameConfig::default(),
-            Records::default(),
-            format!("~p{me}"),
-            true,
-        );
+        let mut app = app_with(GameConfig::default(), &format!("~p{me}"));
         app.enter_room(me, Arc::new(round.view()));
-        app.screen = Screen::RoomRules { selected: 0 };
+        app.screen = Screen::Game;
+        snake(&mut app).screen = SnakeScreen::RoomRules { selected: 0 };
         shown(&app, 80, 24)
     };
     let host = rules_of(1);
@@ -602,12 +601,7 @@ fn only_the_host_sees_how_to_change_the_speed() {
 #[test]
 fn the_leaderboard_shows_what_fits_and_always_your_place() {
     let app = |view: Option<LeaderboardView>| {
-        let mut app = App::online(
-            GameConfig::default(),
-            Records::default(),
-            "~guest".into(),
-            true,
-        );
+        let mut app = app_with(GameConfig::default(), "~guest");
         app.screen = Screen::Leaderboard;
         if let Some(view) = view {
             app.set_leaderboard(view);
@@ -647,12 +641,7 @@ fn the_leaderboard_shows_what_fits_and_always_your_place() {
 #[test]
 fn bots_are_marked_and_offered() {
     let app_at = |screen: Screen| {
-        let mut app = App::online(
-            GameConfig::default(),
-            Records::default(),
-            "~p1".into(),
-            true,
-        );
+        let mut app = app_with(GameConfig::default(), "~p1");
         app.screen = screen;
         app
     };
@@ -670,7 +659,7 @@ fn bots_are_marked_and_offered() {
 
     let mut waiting = app_at(Screen::Finding);
     assert!(!shown(&waiting, 80, 24).contains("bots"));
-    waiting.online.as_mut().unwrap().waited = BOTS_OFFERED_AFTER;
+    waiting.online.waited = BOTS_OFFERED_AFTER;
     let offer = shown(&waiting, 80, 24);
     assert!(offer.contains("Play bots now, unrated."), "{offer}");
     assert!(offer.contains("b play bots · Esc cancel"), "{offer}");
@@ -695,12 +684,7 @@ fn watchers_follow_their_friend_and_are_counted() {
     }
     let mut view = round.view();
     view.shell.watchers = 2;
-    let mut app = App::online(
-        GameConfig::default(),
-        Records::default(),
-        "~me".into(),
-        true,
-    );
+    let mut app = app_with(GameConfig::default(), "~me");
     app.screen = Screen::JoiningToWatch;
     app.watch_room(99, "bob".into(), Arc::new(view.clone()));
     let watching = shown(&app, 80, 24);
@@ -709,12 +693,7 @@ fn watchers_follow_their_friend_and_are_counted() {
     assert!(!watching.contains("←↑↓→ move"), "{watching}");
 
     // Players see who's watching too.
-    let mut player = App::online(
-        GameConfig::default(),
-        Records::default(),
-        "~p1".into(),
-        true,
-    );
+    let mut player = app_with(GameConfig::default(), "~p1");
     player.enter_room(1, Arc::new(view));
     let playing = shown(&player, 80, 24);
     assert!(playing.contains("2 watching"), "{playing}");

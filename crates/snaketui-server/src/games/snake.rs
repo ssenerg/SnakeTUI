@@ -5,14 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use game_api::{Entrant, GameId, MIN_PLAYERS};
-use snake_core::round::{MAX_PLAYERS, RoomKind, RoomSettings, Snake, bot_entrant, quick_rules};
+use shell_tui::GameUi;
+use snake_core::config::Rules;
+use snake_core::round::{
+    MAX_PLAYERS, QUICK_POOL, RoomKind, RoomSettings, Snake, bot_entrant, quick_rules,
+};
+use snake_tui::SnakeUi;
 
-use super::{AnyRoomView, GameInfo, GameServer, PoolInfo, PoolKey, RatingSystem, decode_view};
+use super::{
+    AnyRoomView, GameInfo, GameServer, PoolInfo, PoolKey, RatingSystem, decode, decode_view,
+};
 use crate::rating::SNAKE_QUICK;
 use crate::room::NewRoom;
-
-/// Every snake for itself.
-pub const QUICK_POOL: &str = "ffa";
 
 /// Bots in a match against bots.
 const BOT_MATCH_BOTS: usize = 3;
@@ -72,5 +76,16 @@ impl GameServer for SnakeServer {
             seed,
             players,
         )))
+    }
+
+    fn private_room(&self, settings: &[u8], seed: u64) -> Result<Box<dyn NewRoom>, &'static str> {
+        let settings = decode::<Rules>(settings)
+            .and_then(|rules| RoomSettings::new(rules, RoomKind::Private))
+            .ok_or("Your board is too small for two snakes. Make it bigger in Single player.")?;
+        Ok(Box::new(game_api::Room::<Snake>::new(settings, seed)))
+    }
+
+    fn ui(&self) -> Box<dyn GameUi> {
+        Box::new(SnakeUi::default())
     }
 }

@@ -1,10 +1,11 @@
 //! What a player's screen gets of a room: the same [`ShellView`] for every
 //! game, with the game's settings and its own view of the round.
 
+use std::any::Any;
 use std::fmt;
 use std::time::Duration;
 
-use crate::{Entrant, Game, Placement, PlayerId, RoomKind, is_bot};
+use crate::{Entrant, Game, GameId, Placement, PlayerId, RoomKind, is_bot};
 
 /// Everything a player's screen needs to draw a room.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -56,6 +57,31 @@ where
     G::Settings: Eq,
     G::View: Eq,
 {
+}
+
+/// A room's view, of whichever game: what a player's screen and the
+/// server hold without knowing the game. Its game reads the rest with
+/// [`Self::of`].
+pub trait AnyView: Any + Send + Sync + fmt::Debug {
+    fn game(&self) -> GameId;
+    fn shell(&self) -> &ShellView;
+}
+
+impl<G: Game> AnyView for RoomView<G> {
+    fn game(&self) -> GameId {
+        G::ID
+    }
+
+    fn shell(&self) -> &ShellView {
+        &self.shell
+    }
+}
+
+impl dyn AnyView {
+    /// This view, if it's of a room of `G`.
+    pub fn of<G: Game>(&self) -> Option<&RoomView<G>> {
+        (self as &dyn Any).downcast_ref()
+    }
 }
 
 /// The room around a round, the same for every game.

@@ -1,0 +1,11 @@
+[package]
+name = "shell-tui"
+description = "The screens every game shares: the home menu, accounts, friends, the leaderboard, rooms' lobby and results, and the game picker"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+game-api.workspace = true
+ratatui.workspace = true
+zeroize = "1.9.1"

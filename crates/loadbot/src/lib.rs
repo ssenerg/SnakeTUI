@@ -1,7 +1,8 @@
-//! Bot players for SnakeTUI servers. Each one signs in as a guest, joins
-//! quick play and steers at random, now and then pressing Enter, which
-//! queues it again after a match. Bots that lose their connection come
-//! back a second later.
+//! Bot players for SnakeTUI servers. Each one signs in as a guest, as
+//! `ssh snake@…` does, so Snake opens whichever games the server has. It
+//! joins quick play and steers at random, now and then pressing Enter,
+//! which queues it again after a match. Bots that lose their connection
+//! come back a second later.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -75,7 +76,7 @@ impl client::Handler for AnyHost {
 async fn bot(i: usize, server: SocketAddr, stats: Arc<Stats>) {
     let mut seed = i as u64 + 1;
     loop {
-        if play(i, server, &stats, &mut seed).await.is_err() {
+        if play(server, &stats, &mut seed).await.is_err() {
             stats.failures.fetch_add(1, Ordering::Relaxed);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -83,11 +84,11 @@ async fn bot(i: usize, server: SocketAddr, stats: Arc<Stats>) {
 }
 
 /// Plays until the connection ends.
-async fn play(i: usize, server: SocketAddr, stats: &Stats, seed: &mut u64) -> anyhow::Result<()> {
+async fn play(server: SocketAddr, stats: &Stats, seed: &mut u64) -> anyhow::Result<()> {
     let config = Arc::new(client::Config::default());
     let mut ssh = client::connect(config, server, AnyHost).await?;
     let signed_in = ssh
-        .authenticate_keyboard_interactive_start(format!("bot{i}"), None)
+        .authenticate_keyboard_interactive_start("snake", None)
         .await?;
     anyhow::ensure!(
         matches!(signed_in, KeyboardInteractiveAuthResponse::Success),

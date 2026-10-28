@@ -311,16 +311,6 @@ impl RoomHandle {
     pub fn leave(&self, id: PlayerId) {
         self.send(id, RoomCmd::Leave);
     }
-
-    /// A move in a room of `G`.
-    pub fn play<G: Served>(&self, id: PlayerId, input: &G::Input) {
-        self.send(id, RoomCmd::Play(games::encode(input)));
-    }
-
-    /// The host changes a room of `G`'s settings.
-    pub fn set_settings<G: Served>(&self, id: PlayerId, settings: &G::Settings) {
-        self.send(id, RoomCmd::Settings(games::encode(settings)));
-    }
 }
 
 /// A player's new rating after a rated round, for their session.

@@ -1,11 +1,15 @@
 [package]
 name = "snake-tui"
-description = "SnakeTUI screens and app state machine, shared by the local game and the server"
+description = "Snake's screens: single player, and Snake's rooms in the shared app"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
+game-api = { workspace = true, features = ["serde"] }
 ratatui.workspace = true
-snake-core.workspace = true
-zeroize = "1.9.1"
+shell-tui.workspace = true
+snake-core = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+game-api.workspace = true

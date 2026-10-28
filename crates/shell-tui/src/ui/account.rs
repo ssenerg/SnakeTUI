@@ -6,13 +6,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
-use super::centered_rect;
-use super::menu::draw_logo;
+use super::{centered_rect, draw_logo};
 use crate::app::App;
 use crate::online::AccountRow;
 
 pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
-    let Some(online) = &app.online else { return };
+    let online = &app.online;
     let Some(profile) = &online.account else {
         return;
     };
@@ -22,7 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
         Constraint::Length(3),
     ])
     .areas(frame.area());
-    draw_logo(frame, logo_area);
+    draw_logo(frame, app, logo_area);
 
     let rows = online.account_rows();
     let rect = centered_rect(body_area, 64, rows.len() as u16 + 9);

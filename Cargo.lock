@@ -1423,6 +1423,7 @@ dependencies = [
 name = "game-api"
 version = "0.2.0"
 dependencies = [
+ "postcard",
  "rand 0.10.2",
  "serde",
 ]
@@ -3299,6 +3300,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-tui"
+version = "0.2.0"
+dependencies = [
+ "game-api",
+ "ratatui",
+ "zeroize",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3393,9 +3403,10 @@ dependencies = [
 name = "snake-tui"
 version = "0.2.0"
 dependencies = [
+ "game-api",
  "ratatui",
+ "shell-tui",
  "snake-core",
- "zeroize",
 ]
 
 [[package]]
@@ -3404,6 +3415,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "ratatui",
+ "shell-tui",
  "snake-core",
  "snake-tui",
 ]
@@ -3439,6 +3451,7 @@ dependencies = [
  "ratatui",
  "russh",
  "serde",
+ "shell-tui",
  "skillratings",
  "snake-core",
  "snake-tui",

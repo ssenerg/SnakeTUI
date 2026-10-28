@@ -2,6 +2,7 @@
 
 mod account;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -10,25 +11,20 @@ use std::time::{Duration, Instant};
 
 use actix::prelude::*;
 use bytes::Bytes;
+use game_api::{Entrant, GameId, JoinError, PhaseView, PlayerId};
 use ratatui::layout::{Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use russh::ChannelId;
 use russh::server::Handle;
-use snake_core::config::{GameConfig, Rules};
-use snake_core::records::Records;
-use snake_core::round::{
-    Entrant, JoinError, PhaseView, PlayerId, Room, RoomKind, RoomSettings, Snake,
-};
-use snake_tui::online::QueueRegion;
-use snake_tui::{App, Effect, Key, Screen, ui};
+use shell_tui::online::{HomeItem, QueueRegion};
+use shell_tui::{App, Effect, GameFx, Key, Saved, Screen, ui};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use self::account::{JoinedRoom, PendingInvite};
 use crate::auth::Refused;
 use crate::backend::SshBackend;
-use crate::games::snake::quick_pool;
-use crate::games::{self, AnyRoomView};
+use crate::games::{self, PoolKey};
 use crate::identity::{Player, nickname};
 use crate::input::{Budget, KeyParser, STATUS_QUERY};
 use crate::lobby::{CodeUnavailable, CreateRoom, FindRoom};
@@ -36,8 +32,9 @@ use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::{FRAME_HOLDS, PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
+use crate::rating::{Rating, SNAKE_QUICK};
 use crate::room::{RESULTS_GRACE, RoomCmd, RoomHandle, ViewRx};
-use crate::store::{Account, AccountData, now};
+use crate::store::{self, Account, AccountData, now};
 use crate::tcp::TcpState;
 use crate::{Shared, Stopping};
 
@@ -83,6 +80,7 @@ const KEYS_PER_SEC: u32 = 50;
 const ACTION_BURST: u32 = 10;
 const ACTIONS_PER_SEC: u32 = 2;
 const TOO_FAST: &str = "Slow down a little, then try again.";
+const TRY_AGAIN: &str = "Something went wrong. Try again.";
 /// Settings and nicknames are saved this long after their last change.
 const SAVE_AFTER: Duration = Duration::from_millis(500);
 /// Frames go out at most this often, however fast keys come.
@@ -222,7 +220,7 @@ fn costly(effect: &Effect) -> bool {
             | Effect::Invite(_)
             | Effect::AcceptInvite
             | Effect::Watch(_)
-            | Effect::CreateRoom(_)
+            | Effect::CreateRoom { .. }
             | Effect::JoinRoom(_)
             | Effect::PlayBots
     )
@@ -264,13 +262,17 @@ pub(super) struct Loads {
 /// What has changed since it was last saved.
 #[derive(Default)]
 struct Unsaved {
-    config: bool,
+    /// Each game's preferences, as the game wrote them.
+    prefs: BTreeMap<GameId, String>,
     nick: bool,
+    last_game: Option<GameId>,
 }
 
 /// The room a session's player is in.
 struct RoomLink {
     room: RoomHandle,
+    /// The game it plays.
+    game: GameId,
     /// The future waiting for the room's next view.
     watch: SpawnHandle,
     /// Tells apart this stay from an earlier one in the same room.
@@ -282,9 +284,12 @@ enum JoinFail {
     NoSuchCode,
     TooManyCodes,
     CodesFromAddress,
-    BoardTooSmall,
+    /// The game won't make a room with those settings, and says why.
+    Refused(&'static str),
     Full,
     Closed,
+    /// A room of a game this server has no screens for.
+    OtherGame,
     Unavailable,
 }
 
@@ -294,11 +299,10 @@ impl JoinFail {
             JoinFail::NoSuchCode => "No room has that code.",
             JoinFail::TooManyCodes => "Too many wrong codes. Reconnect to try again.",
             JoinFail::CodesFromAddress => Refused::TooManyCodes.message(),
-            JoinFail::BoardTooSmall => {
-                "Your board is too small for two snakes. Make it bigger in Single player."
-            }
+            JoinFail::Refused(why) => why,
             JoinFail::Full => "That room is full.",
             JoinFail::Closed => "That room has closed.",
+            JoinFail::OtherGame => "That room plays a game this server doesn't have.",
             JoinFail::Unavailable => "Couldn't make a room just now. Try again.",
         }
     }
@@ -317,6 +321,9 @@ pub struct SessionActor {
     wrong_codes: u8,
     /// Signed in to this account.
     account: Option<Account>,
+    /// The game saved as the one to open next time, for the account or
+    /// the key.
+    last_game: Option<GameId>,
     sign_in_failures: u8,
     invite: Option<PendingInvite>,
     /// Counts friends-list refreshes; only the latest one's list is shown.
@@ -418,6 +425,7 @@ impl SessionActor {
             queued: false,
             wrong_codes: 0,
             account: None,
+            last_game: None,
             sign_in_failures: 0,
             invite: None,
             friends_refresh: 0,
@@ -487,47 +495,53 @@ impl SessionActor {
         let player = self.player.clone();
         let load = async move {
             let Some((fp, p)) = player.as_ref().and_then(|p| Some((p.fingerprint()?, p))) else {
-                return anyhow::Ok(Loaded::Guest(
-                    None,
-                    GameConfig::default(),
-                    Records::default(),
-                ));
+                return anyhow::Ok(Loaded::Guest(None));
             };
             if let Some(data) = store.account_for_key(fp).await? {
                 return Ok(Loaded::Account(data));
             }
-            let saved = store.visit(fp, &p.nick).await?;
-            Ok(Loaded::Guest(Some(saved.nick), saved.cfg, saved.records))
+            Ok(Loaded::Guest(Some(store.visit(fp, &p.nick).await?)))
         };
         // Keys that arrive meanwhile wait in the mailbox.
         ctx.wait(load.into_actor(self).map(|loaded, act, ctx| {
             let loaded = loaded.unwrap_or_else(|e| {
                 warn!(peer = %act.peer, error = %e, "couldn't load the player; starting fresh");
-                Loaded::Guest(None, GameConfig::default(), Records::default())
+                Loaded::Guest(None)
             });
             match loaded {
                 Loaded::Account(AccountData {
                     account,
-                    cfg,
+                    prefs,
                     records,
+                    last_game,
                 }) => {
                     debug!(peer = %act.peer, user = %account.username, "signed in by key");
-                    act.open_screen(cfg, records, ctx);
+                    act.open_screen(Saved { prefs, records }, last_game, ctx);
                     act.became(account, ctx);
                 }
-                Loaded::Guest(nick, cfg, records) => {
-                    if let (Some(nick), Some(player)) = (nick, act.player.as_mut()) {
-                        player.nick = nick;
+                Loaded::Guest(Some(saved)) => {
+                    if let Some(player) = act.player.as_mut() {
+                        player.nick = saved.nick;
                     }
-                    act.open_screen(cfg, records, ctx);
+                    let snake = Saved {
+                        prefs: saved.prefs,
+                        records: saved.records,
+                    };
+                    act.open_screen(snake, saved.last_game, ctx);
                 }
+                Loaded::Guest(None) => act.open_screen(Saved::default(), None, ctx),
             }
+            act.note_game(ctx);
+            act.report_status();
             act.render(ctx);
         }));
     }
 
-    /// Sets up the terminal and the game; the caller draws the first frame.
-    fn open_screen(&mut self, cfg: GameConfig, records: Records, ctx: &mut Context<Self>) {
+    /// Sets up the terminal and the app, with Snake's `saved` settings and
+    /// records. It opens the game the player asked for by their SSH
+    /// username, or else the one they played last. The caller draws the
+    /// first frame.
+    fn open_screen(&mut self, saved: Saved, last_game: Option<GameId>, ctx: &mut Context<Self>) {
         let viewport = Viewport::Fixed(Rect::new(0, 0, self.size.width, self.size.height));
         let terminal = match Terminal::with_options(
             SshBackend::new(self.size),
@@ -539,12 +553,15 @@ impl SessionActor {
                 return self.close(1, None, ctx);
             }
         };
+        let asked = self.player.as_ref().and_then(|p| p.game);
         let mut app = App::online(
-            cfg,
-            records,
+            games::uis(),
+            asked.or(last_game),
             self.guest_name(),
             self.fingerprint().is_some(),
         );
+        app.restore(GameId::Snake, saved);
+        self.last_game = last_game;
         if let Some(cluster) = &self.shared.cluster {
             app.set_region(QueueRegion {
                 name: cluster.region.clone(),
@@ -623,7 +640,7 @@ impl SessionActor {
 
     fn on_keys(&mut self, keys: Vec<Key>, ctx: &mut Context<Self>) {
         let Some(app) = self.app.as_mut() else { return };
-        let was_playing = matches!(app.screen, Screen::Playing | Screen::Finding);
+        let was_playing = app.playing_alone() || app.screen == Screen::Finding;
         let mut effects = Vec::new();
         for key in keys {
             let fx = app.handle(key);
@@ -638,6 +655,7 @@ impl SessionActor {
             self.last_tick = Instant::now();
         }
         self.apply(effects, ctx);
+        self.note_game(ctx);
         self.report_status();
         self.render(ctx);
         self.schedule_wake(ctx);
@@ -645,51 +663,30 @@ impl SessionActor {
     }
 
     fn apply(&mut self, effects: Vec<Effect>, ctx: &mut Context<Self>) {
-        let fingerprint = self.fingerprint();
-        let account = self.account_id();
-        let store = self.shared.store.clone();
         for effect in effects {
             if costly(&effect) && self.actions.take(1, Instant::now()) == 0 {
                 self.too_fast(ctx);
                 continue;
             }
             match effect {
-                Effect::SaveConfig => {
-                    self.unsaved.config = true;
-                    self.save_soon(ctx);
-                }
-                Effect::RecordSet { key, best } => {
-                    let (store, fp) = (store.clone(), fingerprint.clone());
-                    actix::spawn(async move {
-                        let saved = match (account, fp) {
-                            (Some(id), _) => store.save_account_record(id, &key, best).await,
-                            (None, Some(fp)) => store.save_record(&fp, &key, best).await,
-                            (None, None) => Ok(()),
-                        };
-                        if let Err(e) = saved {
-                            warn!(error = %e, "couldn't save a record");
-                        }
-                    });
-                }
+                Effect::Game(game, fx) => self.game_fx(game, fx, ctx),
                 Effect::Quit => self.close(0, None, ctx),
-                Effect::QuickPlay => self.enqueue(ctx),
+                Effect::QuickPlay { game, pool } => {
+                    let pool = PoolKey {
+                        game,
+                        pool: pool.to_string(),
+                    };
+                    self.enqueue(pool, ctx);
+                }
                 Effect::LeaveQueue => {
                     self.queued = false;
                     self.shared.matchmaker.do_send(Dequeue(self.id));
                 }
-                Effect::CreateRoom(rules) => self.join_private(Some(rules), None, ctx),
+                Effect::CreateRoom { game, settings } => {
+                    self.join_private(Some((game, settings)), None, ctx);
+                }
                 Effect::JoinRoom(code) => self.join_private(None, Some(code), ctx),
-                Effect::Steer(dir) => {
-                    if let Some(link) = &self.room {
-                        link.room.play::<Snake>(self.id, &dir);
-                    }
-                }
                 Effect::ToggleReady => self.tell_room(RoomCmd::Ready),
-                Effect::RoomRules(rules) => {
-                    if let Some(link) = &self.room {
-                        link.room.set_settings::<Snake>(self.id, &rules);
-                    }
-                }
                 Effect::AddBot => self.tell_room(RoomCmd::AddBot),
                 Effect::RemoveBot => self.tell_room(RoomCmd::RemoveBot),
                 Effect::PlayBots => self.shared.matchmaker.do_send(BotMatch(self.id)),
@@ -707,7 +704,7 @@ impl SessionActor {
                 Effect::ForgetKey(key) => self.refresh_keys(Some(key), ctx),
                 Effect::LoadAccount => self.refresh_keys(None, ctx),
                 Effect::LoadFriends => self.refresh_friends(ctx),
-                Effect::LoadLeaderboard => self.load_leaderboard(ctx),
+                Effect::LoadLeaderboard(key) => self.load_leaderboard(key, ctx),
                 Effect::AddFriend(name) => self.add_friend(name, ctx),
                 Effect::AnswerFriend { name, accept } => self.answer_friend(name, accept, ctx),
                 Effect::RemoveFriend(name) => self.remove_friend(name, ctx),
@@ -718,9 +715,56 @@ impl SessionActor {
         }
     }
 
+    /// Work a game left: moves and settings for its room, and what to keep.
+    fn game_fx(&mut self, game: GameId, fx: GameFx, ctx: &mut Context<Self>) {
+        match fx {
+            // Only to a room of that game, which reads them.
+            GameFx::Play(bytes) if self.room.as_ref().is_some_and(|r| r.game == game) => {
+                self.tell_room(RoomCmd::Play(bytes));
+            }
+            GameFx::Settings(bytes) if self.room.as_ref().is_some_and(|r| r.game == game) => {
+                self.tell_room(RoomCmd::Settings(bytes));
+            }
+            GameFx::Play(_) | GameFx::Settings(_) => {}
+            GameFx::SavePrefs(text) => {
+                self.unsaved.prefs.insert(game, text);
+                self.save_soon(ctx);
+            }
+            // Records are Snake's: their tables don't say which game.
+            GameFx::Record { key, best } if game == GameId::Snake => {
+                let store = self.shared.store.clone();
+                let (account, fp) = (self.account_id(), self.fingerprint());
+                actix::spawn(async move {
+                    let saved = match (account, fp) {
+                        (Some(id), _) => store.save_account_record(id, &key, best).await,
+                        (None, Some(fp)) => store.save_record(&fp, &key, best).await,
+                        (None, None) => Ok(()),
+                    };
+                    if let Err(e) = saved {
+                        warn!(error = %e, "couldn't save a record");
+                    }
+                });
+            }
+            GameFx::Record { .. } => {}
+        }
+    }
+
     fn tell_room(&self, cmd: RoomCmd) {
         if let Some(link) = &self.room {
             link.room.send(self.id, cmd);
+        }
+    }
+
+    /// Saves the game the player has open as the one to open next time,
+    /// once it's another than the one saved.
+    fn note_game(&mut self, ctx: &mut Context<Self>) {
+        let Some(game) = self.app.as_ref().and_then(App::game) else {
+            return;
+        };
+        if self.last_game != Some(game) {
+            self.last_game = Some(game);
+            self.unsaved.last_game = Some(game);
+            self.save_soon(ctx);
         }
     }
 
@@ -741,16 +785,29 @@ impl SessionActor {
         }
     }
 
-    fn enqueue(&mut self, ctx: &mut Context<Self>) {
+    fn enqueue(&mut self, pool: PoolKey, ctx: &mut Context<Self>) {
         if self.room.is_some() {
             return;
         }
+        if pool.find().is_none() {
+            warn!(peer = %self.peer, %pool, "quick play in a pool this server doesn't have");
+            if let Some(app) = self.app.as_mut() {
+                app.go_home(HomeItem::QuickPlay, Some(TRY_AGAIN.to_string()));
+            }
+            return self.render(ctx);
+        }
+        // Only Snake's rating is kept so far.
+        let rating = if pool.rating() == Some(SNAKE_QUICK) {
+            self.rating()
+        } else {
+            Rating::default()
+        };
         self.queued = true;
         self.shared.matchmaker.do_send(Enqueue {
-            pool: quick_pool(),
+            pool,
             who: self.entrant(),
             account: self.account_id(),
-            rating: self.rating(),
+            rating,
             region: self
                 .shared
                 .cluster
@@ -762,20 +819,22 @@ impl SessionActor {
         });
     }
 
-    /// Makes a private room with `rules` and takes a seat in it.
+    /// Makes a private room of `game` with `settings`, as its screens
+    /// wrote them, and takes a seat in it.
     fn room_maker(
         &self,
-        rules: Rules,
+        game: GameId,
+        settings: &[u8],
     ) -> impl std::future::Future<Output = Result<JoinedRoom, JoinFail>> + use<> {
         let lobby = self.shared.lobby.clone();
-        let settings = RoomSettings::new(rules, RoomKind::Private);
         let seed = self.shared.cfg.room_seed.unwrap_or_else(rand::random);
+        let room = games::get(game)
+            .ok_or(JoinFail::OtherGame)
+            .and_then(|g| g.private_room(settings, seed).map_err(JoinFail::Refused));
         let who = self.entrant();
         let presence = Arc::downgrade(&self.presence);
         async move {
-            let settings = settings.ok_or(JoinFail::BoardTooSmall)?;
-            let room = Box::new(Room::new(settings, seed));
-            let room = match lobby.send(CreateRoom { room }).await {
+            let room = match lobby.send(CreateRoom { room: room? }).await {
                 Ok(Ok((_, room))) => room,
                 Ok(Err(CodeUnavailable)) => return Err(JoinFail::Unavailable),
                 Err(_) => return Err(JoinFail::Closed),
@@ -784,19 +843,19 @@ impl SessionActor {
         }
     }
 
-    /// Makes a private room with `rules`, or finds the one with `code`, and
-    /// takes a seat in it.
+    /// Makes a private room of a game with its settings, or finds the one
+    /// with `code`, and takes a seat in it.
     fn join_private(
         &mut self,
-        rules: Option<Rules>,
+        make: Option<(GameId, Vec<u8>)>,
         code: Option<String>,
         ctx: &mut Context<Self>,
     ) {
         if code.is_some() && self.wrong_codes >= MAX_WRONG_CODES {
             return self.join_failed(JoinFail::TooManyCodes, ctx);
         }
-        let join: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> = match (rules, code) {
-            (Some(rules), _) => Box::pin(self.room_maker(rules)),
+        let join: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> = match (make, code) {
+            (Some((game, settings)), _) => Box::pin(self.room_maker(game, &settings)),
             (None, Some(code)) => {
                 let lobby = self.shared.lobby.clone();
                 let guesses = self.shared.guesses.clone();
@@ -850,12 +909,14 @@ impl SessionActor {
             room.leave(self.id);
             return;
         }
-        let Some(current) = snake_view(view.borrow().clone()) else {
+        let current = view.borrow().clone();
+        if !self
+            .app
+            .as_mut()
+            .is_some_and(|app| app.enter_room(self.id, current))
+        {
             room.leave(self.id);
-            return self.join_failed(JoinFail::Closed, ctx);
-        };
-        if let Some(app) = self.app.as_mut() {
-            app.enter_room(self.id, current);
+            return self.join_failed(JoinFail::OtherGame, ctx);
         }
         self.link(room, view, ctx);
     }
@@ -864,11 +925,19 @@ impl SessionActor {
     fn link(&mut self, room: RoomHandle, view: ViewRx, ctx: &mut Context<Self>) {
         self.stays += 1;
         let stay = self.stays;
+        let game = view.borrow().game();
         let watch = self.watch_room(view, stay, ctx);
         if let Some(ping) = self.ping {
             room.send(self.id, RoomCmd::Ping(ping));
         }
-        self.room = Some(RoomLink { room, watch, stay });
+        self.room = Some(RoomLink {
+            room,
+            game,
+            watch,
+            stay,
+        });
+        // Its game is the one open now.
+        self.note_game(ctx);
         self.report_status();
         self.render(ctx);
     }
@@ -890,15 +959,12 @@ impl SessionActor {
             room.leave(self.id);
             return;
         }
-        let Some(current) = snake_view(view.borrow().clone()) else {
+        let current = view.borrow().clone();
+        let Some(app) = self.app.as_mut() else { return };
+        if !app.watch_room(self.id, friend, current) {
             room.leave(self.id);
-            if let Some(app) = self.app.as_mut() {
-                app.watch_failed(JoinFail::Closed.message().to_string());
-            }
+            app.watch_failed(JoinFail::OtherGame.message().to_string());
             return self.render(ctx);
-        };
-        if let Some(app) = self.app.as_mut() {
-            app.watch_room(self.id, friend, current);
         }
         self.link(room, view, ctx);
     }
@@ -921,10 +987,11 @@ impl SessionActor {
                         PhaseView::Closed { reason } => Some(reason.clone()),
                         _ => None,
                     };
-                    match snake_view(latest) {
-                        Some(latest) if open => app.update_room(latest),
+                    if open {
+                        app.update_room(latest);
+                    } else {
                         // The room is gone. Its last view may say why.
-                        _ => app.room_closed(reason),
+                        app.room_closed(reason);
                     }
                     if open && app.in_room() {
                         let watch = act.watch_room(view, stay, ctx);
@@ -954,13 +1021,8 @@ impl SessionActor {
 enum Loaded {
     /// The key is remembered by an account.
     Account(AccountData),
-    /// A guest: the saved nickname, if the key has one, settings and records.
-    Guest(Option<String>, GameConfig, Records),
-}
-
-/// A room's view as the Snake screens draw it; `None` for another game's.
-fn snake_view(view: Arc<dyn AnyRoomView>) -> Option<Arc<snake_core::round::RoomView>> {
-    games::view_of::<Snake>(view)
+    /// A guest: what's saved for their key, if they have one.
+    Guest(Option<store::Saved>),
 }
 
 /// Takes a seat in `room`.
@@ -1014,18 +1076,29 @@ impl SessionActor {
         let unsaved = std::mem::take(&mut self.unsaved);
         let store = self.shared.store.clone();
         let (account, fingerprint) = (self.account_id(), self.fingerprint());
-        if unsaved.config
-            && let Some(cfg) = self.app.as_ref().map(|a| a.cfg.clone())
-        {
+        for (game, text) in unsaved.prefs {
             let (store, fingerprint) = (store.clone(), fingerprint.clone());
             actix::spawn(async move {
                 let saved = match (account, fingerprint) {
-                    (Some(id), _) => store.save_account_config(id, &cfg).await,
-                    (None, Some(fp)) => store.save_config(&fp, &cfg).await,
+                    (Some(id), _) => store.save_account_prefs(id, game, &text).await,
+                    (None, Some(fp)) => store.save_prefs(&fp, game, &text).await,
                     (None, None) => Ok(()),
                 };
                 if let Err(e) = saved {
                     warn!(error = %e, "couldn't save settings");
+                }
+            });
+        }
+        if let Some(game) = unsaved.last_game {
+            let (store, fingerprint) = (store.clone(), fingerprint.clone());
+            actix::spawn(async move {
+                let saved = match (account, fingerprint) {
+                    (Some(id), _) => store.set_account_last_game(id, game).await,
+                    (None, Some(fp)) => store.set_last_game(&fp, game).await,
+                    (None, None) => Ok(()),
+                };
+                if let Err(e) = saved {
+                    warn!(error = %e, "couldn't save the last game");
                 }
             });
         }
@@ -1142,16 +1215,11 @@ impl SessionActor {
         if self.closing {
             return;
         }
-        let delay = match (app.screen, &app.game) {
+        let delay = match (app.screen, app.next_wake()) {
             // The queue's clock and size on screen.
             (Screen::Finding, _) => QUEUE_WAKE,
-            // Frozen until the first key; nothing to wake for.
-            (Screen::Playing, Some(game)) if !game.started => return,
-            (Screen::Playing, Some(game)) => game
-                .until_next_step()
-                .unwrap_or_default()
-                .clamp(Duration::from_millis(1), MAX_WAKE),
-            _ => return,
+            (_, Some(next)) => next.clamp(Duration::from_millis(1), MAX_WAKE),
+            (_, None) => return,
         };
         self.wake = Some(ctx.run_later(delay, |act, ctx| {
             act.wake = None;
@@ -1174,11 +1242,12 @@ impl SessionActor {
         let idle = self.shared.cfg.idle_timeout();
         // Waiting for a match or watching a round isn't idling.
         let playing = self.app.as_ref().is_some_and(|a| {
-            matches!(a.screen, Screen::Playing | Screen::Finding)
+            a.playing_alone()
+                || a.screen == Screen::Finding
                 || a.online
+                    .room
                     .as_ref()
-                    .and_then(|o| o.room.as_ref())
-                    .is_some_and(|r| !matches!(r.view.shell.phase, PhaseView::Waiting { .. }))
+                    .is_some_and(|r| !matches!(r.shell().phase, PhaseView::Waiting { .. }))
         });
         if self.app.is_some() && !playing && self.last_input.elapsed() > idle {
             info!(peer = %self.peer, "idle; logging out");
@@ -1224,9 +1293,8 @@ impl SessionActor {
         let phase = self
             .app
             .as_ref()
-            .and_then(|a| a.online.as_ref())
-            .and_then(|o| o.room.as_ref())
-            .map(|r| &r.view.shell.phase);
+            .and_then(|a| a.online.room.as_ref())
+            .map(|r| &r.shell().phase);
         match phase {
             Some(PhaseView::Countdown { .. } | PhaseView::Running { .. }) => {}
             Some(PhaseView::Results { .. }) => {
@@ -1238,11 +1306,7 @@ impl SessionActor {
 
     fn save_unfinished_game(&mut self, ctx: &mut Context<Self>) {
         if let Some(app) = self.app.as_mut() {
-            let effects: Vec<Effect> = app
-                .handle(Key::CtrlC)
-                .into_iter()
-                .filter(|e| matches!(e, Effect::RecordSet { .. }))
-                .collect();
+            let effects = app.unfinished();
             self.apply(effects, ctx);
         }
     }
@@ -1461,8 +1525,12 @@ mod tests {
     fn database_actions_are_costly_and_moves_are_not() {
         assert!(costly(&Effect::AddFriend("ann".into())));
         assert!(costly(&Effect::JoinRoom("ABCDEF".into())));
-        assert!(!costly(&Effect::Steer(snake_core::geom::Direction::Up)));
-        assert!(!costly(&Effect::LoadLeaderboard), "coalesced instead");
+        let steer = GameFx::Play(games::encode(&snake_core::geom::Direction::Up));
+        assert!(!costly(&Effect::Game(GameId::Snake, steer)));
+        assert!(
+            !costly(&Effect::LoadLeaderboard(SNAKE_QUICK)),
+            "coalesced instead"
+        );
     }
 
     #[test]

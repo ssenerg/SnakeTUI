@@ -11,7 +11,7 @@ use crate::app::App;
 use crate::online::{LeaderRow, MyPlace, RANKED_AFTER};
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let Some(online) = &app.online else { return };
+    let online = &app.online;
     let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(frame.area());
     let dim = Style::default().fg(Color::DarkGray);

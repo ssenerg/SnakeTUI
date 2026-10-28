@@ -1,5 +1,5 @@
-//! A multiplayer room: the lobby of a private room, and the board with its
-//! scoreboard while a round plays.
+//! A room's round: the board with its scoreboard, from the countdown to
+//! under the results.
 
 use std::time::Duration;
 
@@ -8,15 +8,16 @@ use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
+use shell_tui::GameUi;
+use shell_tui::online::InRoom;
+use shell_tui::ui::{dialog, dim, ping_style, ping_text, secs};
 use snake_core::config::ColorSlot;
 use snake_core::geom::Point;
-use snake_core::round::{Entrant, PhaseView, RoomKind, is_bot};
+use snake_core::round::{PhaseView, RoomView};
 use snake_core::view::MatchView;
 
 use super::board::{BoardWidget, SnakeLook};
-use super::dialog;
-use crate::app::App;
-use crate::online::InRoom;
+use crate::app::{SnakeUi, racer, snake_view};
 use crate::palette::{opponent_colors, theme_color};
 
 /// Columns the scoreboard takes beside the board.
@@ -33,149 +34,17 @@ pub fn room_fits(width: u16, height: u16, size: Size) -> bool {
     size.width >= w && size.height >= h
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let Some(room) = app.online.as_ref().and_then(|o| o.room.as_ref()) else {
-        return;
-    };
-    match (&room.view.shell.phase, &room.view.game.board) {
-        (PhaseView::Waiting { starts_in }, _) => draw_lobby(frame, app, room, *starts_in),
-        (_, Some(board)) => draw_match(frame, app, room, board),
-        _ => {}
+pub(crate) fn draw_round(frame: &mut Frame, app: &SnakeUi, room: &InRoom) {
+    if let Some(view) = snake_view(room)
+        && let Some(board) = &view.game.board
+    {
+        draw_match(frame, app, room, view, board);
     }
-}
-
-/// A player's name, marked if they're a bot.
-fn named(who: &Entrant) -> String {
-    if is_bot(who.id) {
-        format!("{} (bot)", who.name)
-    } else {
-        who.name.clone()
-    }
-}
-
-fn secs(d: Duration) -> u64 {
-    d.as_secs_f64().ceil() as u64
-}
-
-fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-/// A round trip as shown: "42 ms", or "1.2 s" from a second on. `tight`
-/// leaves out the space.
-fn ping_text(ping: Duration, tight: bool) -> String {
-    let gap = if tight { "" } else { " " };
-    match ping.as_millis() {
-        ms @ 0..1000 => format!("{}{gap}ms", ms.max(1)),
-        _ => format!("{:.1}{gap}s", ping.as_secs_f64()),
-    }
-}
-
-/// Green while turns feel instant, yellow once they lag, red when they lag
-/// badly.
-fn ping_style(ping: Duration) -> Style {
-    let color = match ping.as_millis() {
-        0..80 => Color::LightGreen,
-        80..200 => Color::Yellow,
-        _ => Color::LightRed,
-    };
-    Style::default().fg(color)
-}
-
-fn draw_lobby(frame: &mut Frame, app: &App, room: &InRoom, starts_in: Option<Duration>) {
-    let view = &room.view.shell;
-    let rules = &room.view.settings;
-    let online = app.online.as_ref();
-    let watchers = u16::from(view.watchers > 0);
-    let height = 12 + view.seats.len() as u16 + u16::from(room.hosting()) + watchers;
-    let inner = dialog(frame, " Private room ", Color::Cyan, 60, height);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::default()];
-    if let Some(code) = &view.code {
-        lines.push(Line::from(vec![
-            Span::styled("Code ", dim()),
-            Span::styled(code.clone(), bold.fg(Color::LightYellow)),
-        ]));
-        lines.push(Line::from("Share it so friends can join.").style(dim()));
-    }
-    // The host can change the speed, so theirs stands out, with arrows.
-    let tick = format!("{} ms ticks", rules.tick_ms);
-    let tick = if room.hosting() {
-        Span::styled(
-            format!("◂ {tick} ▸"),
-            Style::default().fg(Color::LightYellow),
-        )
-    } else {
-        Span::styled(tick, dim())
-    };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{}×{} board · ", rules.width, rules.height), dim()),
-        tick,
-        Span::styled(
-            format!(" · {}/{} players", view.seats.len(), view.max_players),
-            dim(),
-        ),
-    ]));
-    lines.push(Line::default());
-    for seat in &view.seats {
-        let (mark, style) = if seat.ready {
-            ("✓ ", Style::default().fg(Color::LightGreen))
-        } else {
-            ("· ", dim())
-        };
-        let mut spans = vec![
-            Span::styled(mark, style),
-            Span::styled(seat.who.name.clone(), bold),
-        ];
-        if seat.who.id == room.me {
-            spans.push(Span::styled(" (you)", dim()));
-        }
-        if is_bot(seat.who.id) {
-            spans.push(Span::styled(" (bot)", dim()));
-        }
-        if seat.wins > 0 {
-            let s = if seat.wins == 1 { "" } else { "s" };
-            spans.push(Span::styled(format!(" · {} win{s}", seat.wins), dim()));
-        }
-        if let Some(ping) = seat.ping {
-            spans.push(Span::styled(" · ", dim()));
-            spans.push(Span::styled(ping_text(ping, false), ping_style(ping)));
-        }
-        lines.push(Line::from(spans));
-    }
-    if view.watchers > 0 {
-        lines.push(Line::styled(format!("{} watching", view.watchers), dim()));
-    }
-    lines.push(Line::default());
-    lines.push(match starts_in {
-        Some(left) => Line::from(format!(
-            "Starting in {} s, or when everyone is ready",
-            secs(left)
-        )),
-        None if view.seats.len() < 2 => Line::from("Waiting for another player…"),
-        None => Line::default(),
-    });
-    lines.push(match online.and_then(|o| o.notice.as_ref()) {
-        Some(notice) => Line::styled(notice.clone(), Style::default().fg(Color::LightYellow)),
-        None => Line::default(),
-    });
-    let signed_in = online.is_some_and(|o| o.account.is_some());
-    let hint = match (&room.watching, room.hosting(), signed_in) {
-        (Some(friend), _, _) => format!("Watching {friend} · e rules · Esc leave"),
-        (None, true, true) => "Enter ready · e rules · i invite · Esc leave".into(),
-        (None, false, true) => "Enter ready · e rules · i invite friends · Esc leave".into(),
-        (None, _, false) => "Enter ready · e rules · Esc leave".into(),
-    };
-    lines.push(Line::from(hint).style(dim()));
-    if room.hosting() {
-        lines.push(Line::from("←→ speed · b add a bot · x take one out").style(dim()));
-    }
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
 /// How each snake on `board` is drawn for this player: their own in their
 /// theme's colors, the others in colors that stand apart from it.
-fn looks(app: &App, room: &InRoom, board: &MatchView) -> Vec<SnakeLook> {
+fn looks(app: &SnakeUi, room: &InRoom, board: &MatchView) -> Vec<SnakeLook> {
     let theme = &app.cfg.theme;
     let mine = room.followed().and_then(|s| s.slot);
     let others = opponent_colors(theme);
@@ -231,7 +100,7 @@ fn origin(center: Point, board: &MatchView, visible: (u16, u16)) -> Point {
     }
 }
 
-fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
+fn draw_match(frame: &mut Frame, app: &SnakeUi, room: &InRoom, view: &RoomView, board: &MatchView) {
     let area = frame.area();
     let full_w = board.width * 2 + 2;
     let full_h = board.height + 2;
@@ -251,7 +120,7 @@ fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
     let status = Rect::new(area.x, y0 + board_h, area.width, 1).intersection(area);
     let cropped = board_w < full_w || board_h < full_h;
 
-    let clock = match &room.view.shell.phase {
+    let clock = match &view.shell.phase {
         PhaseView::Running { left: Some(left) } => {
             let s = secs(*left);
             format!(" {:02}:{:02} ", s / 60, s % 60)
@@ -293,21 +162,21 @@ fn draw_match(frame: &mut Frame, app: &App, room: &InRoom, board: &MatchView) {
     frame.render_widget(widget, inner);
 
     if score_w > 0 {
-        draw_scores(frame, room, &looks, score_rect);
+        draw_scores(frame, room, view, &looks, score_rect);
     }
     let (need_w, need_h) = room_size(board.width, board.height);
+    let playing = app.in_play(room);
     frame.render_widget(
-        Paragraph::new(status_line(room, cropped, need_w, need_h)).alignment(Alignment::Center),
+        Paragraph::new(status_line(room, playing, cropped, need_w, need_h))
+            .alignment(Alignment::Center),
         status,
     );
-    match &room.view.shell.phase {
-        PhaseView::Countdown { left } => draw_countdown(frame, room, &looks, *left),
-        PhaseView::Results { next_in } => draw_results(frame, room, *next_in),
-        _ => {}
+    if let PhaseView::Countdown { left } = &view.shell.phase {
+        draw_countdown(frame, room, &looks, *left);
     }
 }
 
-fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect) {
+fn draw_scores(frame: &mut Frame, room: &InRoom, view: &RoomView, looks: &[SnakeLook], rect: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim())
@@ -316,13 +185,12 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
     frame.render_widget(block, rect);
 
     // Each seat with whether its snake is alive, and its length.
-    let mut seats: Vec<_> = room
-        .view
+    let mut seats: Vec<_> = view
         .shell
         .seats
         .iter()
         .map(|s| {
-            let racer = room.racer(s);
+            let racer = racer(view, s);
             let alive = racer.is_some_and(|r| r.alive);
             (s, alive, racer.map_or(0, |r| r.length))
         })
@@ -380,17 +248,23 @@ fn draw_scores(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], rect: Rect
         })
         .collect();
     let mut lines = lines;
-    if room.view.shell.watchers > 0 {
+    if view.shell.watchers > 0 {
         lines.push(Line::default());
         lines.push(Line::styled(
-            format!(" {} watching", room.view.shell.watchers),
+            format!(" {} watching", view.shell.watchers),
             dim(),
         ));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn status_line(room: &InRoom, cropped: bool, need_w: u16, need_h: u16) -> Line<'static> {
+fn status_line(
+    room: &InRoom,
+    playing: bool,
+    cropped: bool,
+    need_w: u16,
+    need_h: u16,
+) -> Line<'static> {
     let warn = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -407,12 +281,12 @@ fn status_line(room: &InRoom, cropped: bool, need_w: u16, need_h: u16) -> Line<'
         return Line::styled(format!("Watching {friend} · Esc leave"), dim());
     }
     let seat = room.my_seat();
-    match &room.view.shell.phase {
+    match &room.shell().phase {
         PhaseView::Countdown { .. } => Line::styled("Get ready…", warn),
         PhaseView::Running { .. } if seat.is_some_and(|s| s.slot.is_none()) => {
             Line::styled("Watching · you'll play the next round · Esc leave", dim())
         }
-        PhaseView::Running { .. } if !room.playing() => {
+        PhaseView::Running { .. } if !playing => {
             Line::styled("You're out · watching the rest · Esc leave", dim())
         }
         PhaseView::Running { .. } => Line::styled("←↑↓→ move · Esc leave", dim()),
@@ -452,67 +326,5 @@ fn draw_countdown(frame: &mut Frame, room: &InRoom, looks: &[SnakeLook], left: D
     } else {
         lines.push(Line::styled("You'll play the next round", dim()));
     }
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-}
-
-fn draw_results(frame: &mut Frame, room: &InRoom, next_in: Option<Duration>) {
-    let view = &room.view.shell;
-    let height = 9 + view.placements.len() as u16;
-    let (headline, color) = match view.winner() {
-        Some(winner) if winner.id == room.me => ("★ You win! ★".to_string(), Color::LightGreen),
-        Some(winner) => (format!("{} wins!", named(winner)), Color::LightCyan),
-        None => ("Draw!".to_string(), Color::LightYellow),
-    };
-    let inner = dialog(frame, " RESULTS ", color, 48, height);
-    let time_up = room.view.game.time_up;
-    let mut lines = vec![
-        Line::default(),
-        Line::styled(
-            headline,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        if time_up {
-            Line::styled("Time's up", dim())
-        } else {
-            Line::default()
-        },
-    ];
-    for p in &view.placements {
-        let style = if Some(p.who.id) == room.followed().map(|s| s.who.id) {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let name: String = named(&p.who).chars().take(18).collect();
-        let length = room.view.game.racer(p.who.id).map_or(0, |r| r.length);
-        let mut spans = vec![Span::styled(
-            format!("{:>2}. {name:<18} {length:>4}", p.place),
-            style,
-        )];
-        // Rated matches: how the round moved each account's rating.
-        match view.ratings.iter().find(|r| r.id == p.who.id) {
-            Some(r) if r.after >= r.before => spans.push(Span::styled(
-                format!("  +{:<3}", r.after - r.before),
-                Style::default().fg(Color::LightGreen),
-            )),
-            Some(r) => spans.push(Span::styled(
-                format!("  −{:<3}", r.before - r.after),
-                Style::default().fg(Color::LightRed),
-            )),
-            None => spans.push(Span::raw("      ")),
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::default());
-    lines.push(match (view.kind, next_in) {
-        _ if room.watching.is_some() => Line::styled("Esc leave", dim()),
-        (RoomKind::Match, _) => Line::styled("Enter find another match · Esc home", dim()),
-        (RoomKind::Private, Some(left)) => {
-            Line::styled(format!("Next round in {} s · Esc leave", secs(left)), dim())
-        }
-        (RoomKind::Private, None) => Line::styled("Esc leave", dim()),
-    });
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }

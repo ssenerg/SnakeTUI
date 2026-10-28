@@ -11,7 +11,7 @@ use crate::app::App;
 use crate::online::{FormKind, FormRow};
 
 pub fn draw(frame: &mut Frame, app: &App, kind: FormKind) {
-    let has_key = app.online.as_ref().is_some_and(|o| o.has_key);
+    let has_key = app.online.has_key;
     let rows = kind.rows(has_key);
     let form = &app.form;
     let inner = dialog(frame, kind.title(), Color::Cyan, 56, rows.len() as u16 + 11)

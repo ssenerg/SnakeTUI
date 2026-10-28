@@ -7,14 +7,18 @@
 //! results and wins. Nothing here knows about terminals or networks, and a
 //! room only moves when told to, so tests drive its clock by hand.
 
+#[cfg(feature = "serde")]
+pub mod codec;
+pub mod records;
 pub mod room;
 pub mod view;
 
 use std::fmt::{self, Debug};
 use std::time::Duration;
 
+pub use records::Records;
 pub use room::{Room, RoomRng, RoomSettings};
-pub use view::{PhaseView, RatingChange, RoomView, SeatView, ShellView};
+pub use view::{AnyView, PhaseView, RatingChange, RoomView, SeatView, ShellView};
 
 /// Identifies a player to a room. The server hands them out; rooms never
 /// interpret them.
@@ -37,14 +41,25 @@ pub fn is_bot(id: PlayerId) -> bool {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GameId {
     Snake,
+    /// Not served yet.
+    Chess,
 }
 
 impl GameId {
+    /// Every game, in the order they were added.
+    pub const ALL: &[GameId] = &[GameId::Snake, GameId::Chess];
+
     /// The name the database keeps it by.
     pub const fn as_str(self) -> &'static str {
         match self {
             GameId::Snake => "snake",
+            GameId::Chess => "chess",
         }
+    }
+
+    /// The game kept by this name, if it's one of [`Self::ALL`].
+    pub fn from_name(name: &str) -> Option<GameId> {
+        Self::ALL.iter().copied().find(|g| g.as_str() == name)
     }
 }
 
@@ -208,4 +223,18 @@ pub trait Round<G: Game>: Send + Sized + 'static {
 
     /// Whether anything players see has changed since the last call.
     fn take_changed(&mut self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn games_are_kept_by_name() {
+        for &game in GameId::ALL {
+            assert_eq!(GameId::from_name(game.as_str()), Some(game));
+        }
+        assert_eq!(GameId::from_name("checkers"), None);
+        assert_eq!(GameId::from_name("Snake"), None, "names are lower case");
+    }
 }

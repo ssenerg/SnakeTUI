@@ -5,9 +5,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 use snake_core::solo::SoloGame;
 
+use shell_tui::ui::centered_rect;
+
 use super::board::BoardWidget;
-use super::centered_rect;
-use crate::app::App;
+use crate::app::SnakeUi;
 
 const PAD_X: u16 = 2;
 const PAD_Y: u16 = 1;
@@ -24,7 +25,7 @@ pub fn board_fits(width: u16, height: u16, size: Size) -> bool {
     size.width >= need_w && size.height >= need_h
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &SnakeUi) {
     let Some(game) = &app.game else { return };
     let area = frame.area();
 
@@ -72,7 +73,7 @@ fn title_line() -> Line<'static> {
     .left_aligned()
 }
 
-fn stats_line(app: &App, game: &SoloGame, board_w: u16) -> Line<'static> {
+fn stats_line(app: &SnakeUi, game: &SoloGame, board_w: u16) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let len = game.len();

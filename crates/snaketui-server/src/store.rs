@@ -18,8 +18,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use snake_core::config::GameConfig;
-use snake_core::records::Records;
+use game_api::{GameId, Records};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
@@ -429,8 +428,11 @@ pub struct Store {
 /// What's saved for a returning guest with a key.
 pub struct Saved {
     pub nick: String,
-    pub cfg: GameConfig,
+    /// Snake's preferences, as Snake writes them.
+    pub prefs: String,
     pub records: Records,
+    /// The game they played last, if this server knows it.
+    pub last_game: Option<GameId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -445,8 +447,11 @@ pub struct Account {
 /// An account with its settings and records, as a session needs it.
 pub struct AccountData {
     pub account: Account,
-    pub cfg: GameConfig,
+    /// Snake's preferences, as Snake writes them.
+    pub prefs: String,
     pub records: Records,
+    /// The game they played last, if this server knows it.
+    pub last_game: Option<GameId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -624,18 +629,20 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
-        let player = sqlx::query("SELECT nick, config FROM players WHERE fingerprint = $1")
-            .bind(fingerprint)
-            .fetch_one(&self.pool)
-            .await?;
+        let player =
+            sqlx::query("SELECT nick, config, last_game FROM players WHERE fingerprint = $1")
+                .bind(fingerprint)
+                .fetch_one(&self.pool)
+                .await?;
         let rows = sqlx::query("SELECT record_key, best FROM solo_records WHERE fingerprint = $1")
             .bind(fingerprint)
             .fetch_all(&self.pool)
             .await?;
         Ok(Saved {
             nick: player.try_get(0)?,
-            cfg: GameConfig::from_saved_text(&player.try_get::<String, _>(1)?),
+            prefs: player.try_get(1)?,
             records: records_from(rows)?,
+            last_game: game_from(player.try_get(2)?),
         })
     }
 
@@ -648,14 +655,18 @@ impl Store {
         Ok(())
     }
 
-    pub async fn save_config(&self, fingerprint: &str, cfg: &GameConfig) -> Result<()> {
-        let text = cfg.to_saved_text();
+    /// Keeps a guest's preferences in `game`, as the game writes them.
+    pub async fn save_prefs(&self, fingerprint: &str, game: GameId, text: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE players SET config = $2 WHERE fingerprint = $1")
-            .bind(fingerprint)
-            .bind(&text)
-            .execute(&mut *tx)
-            .await?;
+        // Snake's are read from here until every server reads them from
+        // `player_prefs`.
+        if game == GameId::Snake {
+            sqlx::query("UPDATE players SET config = $2 WHERE fingerprint = $1")
+                .bind(fingerprint)
+                .bind(text)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO player_prefs (fingerprint, game, prefs, updated_at)
              SELECT fingerprint, $2, $3, $4 FROM players WHERE fingerprint = $1
@@ -663,12 +674,22 @@ impl Store {
                  prefs = excluded.prefs, updated_at = excluded.updated_at",
         )
         .bind(fingerprint)
-        .bind(SNAKE)
-        .bind(&text)
+        .bind(game.as_str())
+        .bind(text)
         .bind(now())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Notes the game a guest with a key has open, to open it next time.
+    pub async fn set_last_game(&self, fingerprint: &str, game: GameId) -> Result<()> {
+        sqlx::query("UPDATE players SET last_game = $2 WHERE fingerprint = $1")
+            .bind(fingerprint)
+            .bind(game.as_str())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -690,15 +711,15 @@ impl Store {
 
     // Accounts.
 
-    /// Makes an account, remembered by `key` if there is one; `cfg` and
-    /// `records` are what the guest had. `Ok(None)` if the username is
-    /// taken, ignoring case.
+    /// Makes an account, remembered by `key` if there is one; `prefs`
+    /// (Snake's) and `records` are what the guest had. `Ok(None)` if the
+    /// username is taken, ignoring case.
     pub async fn create_account(
         &self,
         username: &str,
         password_hash: &str,
         key: Option<&str>,
-        cfg: &GameConfig,
+        prefs: &str,
         records: &Records,
     ) -> Result<Option<Account>> {
         let mut tx = self.pool.begin().await?;
@@ -711,7 +732,7 @@ impl Store {
         )
         .bind(username)
         .bind(password_hash)
-        .bind(cfg.to_saved_text())
+        .bind(prefs)
         .bind(start.mu)
         .bind(start.sigma)
         .bind(now())
@@ -728,7 +749,7 @@ impl Store {
         )
         .bind(id)
         .bind(SNAKE)
-        .bind(cfg.to_saved_text())
+        .bind(prefs)
         .bind(now())
         .execute(&mut *tx)
         .await?;
@@ -804,7 +825,7 @@ impl Store {
         let row = sqlx::query(concat!(
             "SELECT ",
             account_columns!(),
-            ", config FROM accounts WHERE id = $1"
+            ", config, last_game FROM accounts WHERE id = $1"
         ))
         .bind(id)
         .fetch_one(&self.pool)
@@ -816,8 +837,9 @@ impl Store {
                 .await?;
         Ok(AccountData {
             account: account_from(&row)?,
-            cfg: GameConfig::from_saved_text(&row.try_get::<String, _>(6)?),
+            prefs: row.try_get(6)?,
             records: records_from(rows)?,
+            last_game: game_from(row.try_get(7)?),
         })
     }
 
@@ -879,14 +901,16 @@ impl Store {
         Ok(())
     }
 
-    pub async fn save_account_config(&self, id: AccountId, cfg: &GameConfig) -> Result<()> {
-        let text = cfg.to_saved_text();
+    /// Like [`Self::save_prefs`], for an account.
+    pub async fn save_account_prefs(&self, id: AccountId, game: GameId, text: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE accounts SET config = $2 WHERE id = $1")
-            .bind(id)
-            .bind(&text)
-            .execute(&mut *tx)
-            .await?;
+        if game == GameId::Snake {
+            sqlx::query("UPDATE accounts SET config = $2 WHERE id = $1")
+                .bind(id)
+                .bind(text)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO account_prefs (account_id, game, prefs, updated_at)
              VALUES ($1, $2, $3, $4)
@@ -894,12 +918,22 @@ impl Store {
                  prefs = excluded.prefs, updated_at = excluded.updated_at",
         )
         .bind(id)
-        .bind(SNAKE)
-        .bind(&text)
+        .bind(game.as_str())
+        .bind(text)
         .bind(now())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Like [`Self::set_last_game`], for an account.
+    pub async fn set_account_last_game(&self, id: AccountId, game: GameId) -> Result<()> {
+        sqlx::query("UPDATE accounts SET last_game = $2 WHERE id = $1")
+            .bind(id)
+            .bind(game.as_str())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -993,9 +1027,16 @@ impl Store {
         Ok(())
     }
 
-    /// The best accounts with at least `min_games` rated games, best first:
-    /// by rating, then games played, then name.
-    pub async fn leaderboard(&self, min_games: u32, limit: u32) -> Result<Vec<Ranked>> {
+    /// The best accounts by the rating `key` with at least `min_games`
+    /// rated games, best first: by rating, then games played, then name.
+    /// Only Snake's quick-play ratings are kept so far.
+    pub async fn leaderboard(
+        &self,
+        key: RatingKey,
+        min_games: u32,
+        limit: u32,
+    ) -> Result<Vec<Ranked>> {
+        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
         let rows = sqlx::query(
             "SELECT username, rating_mu, rating_sigma, games, wins FROM accounts
              WHERE games >= $1
@@ -1023,7 +1064,13 @@ impl Store {
 
     /// Where `account` stands on [`Self::leaderboard`], 1 for the best;
     /// `None` until it has `min_games` rated games.
-    pub async fn place_of(&self, account: AccountId, min_games: u32) -> Result<Option<u32>> {
+    pub async fn place_of(
+        &self,
+        key: RatingKey,
+        account: AccountId,
+        min_games: u32,
+    ) -> Result<Option<u32>> {
+        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
         let min_games = i64::from(min_games);
         let ahead = sqlx::query(
             "SELECT COUNT(*) FROM accounts o, accounts me
@@ -1359,6 +1406,12 @@ fn records_from(rows: Vec<AnyRow>) -> Result<Records> {
     Ok(records)
 }
 
+/// A `last_game` column's game; `None` for none yet, or one this server
+/// doesn't know.
+fn game_from(name: Option<String>) -> Option<GameId> {
+    GameId::from_name(&name?)
+}
+
 /// Remembers `id` by `key`, moving the key from another account if need be,
 /// then forgets the account's least recently used keys beyond [`MAX_KEYS`].
 async fn link_key(tx: &mut AnyConnection, id: AccountId, key: &str) -> Result<()> {
@@ -1408,6 +1461,8 @@ async fn friend_count(tx: &mut AnyConnection, id: AccountId) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use snake_core::config::GameConfig;
+
     use super::*;
 
     /// Runs each test on SQLite and on Postgres.
@@ -1441,6 +1496,7 @@ mod tests {
         limits_count_recent_events_and_tidy_away_old_ones,
         room_codes_are_claimed_once_and_expire,
         snake_ratings_and_settings_are_copied_for_the_game,
+        the_last_game_is_kept_for_guests_and_accounts,
     );
 
     async fn sqlite() -> Store {
@@ -1727,11 +1783,17 @@ mod tests {
     async fn settings_and_records_survive_a_reconnect(store: Store) {
         let first = store.visit("SHA256:abc", "alice").await.unwrap();
         assert_eq!(first.nick, "alice");
-        assert_eq!(first.cfg, GameConfig::default());
+        assert_eq!(
+            GameConfig::from_saved_text(&first.prefs),
+            GameConfig::default()
+        );
 
         let mut cfg = GameConfig::default();
         cfg.adjust(0, 3);
-        store.save_config("SHA256:abc", &cfg).await.unwrap();
+        store
+            .save_prefs("SHA256:abc", GameId::Snake, &cfg.to_saved_text())
+            .await
+            .unwrap();
         store
             .save_record("SHA256:abc", "size:30x20", 12)
             .await
@@ -1745,7 +1807,7 @@ mod tests {
         assert_eq!(again.nick, "alice", "the first name sticks");
         store.set_nick("SHA256:abc", "alicia").await.unwrap();
         assert_eq!(store.visit("SHA256:abc", "x").await.unwrap().nick, "alicia");
-        assert_eq!(again.cfg, cfg);
+        assert_eq!(again.prefs, cfg.to_saved_text());
         assert_eq!(again.records.get("size:30x20"), 12, "records only go up");
         let other = store.visit("SHA256:xyz", "bob").await.unwrap();
         assert_eq!(other.records.get("size:30x20"), 0);
@@ -1753,13 +1815,7 @@ mod tests {
 
     async fn account(store: &Store, name: &str, key: Option<&str>) -> Account {
         store
-            .create_account(
-                name,
-                "hash",
-                key,
-                &GameConfig::default(),
-                &Records::default(),
-            )
+            .create_account(name, "hash", key, "", &Records::default())
             .await
             .unwrap()
             .unwrap()
@@ -1794,14 +1850,17 @@ mod tests {
         // A guest's settings, then theirs as an account, then changed.
         store.visit("SHA256:ann", "ann").await.unwrap();
         let wide = GameConfig::from_saved_text("width=40\n");
-        store.save_config("SHA256:ann", &wide).await.unwrap();
+        store
+            .save_prefs("SHA256:ann", GameId::Snake, &wide.to_saved_text())
+            .await
+            .unwrap();
         assert_eq!(guest_prefs("SHA256:ann").await, Some(wide.to_saved_text()));
         let ann = store
             .create_account(
                 "ann",
                 "hash",
                 Some("SHA256:ann"),
-                &wide,
+                &wide.to_saved_text(),
                 &Records::default(),
             )
             .await
@@ -1814,7 +1873,10 @@ mod tests {
             "they went with the guest"
         );
         let fast = GameConfig::from_saved_text("tick_ms=100\n");
-        store.save_account_config(ann.id, &fast).await.unwrap();
+        store
+            .save_account_prefs(ann.id, GameId::Snake, &fast.to_saved_text())
+            .await
+            .unwrap();
         assert_eq!(account_prefs(ann.id).await, Some(fast.to_saved_text()));
 
         // Ratings, as each account has them.
@@ -1850,16 +1912,43 @@ mod tests {
         }
     }
 
+    async fn the_last_game_is_kept_for_guests_and_accounts(store: Store) {
+        assert_eq!(
+            store.visit("SHA256:ann", "ann").await.unwrap().last_game,
+            None
+        );
+        store
+            .set_last_game("SHA256:ann", GameId::Snake)
+            .await
+            .unwrap();
+        let ann = store.visit("SHA256:ann", "ann").await.unwrap();
+        assert_eq!(ann.last_game, Some(GameId::Snake));
+
+        let ben = account(&store, "ben", None).await;
+        assert_eq!(store.load_account(ben.id).await.unwrap().last_game, None);
+        store
+            .set_account_last_game(ben.id, GameId::Snake)
+            .await
+            .unwrap();
+        let data = store.load_account(ben.id).await.unwrap();
+        assert_eq!(data.last_game, Some(GameId::Snake));
+
+        // A game a newer server added, which this one doesn't serve.
+        sqlx::query("UPDATE players SET last_game = 'checkers' WHERE fingerprint = $1")
+            .bind("SHA256:ann")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.visit("SHA256:ann", "ann").await.unwrap().last_game,
+            None
+        );
+    }
+
     async fn usernames_are_unique_ignoring_case(store: Store) {
         account(&store, "Alice", None).await;
         let clash = store
-            .create_account(
-                "aLICE",
-                "h",
-                None,
-                &GameConfig::default(),
-                &Records::default(),
-            )
+            .create_account("aLICE", "h", None, "", &Records::default())
             .await
             .unwrap();
         assert!(clash.is_none());
@@ -1875,13 +1964,19 @@ mod tests {
         let mut records = Records::default();
         records.update("size:30x20", 9);
         let made = store
-            .create_account("alice", "h", Some("SHA256:k1"), &cfg, &records)
+            .create_account(
+                "alice",
+                "h",
+                Some("SHA256:k1"),
+                &cfg.to_saved_text(),
+                &records,
+            )
             .await
             .unwrap()
             .unwrap();
         let data = store.account_for_key("SHA256:k1").await.unwrap().unwrap();
         assert_eq!(data.account.id, made.id);
-        assert_eq!(data.cfg, cfg);
+        assert_eq!(data.prefs, cfg.to_saved_text());
         assert_eq!(data.records.get("size:30x20"), 9);
         let guest = store.visit("SHA256:k1", "x").await.unwrap();
         assert_eq!(
@@ -1994,25 +2089,37 @@ mod tests {
         rated(dan.id, 26.0, 7).await; // ann's rating, more games
 
         let names = |board: Vec<Ranked>| board.into_iter().map(|r| r.username).collect::<Vec<_>>();
-        let board = store.leaderboard(5, 20).await.unwrap();
+        let board = store.leaderboard(SNAKE_QUICK, 5, 20).await.unwrap();
         assert_eq!(names(board.clone()), ["ben", "Dan", "ann"]);
         assert_eq!((board[0].games, board[0].wins), (6, 3));
         assert_eq!(board[0].rating.mu, 27.0);
         assert_eq!(
-            names(store.leaderboard(5, 2).await.unwrap()),
+            names(store.leaderboard(SNAKE_QUICK, 5, 2).await.unwrap()),
             ["ben", "Dan"]
         );
-        assert_eq!(names(store.leaderboard(4, 1).await.unwrap()), ["cat"]);
-
-        assert_eq!(store.place_of(ben.id, 5).await.unwrap(), Some(1));
-        assert_eq!(store.place_of(dan.id, 5).await.unwrap(), Some(2));
         assert_eq!(
-            store.place_of(ann.id, 5).await.unwrap(),
+            names(store.leaderboard(SNAKE_QUICK, 4, 1).await.unwrap()),
+            ["cat"]
+        );
+
+        assert_eq!(
+            store.place_of(SNAKE_QUICK, ben.id, 5).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store.place_of(SNAKE_QUICK, dan.id, 5).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            store.place_of(SNAKE_QUICK, ann.id, 5).await.unwrap(),
             Some(3),
             "as listed"
         );
-        assert_eq!(store.place_of(cat.id, 5).await.unwrap(), None);
-        assert_eq!(store.place_of(cat.id, 4).await.unwrap(), Some(1));
+        assert_eq!(store.place_of(SNAKE_QUICK, cat.id, 5).await.unwrap(), None);
+        assert_eq!(
+            store.place_of(SNAKE_QUICK, cat.id, 4).await.unwrap(),
+            Some(1)
+        );
     }
 
     async fn friendship_needs_both_sides(store: Store) {

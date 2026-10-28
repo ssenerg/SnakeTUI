@@ -5,18 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix::prelude::*;
-use game_api::Game;
-use snake_core::config::GameConfig;
-use snake_core::records::Records;
-use snake_core::round::{JoinError, RoomKind, Snake};
-use snake_tui::Screen;
-use snake_tui::online::{
+use game_api::{GameId, JoinError, RatingKey, RoomKind};
+use shell_tui::online::{
     FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile, RANKED_AFTER,
     Secret,
 };
+use shell_tui::{Saved, Screen};
 use tracing::{debug, warn};
 
-use super::SessionActor;
+use super::{SessionActor, TRY_AGAIN};
 use crate::auth;
 use crate::presence::{
     Deliver, Doing, Invite, Notice, Offline, Online, SetStatus, Status, StatusOf,
@@ -31,7 +28,6 @@ const MAX_SIGN_IN_TRIES: u8 = 5;
 const LEADERBOARD_SIZE: u32 = 20;
 /// How long an invite waits for an answer.
 const INVITE_LIFETIME: Duration = Duration::from_secs(120);
-const TRY_AGAIN: &str = "Something went wrong. Try again.";
 const TOO_MANY_TRIES: &str = "Too many wrong sign-ins. Goodbye.\r\n";
 
 enum SignedUp {
@@ -81,18 +77,27 @@ impl SessionActor {
         self.account.as_ref().map(|a| a.rating).unwrap_or_default()
     }
 
+    /// The game friends see this player has open.
+    fn open_game(&self) -> GameId {
+        self.app
+            .as_ref()
+            .and_then(|a| a.game())
+            .unwrap_or(GameId::Snake)
+    }
+
     /// This session is now signed in to `account`.
     pub(super) fn became(&mut self, account: Account, ctx: &mut Context<Self>) {
+        let game = self.open_game();
         self.shared.presence.do_send(Online {
             account: account.id,
             session: self.id,
             notices: ctx.address().recipient(),
             status: Status::Menu,
-            game: Snake::ID,
+            game,
         });
         self.status = Some(Doing {
             status: Status::Menu,
-            game: Snake::ID,
+            game,
             room: None,
         });
         if let Some(app) = self.app.as_mut() {
@@ -107,21 +112,19 @@ impl SessionActor {
         let (Some(account), Some(app)) = (self.account_id(), self.app.as_ref()) else {
             return;
         };
-        let room = app.online.as_ref().and_then(|o| o.room.as_ref());
+        let room = app.online.room.as_ref();
         let status = match (app.screen, room) {
             (_, Some(room)) if room.watching.is_some() => Status::Watching,
-            (_, Some(room)) if room.view.shell.kind == RoomKind::Match => Status::Match,
+            (_, Some(room)) if room.shell().kind == RoomKind::Match => Status::Match,
             (_, Some(_)) => Status::Room,
             (Screen::Finding, _) => Status::Queue,
-            (
-                Screen::Menu | Screen::Playing | Screen::Paused { .. } | Screen::GameOver { .. },
-                _,
-            ) => Status::SinglePlayer,
+            // A game's own screens, outside rooms, are a game alone.
+            (Screen::Game, _) => Status::SinglePlayer,
             _ => Status::Menu,
         };
         let doing = Doing {
             status,
-            game: Snake::ID,
+            game: self.open_game(),
             room: self.room.as_ref().map(|link| link.room.at()),
         };
         if self.status != Some(doing) {
@@ -156,13 +159,16 @@ impl SessionActor {
     }
 
     pub(super) fn sign_up(&mut self, username: String, password: Secret, ctx: &mut Context<Self>) {
+        // What's waiting to be saved is the guest's, not the account's.
+        self.save_now();
         let checked = auth::check_username(&username)
             .and_then(|()| auth::check_password(&username, password.expose()));
         if let Err(why) = checked {
             return self.form_failed(why, ctx);
         }
         let Some(app) = self.app.as_ref() else { return };
-        let (cfg, records) = (app.cfg.clone(), app.records.clone());
+        // The guest's Snake settings and records come along.
+        let snake = app.saved(GameId::Snake).unwrap_or_default();
         let (store, hasher) = (self.shared.store.clone(), self.shared.hasher.clone());
         let guesses = self.shared.guesses.clone();
         let key = self.fingerprint();
@@ -181,7 +187,13 @@ impl SessionActor {
             }
             let hash = hasher.hash(password.into_inner()).await?;
             let made = store
-                .create_account(&username, &hash, key.as_deref(), &cfg, &records)
+                .create_account(
+                    &username,
+                    &hash,
+                    key.as_deref(),
+                    &snake.prefs,
+                    &snake.records,
+                )
                 .await?;
             let Some(account) = made else {
                 return Ok(SignedUp::Taken);
@@ -198,6 +210,9 @@ impl SessionActor {
                     if let Some(app) = act.app.as_mut() {
                         app.signed_up(shown);
                     }
+                    // A new account has no last game yet.
+                    act.last_game = None;
+                    act.note_game(ctx);
                     act.report_status();
                 }
                 Ok(SignedUp::Taken) => return act.form_failed("That username is taken.", ctx),
@@ -218,6 +233,8 @@ impl SessionActor {
         remember: bool,
         ctx: &mut Context<Self>,
     ) {
+        // What's waiting to be saved is the guest's, not the account's.
+        self.save_now();
         let (store, hasher) = (self.shared.store.clone(), self.shared.hasher.clone());
         let guesses = self.shared.guesses.clone();
         let key = self.fingerprint().filter(|_| remember);
@@ -250,15 +267,20 @@ impl SessionActor {
                 Ok(SignedIn::Yes(data)) => {
                     let AccountData {
                         account,
-                        cfg,
+                        prefs,
                         records,
+                        last_game,
                     } = *data;
                     debug!(peer = %act.peer, user = %account.username, "signed in");
                     let shown = profile(&account);
                     act.became(account, ctx);
                     if let Some(app) = act.app.as_mut() {
-                        app.signed_in(shown, cfg, records);
+                        app.restore(GameId::Snake, Saved { prefs, records });
+                        app.signed_in(shown);
                     }
+                    // The game open now is the account's last one.
+                    act.last_game = last_game;
+                    act.note_game(ctx);
                     act.report_status();
                 }
                 Ok(SignedIn::Wrong) => {
@@ -285,6 +307,8 @@ impl SessionActor {
         let Some(account) = self.account_id() else {
             return;
         };
+        // What's waiting to be saved is the account's, not the guest's.
+        self.save_now();
         self.sign_off();
         self.account = None;
         self.status = None;
@@ -296,24 +320,36 @@ impl SessionActor {
             match (fp, player.as_ref()) {
                 (Some(fp), Some(p)) => {
                     store.forget_key(account, fp).await?;
-                    let saved = store.visit(fp, &p.nick).await?;
-                    anyhow::Ok((Some(saved.nick), saved.cfg, saved.records))
+                    anyhow::Ok(Some(store.visit(fp, &p.nick).await?))
                 }
-                _ => Ok((None, GameConfig::default(), Records::default())),
+                _ => Ok(None),
             }
         };
         ctx.spawn(back.into_actor(self).map(|back, act, ctx| {
-            let (nick, cfg, records) = back.unwrap_or_else(|e| {
+            let saved = back.unwrap_or_else(|e| {
                 warn!(error = %e, "couldn't sign out cleanly");
-                (None, GameConfig::default(), Records::default())
+                None
             });
-            if let (Some(nick), Some(player)) = (nick, act.player.as_mut()) {
-                player.nick = nick;
-            }
+            let (snake, last_game) = match saved {
+                Some(saved) => {
+                    if let Some(player) = act.player.as_mut() {
+                        player.nick = saved.nick;
+                    }
+                    let snake = Saved {
+                        prefs: saved.prefs,
+                        records: saved.records,
+                    };
+                    (snake, saved.last_game)
+                }
+                None => (Saved::default(), None),
+            };
             let name = act.guest_name();
             if let Some(app) = act.app.as_mut() {
-                app.signed_out(name, cfg, records);
+                app.restore(GameId::Snake, snake);
+                app.signed_out(name);
             }
+            act.last_game = last_game;
+            act.note_game(ctx);
             act.render(ctx);
         }));
     }
@@ -454,23 +490,26 @@ impl SessionActor {
         }));
     }
 
-    /// Loads the best players, and this player's place among everyone.
-    pub(super) fn load_leaderboard(&mut self, ctx: &mut Context<Self>) {
+    /// Loads the best players by `key`, and this player's place among
+    /// everyone.
+    pub(super) fn load_leaderboard(&mut self, key: RatingKey, ctx: &mut Context<Self>) {
         if !self.loads.leaderboard.start() {
             return;
         }
         let (store, me) = (self.shared.store.clone(), self.account_id());
         let board = async move {
-            let best = store.leaderboard(RANKED_AFTER, LEADERBOARD_SIZE).await?;
+            let best = store
+                .leaderboard(key, RANKED_AFTER, LEADERBOARD_SIZE)
+                .await?;
             let place = match me {
-                Some(id) => store.place_of(id, RANKED_AFTER).await?,
+                Some(id) => store.place_of(key, id, RANKED_AFTER).await?,
                 None => None,
             };
             anyhow::Ok((best, place))
         };
-        ctx.spawn(board.into_actor(self).map(|board, act, ctx| {
+        ctx.spawn(board.into_actor(self).map(move |board, act, ctx| {
             if act.loads.leaderboard.done() {
-                act.load_leaderboard(ctx);
+                act.load_leaderboard(key, ctx);
             }
             let (best, place) = match board {
                 Ok(board) => board,
@@ -686,18 +725,18 @@ impl SessionActor {
         };
         let in_private = app
             .online
+            .room
             .as_ref()
-            .and_then(|o| o.room.as_ref())
-            .is_some_and(|r| r.view.shell.kind == RoomKind::Private);
+            .is_some_and(|r| r.shell().kind == RoomKind::Private);
         let room = self
             .room
             .as_ref()
-            .map(|link| link.room.at())
+            .map(|link| (link.room.at(), link.game))
             .filter(|_| in_private);
-        let rules = app.cfg.rules.clone();
+        let (game, settings) = app.room_to_make();
         let (store, presence) = (self.shared.store.clone(), self.shared.presence.clone());
         let guesses = self.shared.guesses.clone();
-        let new_room = self.room_maker(rules);
+        let new_room = self.room_maker(game, &settings);
         let invited = async move {
             let Some((them, _)) = store.find_account(&name).await? else {
                 return anyhow::Ok(Err(format!("Nobody is called {name}.")));
@@ -716,10 +755,10 @@ impl SessionActor {
                 }
                 Some(_) => {}
             }
-            let (room, joined) = match room {
+            let ((room, game), joined) = match room {
                 Some(room) => (room, None),
                 None => match new_room.await {
-                    Ok((room, view)) => (room.at(), Some((room, view))),
+                    Ok((room, view)) => ((room.at(), game), Some((room, view))),
                     Err(why) => return Ok(Err(why.message().to_string())),
                 },
             };
@@ -727,7 +766,7 @@ impl SessionActor {
                 to: them.id,
                 notice: Notice::Invite(Invite {
                     from: me.username.clone(),
-                    game: Snake::ID,
+                    game,
                     room,
                 }),
             });
@@ -803,7 +842,7 @@ impl SessionActor {
             act.render(ctx);
         });
         if let Some(app) = self.app.as_mut() {
-            app.invited(invite.from.clone());
+            app.invited(invite.from.clone(), invite.game);
         }
         self.invite = Some(PendingInvite { invite, expires });
         self.render(ctx);
@@ -838,7 +877,7 @@ impl Handler<Rated> for SessionActor {
 
     fn handle(&mut self, msg: Rated, ctx: &mut Self::Context) {
         // Only Snake's rating shows so far.
-        if msg.game != Snake::ID {
+        if msg.game != GameId::Snake {
             return;
         }
         if let Some(account) = self.account.as_mut() {

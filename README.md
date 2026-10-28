@@ -62,6 +62,11 @@ no account on the machine, and quitting the game ends their connection at once.
   game adds a username, a rating and friends (see below). Even as a guest, a
   player who connects with an SSH key keeps their nickname, settings and
   records between visits.
+- **Which game.** `ssh snake@play.example.com` opens Snake. Plain
+  `ssh play.example.com` opens the game you had open last time, kept for
+  your key or account. Once a server has more than one game, new players
+  pick one, and `g` on the home menu switches. Snake is the only one so
+  far.
 - **Only the game.** Commands (`ssh host ls`), file transfer and port
   forwarding are refused with a message.
 - **Limits.** Connections are capped in total and per IP address. Logins time
@@ -347,7 +352,8 @@ The code is a Cargo workspace:
 | `crates/game-api` | What every game shares: players, the `Game` and `Round` traits a game implements, and `Room`, which runs any game's lobby, countdown and results |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), multiplayer rounds (`Snake`, a `Game`), settings, records. No terminal or file access |
 | `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess. Not playable yet |
-| `crates/snake-tui` | Screens and the app state machine, drawn through any ratatui backend |
+| `crates/shell-tui` | The app around every game, drawn through any ratatui backend: the home menu, accounts, friends, the leaderboard, the game picker, and rooms' lobby and results. Each game adds its screens through `GameUi` |
+| `crates/snake-tui` | Snake's screens: single player, and its part of rooms (`SnakeUi`, a `GameUi`). The local game drives them on their own |
 | `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room of any game (actix), the games it serves (`games/`), the quick-play matcher with a pool per game and kind of match, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, draining on shutdown, health and metrics over HTTP, the PROXY protocol, `server.toml`; and `snaketui-matchmaker`, the quick-play queue for a cluster of servers |
 | `crates/loadbot` | `snaketui-loadbot`: thousands of bot players, to see how servers hold up |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |

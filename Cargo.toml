@@ -12,6 +12,7 @@ anyhow = "1.0.103"
 rand = "=0.10.2"
 ratatui = "0.30.2"
 game-api = { path = "crates/game-api" }
+shell-tui = { path = "crates/shell-tui" }
 snake-core = { path = "crates/snake-core" }
 snake-tui = { path = "crates/snake-tui" }
 
@@ -23,6 +24,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 ratatui.workspace = true
+shell-tui.workspace = true
 snake-core.workspace = true
 snake-tui.workspace = true
 

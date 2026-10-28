@@ -4,13 +4,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
-use super::centered_rect;
-use super::menu::draw_logo;
+use super::{centered_rect, draw_logo};
 use crate::app::App;
 use crate::online::HomeItem;
 
 pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
-    let Some(online) = &app.online else { return };
+    let online = &app.online;
     let items = app.home_items();
     let [logo_area, list_area, footer_area] = Layout::vertical([
         Constraint::Length(4),
@@ -18,7 +17,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
         Constraint::Length(4),
     ])
     .areas(frame.area());
-    draw_logo(frame, logo_area);
+    draw_logo(frame, app, logo_area);
 
     let rect = centered_rect(list_area, 44, items.len() as u16 + 4);
     let block = Block::bordered()
@@ -39,10 +38,14 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
             Style::default()
         };
         let marker = if active { " ❯ " } else { "   " };
-        let mut spans = vec![Span::styled(format!("{marker}{}", item.label()), style)];
+        let mut spans = vec![Span::styled(format!("{marker}{}", app.label(*item)), style)];
         match item {
             HomeItem::Nickname => spans.push(Span::styled(format!("  {}", online.name), dim)),
-            HomeItem::CreateRoom => spans.push(Span::styled("  your settings", dim)),
+            HomeItem::CreateRoom => {
+                if let Some(note) = app.ui().room_note() {
+                    spans.push(Span::styled(format!("  {note}"), dim));
+                }
+            }
             HomeItem::Friends if online.requests > 0 => {
                 let s = if online.requests == 1 { "" } else { "s" };
                 spans.push(Span::styled(
@@ -81,10 +84,12 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
             Span::styled(" (guest)", dim),
         ]),
     };
-    let footer = vec![
-        status,
-        Line::from("↑↓ select · Enter choose · q quit").style(dim),
-    ];
+    let keys = if app.games().count() > 1 {
+        "↑↓ select · Enter choose · g games · q quit"
+    } else {
+        "↑↓ select · Enter choose · q quit"
+    };
+    let footer = vec![status, Line::from(keys).style(dim)];
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use game_api::{Game, GameId, RoomRng, RoundEnd};
+use game_api::{Game, GameId, RatingKey, RoomRng, RoundEnd};
 use rand::Rng;
 
 pub use game_api::{
@@ -48,6 +48,16 @@ pub fn bot_entrant(n: usize) -> Entrant {
 pub fn bot_names() -> &'static [&'static str] {
     &BOT_NAMES
 }
+
+/// Quick play's one pool, every snake for itself, which the server matches
+/// players in.
+pub const QUICK_POOL: &str = "ffa";
+
+/// The rating quick play's matches change.
+pub const QUICK_RATING: RatingKey = RatingKey {
+    game: GameId::Snake,
+    category: QUICK_POOL,
+};
 
 /// The board every quick-play match uses. With the scoreboard beside it, it
 /// fits an 80×23 terminal (80×24 with a tmux status bar).

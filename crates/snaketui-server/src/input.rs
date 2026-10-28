@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use snake_tui::Key;
+use shell_tui::Key;
 
 const ESC: u8 = 0x1b;
 /// A sequence longer than this is garbage, not a key.

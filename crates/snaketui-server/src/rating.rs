@@ -1,7 +1,6 @@
 //! Skill ratings for quick play: Weng-Lin, which rates free-for-all games
 //! of any size.
 
-use game_api::GameId;
 use serde::{Deserialize, Serialize};
 use skillratings::MultiTeamOutcome;
 use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
@@ -9,10 +8,7 @@ use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
 pub use game_api::RatingKey;
 
 /// Snake's quick play, every snake for itself.
-pub const SNAKE_QUICK: RatingKey = RatingKey {
-    game: GameId::Snake,
-    category: "ffa",
-};
+pub const SNAKE_QUICK: RatingKey = snake_core::round::QUICK_RATING;
 
 /// A player's estimated skill, `mu`, and how unsure that estimate is,
 /// `sigma`.

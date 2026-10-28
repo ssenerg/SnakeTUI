@@ -6,11 +6,12 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use snake_core::config::GameConfig;
 use snake_core::settings::{Kind, SETTINGS};
 
-use super::centered_rect;
-use crate::app::App;
+use shell_tui::ui::centered_rect;
+
+use crate::app::SnakeUi;
 use crate::palette::theme_color;
 
-const LOGO: [&str; 3] = ["┌─┐┌┐┌┌─┐┬┌─┌─┐", "└─┐│││├─┤├┴┐├┤ ", "└─┘┘└┘┴ ┴┴ ┴└─┘"];
+pub(crate) const LOGO: [&str; 3] = ["┌─┐┌┐┌┌─┐┬┌─┌─┐", "└─┐│││├─┤├┴┐├┤ ", "└─┘┘└┘┴ ┴┴ ┴└─┘"];
 
 enum Row {
     Header(&'static str),
@@ -36,7 +37,7 @@ fn rows(items: &[usize]) -> Vec<Row> {
     rows
 }
 
-pub(super) fn draw_logo(frame: &mut Frame, area: Rect) {
+fn draw_logo(frame: &mut Frame, area: Rect) {
     let logo: Vec<Line> = LOGO
         .iter()
         .map(|l| {
@@ -50,7 +51,8 @@ pub(super) fn draw_logo(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(logo).alignment(Alignment::Center), area);
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+/// The settings single player starts with; `online`, inside the app.
+pub fn draw(frame: &mut Frame, app: &SnakeUi, online: bool) {
     let [logo_area, list_area, footer_area] = Layout::vertical([
         Constraint::Length(4),
         Constraint::Min(3),
@@ -84,7 +86,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        let back = if app.online.is_some() { "back" } else { "quit" };
+        let back = if online { "back" } else { "quit" };
         Line::from(format!(
             "↑↓ select · ←→ adjust · Enter play · r reset · q {back}"
         ))

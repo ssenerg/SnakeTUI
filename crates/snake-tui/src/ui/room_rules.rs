@@ -6,16 +6,18 @@ use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use shell_tui::Ctx;
+use shell_tui::ui::centered_rect;
 use snake_core::config::GameConfig;
 use snake_core::settings::{SETTINGS, room_settings};
 
-use super::centered_rect;
 use super::menu::draw_settings;
-use crate::app::App;
+use crate::app::{SnakeUi, snake_view};
 
-pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
-    let Some(online) = &app.online else { return };
-    let Some(room) = &online.room else { return };
+pub fn draw(frame: &mut Frame, app: &SnakeUi, ctx: &Ctx, selected: usize) {
+    let Some((room, view)) = ctx.room.and_then(|r| Some((r, snake_view(r)?))) else {
+        return;
+    };
     let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(frame.area());
 
@@ -40,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let cfg = GameConfig {
-        rules: room.view.settings.clone(),
+        rules: view.settings.clone(),
         ..app.cfg.clone()
     };
     let hosting = room.hosting();
@@ -48,9 +50,9 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
     draw_settings(frame, inner, &cfg, &items, selected, hosting);
 
     let dim = Style::default().fg(Color::DarkGray);
-    let status = match (&online.notice, hosting) {
+    let status = match (ctx.notice, hosting) {
         (Some(notice), _) => Line::styled(
-            notice.clone(),
+            notice.to_string(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -58,13 +60,12 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
         (None, true) => Line::styled(
             format!(
                 "Room for {} players · a change un-readies everyone",
-                room.view.shell.max_players
+                view.shell.max_players
             ),
             dim,
         ),
         (None, false) => {
-            let host = room
-                .view
+            let host = view
                 .shell
                 .host()
                 .map_or("the host", |h| h.who.name.as_str());

@@ -15,9 +15,11 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use game_api::{Entrant, Game, GameId, PhaseView, RatingKey, RoomView, ShellView};
+pub use game_api::codec::{decode, encode};
+use game_api::{AnyView, Entrant, Game, GameId, PhaseView, RatingKey, RoomView};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use shell_tui::GameUi;
 
 use crate::cluster::wire::WireView;
 use crate::room::NewRoom;
@@ -44,27 +46,16 @@ impl<G> Served for G where
 {
 }
 
-/// A room's view, of whichever game.
-pub trait AnyRoomView: Any + Send + Sync + fmt::Debug {
-    fn game(&self) -> GameId;
-    fn shell(&self) -> &ShellView;
+/// A room's view, of whichever game, as the server passes it around.
+pub trait AnyRoomView: AnyView {
     /// The same view, with the room closed for `reason`.
     fn closed(&self, reason: &str) -> Arc<dyn AnyRoomView>;
     /// The view as other servers get it, which its game's
     /// [`GameServer::decode_view`] reads.
     fn to_wire(&self) -> WireView;
-    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
 
 impl<G: Served> AnyRoomView for RoomView<G> {
-    fn game(&self) -> GameId {
-        G::ID
-    }
-
-    fn shell(&self) -> &ShellView {
-        &self.shell
-    }
-
     fn closed(&self, reason: &str) -> Arc<dyn AnyRoomView> {
         let mut last = self.clone();
         last.shell.phase = PhaseView::Closed {
@@ -76,33 +67,21 @@ impl<G: Served> AnyRoomView for RoomView<G> {
     fn to_wire(&self) -> WireView {
         WireView {
             game: G::ID,
-            body: postcard::to_allocvec(self).expect("views always serialize"),
+            body: encode(self),
         }
-    }
-
-    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 
 /// `view`, if it's of a room of `G`.
 pub fn view_of<G: Served>(view: Arc<dyn AnyRoomView>) -> Option<Arc<RoomView<G>>> {
-    view.into_any().downcast().ok()
+    let view: Arc<dyn Any + Send + Sync> = view;
+    view.downcast().ok()
 }
 
 /// A view of a room of `G`, as [`AnyRoomView::to_wire`] wrote it.
 fn decode_view<G: Served>(body: &[u8]) -> Option<Arc<dyn AnyRoomView>> {
-    let view: RoomView<G> = postcard::from_bytes(body).ok()?;
+    let view: RoomView<G> = decode(body)?;
     Some(Arc::new(view))
-}
-
-/// A move or settings, as they cross from a session to its room.
-pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-    postcard::to_allocvec(value).expect("moves and settings always serialize")
-}
-
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
-    postcard::from_bytes(bytes).ok()
 }
 
 /// How a game's ratings are worked out.
@@ -155,6 +134,13 @@ pub trait GameServer: Send + Sync + 'static {
 
     /// A match for `who` alone against bots, if the game has bots.
     fn bot_match(&self, seed: u64, who: Entrant) -> Option<Box<dyn NewRoom>>;
+
+    /// A private room with `settings`, as the game's screens wrote them;
+    /// or what to tell the player if it can't have those.
+    fn private_room(&self, settings: &[u8], seed: u64) -> Result<Box<dyn NewRoom>, &'static str>;
+
+    /// The game's screens, for a new player.
+    fn ui(&self) -> Box<dyn GameUi>;
 }
 
 /// Every game this server serves.
@@ -162,6 +148,21 @@ pub static GAMES: &[&dyn GameServer] = &[&snake::SnakeServer];
 
 pub fn get(id: GameId) -> Option<&'static dyn GameServer> {
     GAMES.iter().copied().find(|g| g.info().id == id)
+}
+
+/// The game a player asked for by connecting as `ssh <user>@…`, such as
+/// `snake`, ignoring case.
+pub fn for_ssh_user(user: &str) -> Option<GameId> {
+    GAMES
+        .iter()
+        .map(|g| g.info())
+        .find(|info| info.ssh_users.iter().any(|u| u.eq_ignore_ascii_case(user)))
+        .map(|info| info.id)
+}
+
+/// Every game's screens, for a new player.
+pub fn uis() -> Vec<Box<dyn GameUi>> {
+    GAMES.iter().map(|g| g.ui()).collect()
 }
 
 /// A pool players wait in for quick play: one of a game's.
