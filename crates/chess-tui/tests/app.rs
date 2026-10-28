@@ -8,9 +8,9 @@ use chess_core::moves::Move;
 use chess_core::round::{ChessInput, ChessSettings, Side};
 use chess_tui::{BoardLook, ChessScreen, MoveInput, Prefs};
 use common::*;
-use game_api::GameId;
 use game_api::codec::decode;
-use shell_tui::online::HomeItem;
+use game_api::{GameId, RatingKey};
+use shell_tui::online::{HomeItem, Profile, ShownRating};
 use shell_tui::{App, Effect, GameFx, Key, Screen};
 
 /// The moves and other inputs the app sent to the room.
@@ -201,7 +201,7 @@ fn the_host_sets_the_challenge() {
 }
 
 #[test]
-fn settings_are_kept_and_quick_play_waits() {
+fn settings_are_kept() {
     let mut app = App::online(
         vec![Box::new(chess_tui::ChessUi::default())],
         None,
@@ -218,12 +218,105 @@ fn settings_are_kept_and_quick_play_waits() {
     assert_eq!(Prefs::from_saved_text(text).board, BoardLook::Green);
     app.handle(Key::Esc);
     assert!(matches!(app.screen, Screen::Home { .. }));
+}
 
+#[test]
+fn quick_pairing_picks_a_preset_and_waits_in_its_pool() {
+    let mut app = App::online(
+        vec![Box::new(chess_tui::ChessUi::default())],
+        None,
+        "~ann".into(),
+        true,
+    );
     app.go_home(HomeItem::QuickPlay, None);
     let effects = app.handle(Key::Enter);
     assert!(effects.is_empty(), "{effects:?}");
-    let screen = shown(&app, 100, 30);
-    assert!(screen.contains("Make a private room"), "{screen}");
+    assert_eq!(app.screen, Screen::Game);
+    assert_eq!(
+        chess(&mut app).screen,
+        ChessScreen::Pairing { selected: 5 },
+        "on 5+3 to begin with"
+    );
+    let screen = shown(&app, 80, 24);
+    assert!(
+        screen.contains("5+3 blitz · sides drawn · unrated"),
+        "{screen}"
+    );
+
+    // Up to bullet's 2+1, left to 1+0, right again, and play it.
+    let effects = keys(&mut app, &[Key::Up, Key::Left, Key::Right, Key::Enter]);
+    let [
+        Effect::Game(GameId::Chess, GameFx::SavePrefs(text)),
+        Effect::QuickPlay {
+            game: GameId::Chess,
+            pool: "2+1",
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(
+        Prefs::from_saved_text(text).pairing,
+        TimeControl::minutes(2, 1)
+    );
+    assert_eq!(app.screen, Screen::Finding);
+    let screen = shown(&app, 80, 24);
+    assert!(screen.contains("2+1 bullet"), "{screen}");
+
+    // Quick play opens again on the preset last played, and Esc goes
+    // back to it on the home menu.
+    app.handle(Key::Esc);
+    app.go_home(HomeItem::QuickPlay, None);
+    app.handle(Key::Enter);
+    assert_eq!(chess(&mut app).screen, ChessScreen::Pairing { selected: 1 });
+    app.handle(Key::Esc);
+    let Screen::Home { selected } = app.screen else {
+        panic!("{:?}", app.screen);
+    };
+    assert_eq!(app.home_items()[selected], HomeItem::QuickPlay);
+}
+
+#[test]
+fn pairing_shows_the_ratings_of_a_signed_in_player() {
+    let mut app = App::online(
+        vec![Box::new(chess_tui::ChessUi::default())],
+        None,
+        "~ann".into(),
+        true,
+    );
+    let rating = |category, rating, provisional| ShownRating {
+        key: RatingKey {
+            game: GameId::Chess,
+            category,
+        },
+        rating,
+        games: 3,
+        wins: 1,
+        provisional,
+    };
+    app.online.account = Some(Profile {
+        username: "ann".into(),
+        ratings: vec![
+            rating("bullet", 1500, true),
+            rating("blitz", 1712, false),
+            rating("rapid", 1500, true),
+            rating("classical", 1500, true),
+        ],
+    });
+    app.go_home(HomeItem::QuickPlay, None);
+    app.handle(Key::Enter);
+    let screen = shown(&app, 80, 24);
+    let blitz = screen.lines().find(|l| l.contains("Blitz")).unwrap();
+    assert!(
+        blitz.contains("1712") && !blitz.contains("1712?"),
+        "{screen}"
+    );
+    let bullet = screen.lines().find(|l| l.contains("Bullet")).unwrap();
+    assert!(bullet.contains("1500?"), "{screen}");
+    assert!(
+        screen.contains("5+3 blitz · sides drawn · rated"),
+        "{screen}"
+    );
 }
 
 #[test]

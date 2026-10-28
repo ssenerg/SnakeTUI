@@ -25,7 +25,7 @@ use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 use tracing::{info, warn};
 
 use crate::games::{self, RatingSystem};
-use crate::rating::{self, Rating, RatingKey, SNAKE_QUICK};
+use crate::rating::{self, Rating, RatingKey, SNAKE_QUICK, Skill, days_between};
 use crate::room::{RoomRef, ServerId};
 
 /// The tables as they were before migrations, which is step 1. Frozen: a
@@ -343,7 +343,7 @@ ON CONFLICT DO NOTHING;
 /// `id`'s standing in `key`; a new player's if they haven't played it.
 async fn standing(conn: &mut AnyConnection, id: AccountId, key: RatingKey) -> Result<Standing> {
     let row = sqlx::query(
-        "SELECT rating, deviation, games, wins FROM ratings
+        "SELECT rating, deviation, volatility, games, wins, rated_at FROM ratings
          WHERE account_id = $1 AND game = $2 AND category = $3",
     )
     .bind(id)
@@ -351,40 +351,54 @@ async fn standing(conn: &mut AnyConnection, id: AccountId, key: RatingKey) -> Re
     .bind(key.category)
     .fetch_optional(conn)
     .await?;
-    row.map_or(Ok(Standing::default()), |row| standing_from(&row, 0))
+    row.map_or(Ok(Standing::new(key)), |row| standing_from(&row, 0, key))
+}
+
+/// What a rating's `rating`, `deviation` and `volatility` columns hold.
+fn columns(rating: Skill) -> (f64, f64, Option<f64>) {
+    match rating {
+        Skill::WengLin(r) => (r.mu, r.sigma, None),
+        Skill::Glicko2(r) => (r.rating, r.deviation, Some(r.volatility)),
+    }
 }
 
 /// Saves `id`'s new `rating` in `key` after a rated round, counting the
-/// round and any win. Snake's quick play also goes in the account's own
-/// columns, which servers from before step 3 read.
+/// round and a win or a draw. Snake's quick play also goes in the
+/// account's own columns, which servers from before step 3 read.
 async fn save_standing(
     conn: &mut AnyConnection,
     id: AccountId,
     key: RatingKey,
-    rating: Rating,
-    won: bool,
+    rating: Skill,
+    (won, drew): (bool, bool),
 ) -> Result<()> {
+    let (value, deviation, volatility) = columns(rating);
     let row = sqlx::query(
         "INSERT INTO ratings
              (account_id, game, category, rating, deviation, volatility,
               games, wins, draws, rated_at)
-         VALUES ($1, $2, $3, $4, $5, NULL, 1, $6, 0, $7)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9)
          ON CONFLICT (account_id, game, category) DO UPDATE SET
              rating = excluded.rating, deviation = excluded.deviation,
-             games = ratings.games + 1, wins = ratings.wins + excluded.wins,
-             rated_at = excluded.rated_at
+             volatility = excluded.volatility, games = ratings.games + 1,
+             wins = ratings.wins + excluded.wins,
+             draws = ratings.draws + excluded.draws, rated_at = excluded.rated_at
          RETURNING games, wins",
     )
     .bind(id)
     .bind(key.game.as_str())
     .bind(key.category)
-    .bind(rating.mu)
-    .bind(rating.sigma)
+    .bind(value)
+    .bind(deviation)
+    .bind(volatility)
     .bind(i64::from(won))
+    .bind(i64::from(drew))
     .bind(now())
     .fetch_one(&mut *conn)
     .await?;
-    if key == SNAKE_QUICK {
+    if key == SNAKE_QUICK
+        && let Skill::WengLin(rating) = rating
+    {
         sqlx::query(
             "UPDATE accounts SET rating_mu = $2, rating_sigma = $3, games = $4, wins = $5
              WHERE id = $1",
@@ -506,11 +520,32 @@ pub struct Account {
 
 /// An account's standing in one rating: how good it's thought to be, and
 /// its rated games.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Standing {
-    pub rating: Rating,
+    pub rating: Skill,
     pub games: u32,
     pub wins: u32,
+    /// When it last changed, as a Unix time: ratings grow unsure with
+    /// time away in some games.
+    pub rated_at: i64,
+}
+
+impl Standing {
+    /// A new player's in `key`.
+    pub fn new(key: RatingKey) -> Standing {
+        Standing {
+            rating: Skill::new(RatingSystem::of(key.game)),
+            games: 0,
+            wins: 0,
+            rated_at: now(),
+        }
+    }
+
+    /// Whether the rating is still too unsure to count for much at `at`,
+    /// a Unix time.
+    pub fn is_provisional(&self, at: i64) -> bool {
+        self.rating.is_provisional(days_between(self.rated_at, at))
+    }
 }
 
 /// An account with its ratings, settings and records, as a session needs
@@ -570,7 +605,7 @@ pub enum Requested {
 /// One account's result in a rated round.
 pub struct RatedResult {
     pub account: AccountId,
-    pub rating: Rating,
+    pub rating: Skill,
     pub won: bool,
 }
 
@@ -928,8 +963,8 @@ impl Store {
     /// Every rating `id` has played in, in games this server serves.
     pub async fn ratings(&self, id: AccountId) -> Result<Vec<(RatingKey, Standing)>> {
         let rows = sqlx::query(
-            "SELECT game, category, rating, deviation, games, wins FROM ratings
-             WHERE account_id = $1",
+            "SELECT game, category, rating, deviation, volatility, games, wins, rated_at
+             FROM ratings WHERE account_id = $1",
         )
         .bind(id)
         .fetch_all(&self.pool)
@@ -938,7 +973,7 @@ impl Store {
         for row in rows {
             let (game, category): (String, String) = (row.try_get(0)?, row.try_get(1)?);
             if let Some(key) = games::rating_key(&game, &category) {
-                ratings.push((key, standing_from(&row, 2)?));
+                ratings.push((key, standing_from(&row, 2, key)?));
             }
         }
         Ok(ratings)
@@ -1058,17 +1093,21 @@ impl Store {
     /// ratings from the ones saved now, saves them, and answers each
     /// account's rating before and after, in the same order. Rounds ending
     /// at once, with the same account in both, take turns, so neither
-    /// overwrites the other. Only Weng-Lin ratings are worked out so far.
+    /// overwrites the other. A game rated by Glicko-2 is between two:
+    /// equal places are a draw.
     pub async fn rate_round(
         &self,
         key: RatingKey,
         players: &[(AccountId, usize, bool)],
-    ) -> Result<Vec<(Rating, Rating)>> {
-        let system = games::get(key.game).map(|g| g.info().rating);
+    ) -> Result<Vec<(Skill, Skill)>> {
         anyhow::ensure!(
-            system == Some(RatingSystem::WengLin)
-                && games::rating_key(key.game.as_str(), key.category) == Some(key),
+            games::rating_key(key.game.as_str(), key.category) == Some(key),
             "no ratings are worked out for {key:?}"
+        );
+        let system = RatingSystem::of(key.game);
+        anyhow::ensure!(
+            system != RatingSystem::Glicko2 || players.len() == 2,
+            "Glicko-2 rates games between two"
         );
         let mut tx = self.pool.begin().await?;
         // Taking each account's lock first, in one order for every round.
@@ -1081,15 +1120,16 @@ impl Store {
                 .await?;
         }
         let mut before = Vec::with_capacity(players.len());
-        for &(id, place, _) in players {
-            before.push((standing(&mut tx, id, key).await?.rating, place));
+        for &(id, _, _) in players {
+            before.push(standing(&mut tx, id, key).await?);
         }
-        let after = rating::after_round(&before);
+        let after = after_round(&before, players, now());
+        let drawn = players.iter().all(|p| p.1 == players[0].1);
         for (&(id, _, won), &rating) in players.iter().zip(&after) {
-            save_standing(&mut tx, id, key, rating, won).await?;
+            save_standing(&mut tx, id, key, rating, (won, drawn && !won)).await?;
         }
         tx.commit().await?;
-        Ok(before.into_iter().map(|(r, _)| r).zip(after).collect())
+        Ok(before.into_iter().map(|s| s.rating).zip(after).collect())
     }
 
     /// Saves everyone's new rating in `key` after a round, and counts the
@@ -1097,7 +1137,7 @@ impl Store {
     pub async fn save_rated_round(&self, key: RatingKey, results: &[RatedResult]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for r in results {
-            save_standing(&mut tx, r.account, key, r.rating, r.won).await?;
+            save_standing(&mut tx, r.account, key, r.rating, (r.won, false)).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1112,7 +1152,8 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Ranked>> {
         let rows = sqlx::query(
-            "SELECT a.username, r.rating, r.deviation, r.games, r.wins
+            "SELECT a.username, r.rating, r.deviation, r.volatility, r.games, r.wins,
+                    r.rated_at
              FROM ratings r JOIN accounts a ON a.id = r.account_id
              WHERE r.game = $1 AND r.category = $2 AND r.games >= $3
              ORDER BY r.rating DESC, r.games DESC, lower(a.username)
@@ -1128,7 +1169,7 @@ impl Store {
             .map(|row| {
                 Ok(Ranked {
                     username: row.try_get(0)?,
-                    standing: standing_from(row, 1)?,
+                    standing: standing_from(row, 1, key)?,
                 })
             })
             .collect()
@@ -1472,17 +1513,65 @@ fn account_from(row: &AnyRow) -> Result<Account> {
     })
 }
 
-/// A standing from `rating, deviation, games, wins`, starting at column
-/// `at`.
-fn standing_from(row: &AnyRow, at: usize) -> Result<Standing> {
+/// A standing in `key` from `rating, deviation, volatility, games, wins,
+/// rated_at`, starting at column `at`.
+fn standing_from(row: &AnyRow, at: usize, key: RatingKey) -> Result<Standing> {
+    let (value, deviation): (f64, f64) = (row.try_get(at)?, row.try_get(at + 1)?);
+    let volatility: Option<f64> = row.try_get(at + 2)?;
+    let rating = match RatingSystem::of(key.game) {
+        RatingSystem::WengLin => Skill::WengLin(Rating {
+            mu: value,
+            sigma: deviation,
+        }),
+        RatingSystem::Glicko2 => Skill::Glicko2(chess_core::rating::Rating {
+            rating: value,
+            deviation,
+            volatility: volatility
+                .unwrap_or_else(|| chess_core::rating::Rating::default().volatility),
+        }),
+    };
     Ok(Standing {
-        rating: Rating {
-            mu: row.try_get(at)?,
-            sigma: row.try_get(at + 1)?,
-        },
-        games: row.try_get::<i64, _>(at + 2)? as u32,
-        wins: row.try_get::<i64, _>(at + 3)? as u32,
+        rating,
+        games: row.try_get::<i64, _>(at + 3)? as u32,
+        wins: row.try_get::<i64, _>(at + 4)? as u32,
+        rated_at: row.try_get(at + 5)?,
     })
+}
+
+/// Everyone's new rating after a round, from their standings before it and
+/// their places, in the same order, at `at`. Glicko-2 games are between
+/// two, and ratings in it grow unsure with each idle day first.
+fn after_round(before: &[Standing], players: &[(AccountId, usize, bool)], at: i64) -> Vec<Skill> {
+    if let [a, b] = before
+        && let (Skill::Glicko2(ra), Skill::Glicko2(rb)) = (a.rating, b.rating)
+    {
+        use chess_core::piece::Color;
+        let entrant = |s: &Standing, rating| chess_core::rating::Entrant {
+            rating,
+            idle_days: days_between(s.rated_at, at),
+        };
+        // The first plays as white, the second as black: Glicko-2 doesn't
+        // mind which.
+        let winner = match players[0].1.cmp(&players[1].1) {
+            std::cmp::Ordering::Less => Some(Color::White),
+            std::cmp::Ordering::Greater => Some(Color::Black),
+            std::cmp::Ordering::Equal => None,
+        };
+        let (ra, rb) = chess_core::rating::after_game(entrant(a, ra), entrant(b, rb), winner);
+        return vec![Skill::Glicko2(ra), Skill::Glicko2(rb)];
+    }
+    let weng_lin: Vec<(Rating, usize)> = before
+        .iter()
+        .zip(players)
+        .map(|(s, p)| match s.rating {
+            Skill::WengLin(r) => (r, p.1),
+            Skill::Glicko2(_) => (Rating::default(), p.1),
+        })
+        .collect();
+    rating::after_round(&weng_lin)
+        .into_iter()
+        .map(Skill::WengLin)
+        .collect()
 }
 
 /// Each game's preferences from `game, prefs` rows, leaving out games this
@@ -1590,6 +1679,7 @@ mod tests {
         keys_move_between_accounts_and_only_the_latest_ten_are_kept,
         rated_rounds_count_games_wins_and_new_ratings,
         rounds_are_rated_from_the_saved_ratings,
+        chess_is_rated_by_glicko_2_in_each_category_apart,
         friendship_needs_both_sides,
         the_leaderboard_ranks_accounts_with_enough_games,
         requests_waiting_for_an_answer_are_limited,
@@ -1832,12 +1922,12 @@ mod tests {
         let store = Store::open(&url).await.unwrap();
         assert_eq!(steps(&url).await, every_step());
         let ann = quick(&store, 1).await;
-        assert_eq!((ann.rating.mu, ann.games, ann.wins), (33.0, 9, 5));
+        assert_eq!((ann.rating.mu(), ann.games, ann.wins), (33.0, 9, 5));
         let cat = store.load_account(3).await.unwrap();
         assert_eq!(cat.prefs, [(GameId::Snake, "width=50\n".to_string())]);
         assert_eq!(quick(&store, 3).await.games, 2);
         let dan = quick(&store, 4).await;
-        assert_eq!((dan.rating.mu, dan.games), (26.0, 4), "the newer one");
+        assert_eq!((dan.rating.mu(), dan.games), (26.0, 4), "the newer one");
         let ann = store.load_account(1).await.unwrap();
         assert_eq!(ann.prefs, [(GameId::Snake, "width=40\n".to_string())]);
     }
@@ -1998,6 +2088,76 @@ mod tests {
             .unwrap()
     }
 
+    /// `id`'s standing in `key`, as a session loads it.
+    async fn standing_in(store: &Store, id: AccountId, key: RatingKey) -> Standing {
+        let ratings = store.load_account(id).await.unwrap().ratings;
+        ratings
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map_or_else(|| Standing::new(key), |(_, standing)| standing)
+    }
+
+    async fn chess_is_rated_by_glicko_2_in_each_category_apart(store: Store) {
+        let blitz = games::rating_key("chess", "blitz").unwrap();
+        let rapid = games::rating_key("chess", "rapid").unwrap();
+        let ann = account(&store, "ann", None).await;
+        let ben = account(&store, "ben", None).await;
+        let new = standing_in(&store, ann.id, blitz).await;
+        assert_eq!((new.rating.shown(), new.games), (1500, 0));
+        assert!(new.is_provisional(now()));
+
+        // ann beats ben at blitz.
+        let changes = store
+            .rate_round(blitz, &[(ann.id, 1, true), (ben.id, 2, false)])
+            .await
+            .unwrap();
+        assert_eq!(changes[0].0.shown(), 1500);
+        assert!(changes[0].1.shown() > 1500 && changes[1].1.shown() < 1500);
+        let won = standing_in(&store, ann.id, blitz).await;
+        assert_eq!((won.rating, won.games, won.wins), (changes[0].1, 1, 1));
+        let Skill::Glicko2(after) = won.rating else {
+            panic!("chess keeps Glicko-2 ratings");
+        };
+        assert!(after.deviation < 350.0 && after.volatility > 0.0);
+        // Rapid is untouched, and a draw there moves two new players little.
+        assert_eq!(standing_in(&store, ann.id, rapid).await.games, 0);
+        let drawn = store
+            .rate_round(rapid, &[(ann.id, 1, false), (ben.id, 1, false)])
+            .await
+            .unwrap();
+        assert_eq!(drawn[0].1.shown(), 1500);
+        assert_eq!(standing_in(&store, ben.id, rapid).await.wins, 0);
+        let draws: i64 =
+            sqlx::query("SELECT draws FROM ratings WHERE account_id = $1 AND category = 'rapid'")
+                .bind(ann.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+                .get(0);
+        assert_eq!(draws, 1);
+        assert_eq!(standing_in(&store, ann.id, blitz).await, won, "blitz kept");
+
+        // A settled rating grows unsure again with time away.
+        let settled = Skill::Glicko2(chess_core::rating::Rating {
+            rating: 1700.0,
+            deviation: 60.0,
+            volatility: 0.06,
+        });
+        let results = [RatedResult {
+            account: ben.id,
+            rating: settled,
+            won: true,
+        }];
+        store.save_rated_round(blitz, &results).await.unwrap();
+        let ben_blitz = standing_in(&store, ben.id, blitz).await;
+        assert!(!ben_blitz.is_provisional(now()));
+        assert!(ben_blitz.is_provisional(now() + 3650 * 86_400));
+        assert!(
+            store.rate_round(blitz, &[(ann.id, 1, true)]).await.is_err(),
+            "chess is between two"
+        );
+    }
+
     /// `id`'s standing in Snake's quick play, as a session loads it.
     async fn quick(store: &Store, id: AccountId) -> Standing {
         let ratings = store.load_account(id).await.unwrap().ratings;
@@ -2005,7 +2165,7 @@ mod tests {
             .into_iter()
             .find(|(key, _)| *key == SNAKE_QUICK)
             .map(|(_, standing)| standing)
-            .unwrap_or_default()
+            .unwrap_or_else(|| Standing::new(SNAKE_QUICK))
     }
 
     async fn snake_ratings_and_settings_are_copied_for_the_game(store: Store) {
@@ -2089,8 +2249,8 @@ mod tests {
                     old.try_get::<i64, _>(3).unwrap(),
                 ),
                 (
-                    standing.rating.mu,
-                    standing.rating.sigma,
+                    standing.rating.mu(),
+                    standing.rating.sigma(),
                     i64::from(standing.games),
                     i64::from(standing.wins),
                 )
@@ -2116,7 +2276,7 @@ mod tests {
             for _ in 0..5 {
                 let results = [RatedResult {
                     account: who,
-                    rating,
+                    rating: rating.into(),
                     won: true,
                 }];
                 store.save_rated_round(key, &results).await.unwrap();
@@ -2251,7 +2411,7 @@ mod tests {
         };
         let results = [RatedResult {
             account: ann.id,
-            rating: strong,
+            rating: strong.into(),
             won: true,
         }];
         store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();
@@ -2260,8 +2420,8 @@ mod tests {
             .rate_round(SNAKE_QUICK, &[(ann.id, 2, false), (ben.id, 1, true)])
             .await
             .unwrap();
-        assert_eq!(changes[0].0, strong, "rated from what's saved");
-        assert!(changes[0].1.mu < strong.mu && changes[1].1.mu > changes[1].0.mu);
+        assert_eq!(changes[0].0, strong.into(), "rated from what's saved");
+        assert!(changes[0].1.mu() < strong.mu && changes[1].1.mu() > changes[1].0.mu());
         let ann_now = quick(&store, ann.id).await;
         assert_eq!(ann_now.rating, changes[0].1);
         assert_eq!((ann_now.games, ann_now.wins), (2, 1));
@@ -2280,14 +2440,17 @@ mod tests {
                 SNAKE_QUICK,
                 &[RatedResult {
                     account: a.id,
-                    rating: better,
+                    rating: better.into(),
                     won: true,
                 }],
             )
             .await
             .unwrap();
         let after = quick(&store, a.id).await;
-        assert_eq!((after.games, after.wins, after.rating), (1, 1, better));
+        assert_eq!(
+            (after.games, after.wins, after.rating),
+            (1, 1, better.into())
+        );
     }
 
     async fn the_leaderboard_ranks_accounts_with_enough_games(store: Store) {
@@ -2300,7 +2463,7 @@ mod tests {
                     let won = i % 2 == 0;
                     let results = [RatedResult {
                         account: who,
-                        rating,
+                        rating: rating.into(),
                         won,
                     }];
                     store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();
@@ -2320,7 +2483,7 @@ mod tests {
         let board = store.leaderboard(SNAKE_QUICK, 5, 20).await.unwrap();
         assert_eq!(names(board.clone()), ["ben", "Dan", "ann"]);
         assert_eq!((board[0].standing.games, board[0].standing.wins), (6, 3));
-        assert_eq!(board[0].standing.rating.mu, 27.0);
+        assert_eq!(board[0].standing.rating.mu(), 27.0);
         assert_eq!(
             names(store.leaderboard(SNAKE_QUICK, 5, 2).await.unwrap()),
             ["ben", "Dan"]

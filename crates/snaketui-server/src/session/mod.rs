@@ -806,13 +806,16 @@ impl SessionActor {
             }
             return self.render(ctx);
         }
-        let rating = pool.rating().map(|key| self.standing(key).rating);
+        let Some(key) = pool.rating() else {
+            return;
+        };
+        let rating = self.standing(key).rating;
         self.queued = true;
         self.shared.matchmaker.do_send(Enqueue {
             pool,
             who: self.entrant(),
             account: self.account_id(),
-            rating: rating.unwrap_or_default(),
+            rating,
             region: self
                 .shared
                 .cluster

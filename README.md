@@ -127,14 +127,24 @@ Chess is off unless the server's `server.toml` turns it on:
 `enabled_games = ["snake", "chess"]`. Then `ssh chess@play.example.com`
 opens it, and new players choose between the two.
 
+- **Quick pairing.** Quick play lists the presets by speed: bullet 1+0
+  and 2+1; blitz 3+0, 3+2, 5+0 and 5+3; rapid 10+0, 10+5 and 15+10;
+  classical 30+0 and 30+20. Pick one with the arrows and Enter, and you're
+  paired with the next player who picks the same, sides drawn. Quick play
+  opens on the preset you played last.
+- **Ratings.** Signed-in players' quick-pairing games are rated with
+  Glicko-2, one rating for each speed, so a rapid game never moves your
+  bullet rating. Everyone starts at 1500. A rating shows a `?` while it's
+  still unsure: at first, and again after weeks without games, since its
+  uncertainty grows each idle day. Each speed has its own leaderboard (←→
+  on the leaderboard). Guests play unrated.
 - **Challenges.** Make a private room and share its code, or invite a
   friend. The host's challenge says the time control and which side they
-  play: ←→ in the lobby steps through 1+0, 2+1, 3+0, 3+2, 5+0, 5+3, 10+0,
-  10+5, 15+10, 30+0 and 30+20, and `e` sets any starting time from a
-  quarter of a minute to 3 hours, any increment up to 3 minutes, and the
-  host's side: white, black or drawn. A game starts once both players are
-  ready, and the room's next game is the rematch. Challenges are unrated
-  for now, and quick pairing comes later.
+  play: ←→ in the lobby steps through the presets, and `e` sets any
+  starting time from a quarter of a minute to 3 hours, any increment up to
+  3 minutes, and the host's side: white, black or drawn. A game starts once
+  both players are ready, and the room's next game is the rematch.
+  Challenges are unrated.
 - **The board** fits an 80×24 terminal with the clocks, what each side has
   taken and the moves beside it. Smaller terminals get a smaller board.
 - **Moves.** Type them, as `Nf3`, `exd5`, `O-O` or `e7e8q`: as you type,
@@ -153,7 +163,8 @@ opens it, and new players choose between the two.
   mid-game, or they quit, their seat waits 90 seconds while their clock
   runs on; the other player sees how long. Connecting again, with their
   key or by signing in, on any of the servers, takes them straight back to
-  the game. After 90 seconds they lose by abandonment, or the game is
+  the game, and a rated game's new rating reaches them there. After 90
+  seconds they lose by abandonment, or the game is
   aborted if they hadn't moved yet. A guest who goes loses at once.
 - **Watching** works as in Snake: `v` on a friend who's playing.
 
@@ -184,13 +195,13 @@ Guests can play everything except friends and ratings. To get those, pick
   colors. You don't play and nothing you press moves anything; Esc takes you
   back to Friends. Players see how many are watching. Up to 20 people can
   watch one room, whichever servers they're on.
-- **Ratings.** Every account starts at 1000. Only quick play is rated: each
-  match moves your rating by where you placed and whom you beat, and the
-  results show by how much. Quick play looks for players of a close rating
+- **Ratings.** Every account starts at 1000 in Snake, and 1500 in chess.
+  Only quick play is rated: each match moves your rating by where you
+  placed and whom you beat, and the results show by how much. Quick play looks for players of a close rating
   first, and widens the range the longer you wait. Only accounts are rated,
   against each other: guests can join rated matches, but beating them, or
   losing to them, doesn't count. Each game keeps its own ratings, and a game
-  can keep several apart, as chess will its time controls.
+  can keep several apart, as chess does its speeds.
 - **Leaderboard**, on the home screen, lists the open game's top 20 accounts
   by rating, and your own place; ←→ picks another of its ratings, when it has
   several. You're listed after 5 rated games.

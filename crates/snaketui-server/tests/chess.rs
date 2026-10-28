@@ -1,5 +1,6 @@
 //! Chess, end to end: a challenge in a private room, played to mate, on
-//! time and to a draw, with a rematch; and friends watching.
+//! time and to a draw, with a rematch; quick pairing, rated; and friends
+//! watching.
 
 mod common;
 
@@ -110,6 +111,78 @@ async fn a_draw_is_agreed_and_a_rematch_follows() {
     })
     .await;
     start(&mut ann, &mut ben).await;
+}
+
+/// On quick pairing's screen, `keys` move to `pool` and wait in it.
+async fn choose_pool(p: &mut Player, keys: &[&[u8]], pool: &str) {
+    p.wait_for("Quick pairing").await;
+    for &key in keys {
+        p.send(key).await;
+    }
+    p.wait_for(&format!("{pool} · sides drawn · rated")).await;
+    p.send(ENTER).await;
+    p.wait_for("Finding a match").await;
+    p.wait_for(pool).await;
+}
+
+#[tokio::test]
+async fn quick_pairing_keeps_presets_apart_and_rates_each_category_alone() {
+    let server = chess_server();
+    let (mut ann, _) = account(server.addr, "ann").await;
+    let (mut ben, _) = account(server.addr, "ben").await;
+    // From the top of the home menu to quick play. Pairing starts on 5+3:
+    // up and left is bullet's 1+0, down and left twice rapid's 10+0.
+    for p in [&mut ann, &mut ben] {
+        p.send(DOWN).await;
+        p.send(ENTER).await;
+    }
+    choose_pool(&mut ann, &[UP, LEFT], "1+0 bullet").await;
+    choose_pool(&mut ben, &[DOWN, LEFT, LEFT], "10+0 rapid").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for p in [&ann, &ben] {
+        assert!(p.text().contains("Finding a match"), "{}", p.text());
+    }
+
+    // Ben goes to bullet instead, from 10+0 where pairing opens now.
+    ben.send(ESC).await;
+    ben.wait_until("the home menu", Duration::from_secs(5), |p| {
+        !p.text().contains("Finding a match")
+    })
+    .await;
+    ben.send(ENTER).await;
+    choose_pool(&mut ben, &[UP, UP], "1+0 bullet").await;
+    for p in [&mut ann, &mut ben] {
+        p.wait_for("move within").await;
+    }
+    let (mut white, mut black) = if ann.text().contains("Your move within") {
+        (ann, ben)
+    } else {
+        (ben, ann)
+    };
+    play(&mut white, "", "e4").await;
+    play(&mut black, "1. e4", "e5").await;
+    white.wait_for("1. e4      e5").await;
+    black.send(ESC).await;
+    black.wait_for("Resign").await;
+    black.send(DOWN).await;
+    black.send(ENTER).await;
+    black.wait_for("Resign this game?").await;
+    black.send(b"y").await;
+    white.wait_for("You win!").await;
+    // Both new, both very unsure: Glicko-2 moves them far.
+    white.wait_for("+162").await;
+    black.wait_for("−162").await;
+
+    // Playing again shows bullet's new rating, and rapid's untouched.
+    white.send(ENTER).await;
+    white
+        .wait_until("bullet's new rating", Duration::from_secs(5), |p| {
+            line_of(&p.text(), "Bullet").contains("1662?")
+        })
+        .await;
+    let text = white.text();
+    assert!(line_of(&text, "Rapid").contains("1500?"), "{text}");
+    assert!(text.contains("1+0 bullet · sides drawn · rated"), "{text}");
 }
 
 #[tokio::test]

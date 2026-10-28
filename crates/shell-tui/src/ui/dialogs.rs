@@ -60,9 +60,16 @@ pub fn draw_finding(frame: &mut Frame, app: &App) {
     } else {
         36
     };
-    let height = if bots { 9 } else { 7 };
+    // Which of the game's pools, if it has several.
+    let pool = online.pool.and_then(|p| app.ui().pool_name(p));
+    let height = if bots { 9 } else { 7 } + u16::from(pool.is_some());
     let inner = dialog(frame, " Finding a match ", Color::Cyan, width, height);
-    let mut lines = vec![Line::default(), Line::from(status), Line::default()];
+    let mut lines = vec![Line::default()];
+    if let Some(pool) = pool {
+        let bold = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+        lines.push(Line::styled(pool, bold));
+    }
+    lines.extend([Line::from(status), Line::default()]);
     if bots {
         lines.push(Line::from("Nobody yet? Play bots now, unrated."));
         lines.push(Line::default());

@@ -204,6 +204,24 @@ pub struct ShownRating {
     pub rating: u32,
     pub games: u32,
     pub wins: u32,
+    /// Still too unsure to count for much.
+    pub provisional: bool,
+}
+
+impl ShownRating {
+    /// The rating as written: "1500?" while provisional.
+    pub fn text(&self) -> String {
+        rating_text(self.rating, self.provisional)
+    }
+}
+
+/// A rating as written: `rating`, with a question mark if `provisional`.
+pub fn rating_text(rating: u32, provisional: bool) -> String {
+    if provisional {
+        format!("{rating}?")
+    } else {
+        rating.to_string()
+    }
 }
 
 /// The signed-in account, as shown.
@@ -276,6 +294,8 @@ pub struct LeaderRow {
     pub rating: u32,
     pub games: u32,
     pub wins: u32,
+    /// The rating is still too unsure to count for much.
+    pub provisional: bool,
 }
 
 /// Where this player stands on the leaderboard.
@@ -331,6 +351,8 @@ pub struct Online {
     pub room: Option<InRoom>,
     /// Time spent in the queue so far.
     pub waited: Duration,
+    /// The pool waited in.
+    pub pool: Option<&'static str>,
     pub queue_len: usize,
     /// In a cluster of servers: the region this player is matched in first.
     pub region: Option<QueueRegion>,
@@ -361,6 +383,7 @@ impl Online {
             notice: None,
             room: None,
             waited: Duration::ZERO,
+            pool: None,
             queue_len: 0,
             region: None,
             account: None,

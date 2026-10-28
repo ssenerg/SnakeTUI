@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use super::centered_rect;
 use crate::app::App;
-use crate::online::{LeaderRow, MyPlace, RANKED_AFTER};
+use crate::online::{LeaderRow, MyPlace, RANKED_AFTER, rating_text};
 
 pub fn draw(frame: &mut Frame, app: &App, category: usize) {
     let online = &app.online;
@@ -120,7 +120,11 @@ pub fn draw(frame: &mut Frame, app: &App, category: usize) {
 fn columns(row: &LeaderRow) -> String {
     format!(
         " {:>3}  {:<16}  {:>6}  {:>5}  {:>4}",
-        row.place, row.name, row.rating, row.games, row.wins
+        row.place,
+        row.name,
+        rating_text(row.rating, row.provisional),
+        row.games,
+        row.wins
     )
 }
 

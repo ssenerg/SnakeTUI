@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use chess_core::control::{MAX_BASE, MAX_INCREMENT, TimeControl};
+use chess_core::control::{MAX_BASE, MAX_INCREMENT, PRESET_NAMES, PRESETS, TimeControl};
 use chess_core::round::{ChessSettings, Side};
 
 /// The squares' colors.
@@ -91,6 +91,9 @@ pub struct Prefs {
     /// What a private room this player makes plays by. A host's changes in
     /// the lobby are kept here too.
     pub challenge: ChessSettings,
+    /// The preset quick pairing last found them a game in, one of
+    /// [`PRESETS`].
+    pub pairing: TimeControl,
 }
 
 impl Default for Prefs {
@@ -103,6 +106,7 @@ impl Default for Prefs {
             input: MoveInput::default(),
             confirm_resign: true,
             challenge: ChessSettings::default(),
+            pairing: TimeControl::minutes(5, 3),
         }
     }
 }
@@ -129,6 +133,7 @@ impl Prefs {
             ("base_s", control.base.as_secs().to_string()),
             ("increment_s", control.increment.as_secs().to_string()),
             ("side", self.challenge.side.name().to_string()),
+            ("pairing", self.pairing.to_string()),
         ]
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))
@@ -176,6 +181,13 @@ impl Prefs {
                 "side" => set(
                     &mut prefs.challenge.side,
                     named(&Side::ALL, Side::name, value),
+                ),
+                "pairing" => set(
+                    &mut prefs.pairing,
+                    PRESET_NAMES
+                        .iter()
+                        .position(|&name| name == value)
+                        .map(|i| PRESETS[i]),
                 ),
                 _ => {}
             }
@@ -256,11 +268,13 @@ mod tests {
                 control: TimeControl::minutes(3, 2),
                 side: Side::Black,
             },
+            pairing: TimeControl::minutes(1, 0),
         };
         assert_eq!(Prefs::from_saved_text(&prefs.to_saved_text()), prefs);
         assert_eq!(Prefs::from_saved_text(""), Prefs::default());
-        let odd =
-            Prefs::from_saved_text("board=plaid\nbase_s=0\nincrement_s=x\nnoise\npieces=letters");
+        let odd = Prefs::from_saved_text(
+            "board=plaid\nbase_s=0\nincrement_s=x\nnoise\npieces=letters\npairing=4+0",
+        );
         assert_eq!(
             odd,
             Prefs {

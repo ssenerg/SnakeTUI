@@ -43,6 +43,7 @@ fn snake_rating(rating: u32, games: u32, wins: u32) -> ShownRating {
         rating,
         games,
         wins,
+        provisional: false,
     }
 }
 

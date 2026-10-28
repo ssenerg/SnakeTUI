@@ -14,7 +14,7 @@ use ratatui::layout::Size;
 use ratatui::style::Color;
 
 use crate::online::{Category, HomeItem, InRoom, LeaderboardView, MyPlace, Profile, ShownRating};
-use crate::{App, Ctx, Effect, GameUi, Key, QuickPlay, Screen, ui};
+use crate::{App, Ctx, Effect, GameUi, Key, QuickPlay, QuickStart, Screen, ui};
 
 /// A game with nothing to it, played as Snake or as Chess, so the app
 /// has two to choose from.
@@ -86,11 +86,11 @@ impl GameUi for ToyUi {
         Vec::new()
     }
 
-    fn quick_play(&self, _: Size) -> Result<QuickPlay, String> {
-        Ok(QuickPlay {
+    fn quick_play(&mut self, _: Size) -> Result<QuickStart, String> {
+        Ok(QuickStart::Queue(QuickPlay {
             pool: "duel",
             too_small: None,
-        })
+        }))
     }
 
     fn ratings(&self) -> &'static [Category] {
@@ -339,6 +339,7 @@ fn sign_in(app: &mut App) {
         rating,
         games,
         wins,
+        provisional: false,
     };
     app.set_profile(Some(Profile {
         username: "ann".into(),
@@ -411,10 +412,11 @@ fn the_account_shows_the_open_games_ratings() {
     );
 
     // A rated round moves only its own rating.
-    app.rated(key(GameId::Snake, "brawl"), 950, true);
+    app.rated(key(GameId::Snake, "brawl"), 950, true, true);
     let profile = app.online.account.as_ref().unwrap();
     let brawl = profile.rating(key(GameId::Snake, "brawl")).unwrap();
     assert_eq!((brawl.rating, brawl.games, brawl.wins), (950, 2, 1));
+    assert_eq!(brawl.text(), "950?", "still unsure");
     let duel = profile.rating(key(GameId::Snake, "duel")).unwrap();
     assert_eq!((duel.rating, duel.games), (1100, 3));
 

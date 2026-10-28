@@ -42,6 +42,7 @@ fn snake_rating(rating: u32, games: u32, wins: u32) -> ShownRating {
         rating,
         games,
         wins,
+        provisional: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn leaderboard(len: u32, me: MyPlace) -> LeaderboardView {
             rating: 1500 - place * 10,
             games: 100 + place,
             wins: 50,
+            provisional: false,
         })
         .collect();
     LeaderboardView {
@@ -70,6 +72,7 @@ fn ranked(place: u32) -> MyPlace {
         rating: 988,
         games: 6,
         wins: 1,
+        provisional: true,
     })
 }
 

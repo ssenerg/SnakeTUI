@@ -1,9 +1,12 @@
 //! Skill ratings for quick play: Weng-Lin, which rates free-for-all games
-//! of any size.
+//! of any size, for Snake; and a [`Skill`] in either system, Glicko-2
+//! being chess's.
 
 use serde::{Deserialize, Serialize};
 use skillratings::MultiTeamOutcome;
 use skillratings::weng_lin::{WengLinConfig, WengLinRating, weng_lin_multi_team};
+
+use crate::games::RatingSystem;
 
 pub use game_api::RatingKey;
 
@@ -61,6 +64,72 @@ pub fn after_round(players: &[(Rating, usize)]) -> Vec<Rating> {
         .collect()
 }
 
+/// A player's rating in one category, in the system its game rates by.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Skill {
+    /// Snake's: see [`Rating`].
+    WengLin(Rating),
+    /// Chess's: see [`chess_core::rating`].
+    Glicko2(chess_core::rating::Rating),
+}
+
+impl Skill {
+    /// Where a new player starts in `system`.
+    pub fn new(system: RatingSystem) -> Skill {
+        match system {
+            RatingSystem::WengLin => Skill::WengLin(Rating::default()),
+            RatingSystem::Glicko2 => Skill::Glicko2(chess_core::rating::Rating::default()),
+        }
+    }
+
+    /// The number players see.
+    pub fn shown(self) -> u32 {
+        match self {
+            Skill::WengLin(r) => r.shown(),
+            Skill::Glicko2(r) => r.shown(),
+        }
+    }
+
+    /// Whether it's still too unsure to count for much, after `idle_days`
+    /// without a rated game: shown with a question mark.
+    pub fn is_provisional(self, idle_days: u32) -> bool {
+        match self {
+            Skill::WengLin(_) => false,
+            Skill::Glicko2(r) => r.decayed(idle_days).is_provisional(),
+        }
+    }
+}
+
+impl From<Rating> for Skill {
+    fn from(rating: Rating) -> Skill {
+        Skill::WengLin(rating)
+    }
+}
+
+#[cfg(test)]
+impl Skill {
+    /// Weng-Lin's mu, for tests of Snake's ratings.
+    pub fn mu(self) -> f64 {
+        match self {
+            Skill::WengLin(r) => r.mu,
+            Skill::Glicko2(_) => panic!("not a Weng-Lin rating"),
+        }
+    }
+
+    pub fn sigma(self) -> f64 {
+        match self {
+            Skill::WengLin(r) => r.sigma,
+            Skill::Glicko2(_) => panic!("not a Weng-Lin rating"),
+        }
+    }
+}
+
+/// Whole days from `from` to `to`, as Unix times, for ratings that grow
+/// unsure with time; none if `to` comes first.
+pub fn days_between(from: i64, to: i64) -> u32 {
+    u32::try_from((to - from).max(0) / 86_400).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +137,23 @@ mod tests {
     #[test]
     fn new_players_show_1000() {
         assert_eq!(Rating::default().shown(), 1000);
+    }
+
+    #[test]
+    fn chess_ratings_start_unsure_and_grow_unsure_again() {
+        let new = Skill::new(RatingSystem::Glicko2);
+        assert_eq!(new.shown(), 1500);
+        assert!(new.is_provisional(0));
+        let settled = Skill::Glicko2(chess_core::rating::Rating {
+            rating: 1612.0,
+            deviation: 60.0,
+            volatility: 0.06,
+        });
+        assert!(!settled.is_provisional(0));
+        assert!(settled.is_provisional(3650), "ten years away");
+        assert!(!Skill::new(RatingSystem::WengLin).is_provisional(3650));
+        assert_eq!(days_between(0, 86_400 * 3 - 1), 2);
+        assert_eq!(days_between(10, 0), 0);
     }
 
     #[test]

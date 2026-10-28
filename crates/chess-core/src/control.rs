@@ -33,6 +33,11 @@ pub const PRESETS: [TimeControl; 11] = [
     TimeControl::minutes(30, 20),
 ];
 
+/// [`PRESETS`] as written: what quick pairing's pools are called.
+pub const PRESET_NAMES: [&str; 11] = [
+    "1+0", "2+1", "3+0", "3+2", "5+0", "5+3", "10+0", "10+5", "15+10", "30+0", "30+20",
+];
+
 impl TimeControl {
     /// `base` minutes and `increment` seconds, as in "3+2".
     pub const fn minutes(base: u64, increment: u64) -> TimeControl {
@@ -112,6 +117,12 @@ impl Category {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_are_named_as_written() {
+        let written: Vec<String> = PRESETS.iter().map(|p| p.to_string()).collect();
+        assert_eq!(written, PRESET_NAMES);
+    }
 
     fn secs(base: u64, increment: u64) -> TimeControl {
         TimeControl {

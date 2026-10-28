@@ -351,7 +351,7 @@ mod tests {
                 name: format!("p{id}"),
             },
             account: None,
-            rating: Rating::default(),
+            rating: Rating::default().into(),
             region: region.into(),
             server,
             waited: Duration::from_secs(waited),
@@ -386,7 +386,7 @@ mod tests {
                 name: String::new(),
             },
             account: None,
-            rating: Rating::default(),
+            rating: Rating::default().into(),
             server,
         };
         // Two of three players are on server 1: it hosts, busy or not.

@@ -10,7 +10,7 @@ use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::text::Span;
 use shell_tui::online::{Category, InRoom};
-use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickPlay, Reply, Saved};
+use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickPlay, QuickStart, Reply, Saved};
 use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::geom::Direction;
 use snake_core::records::Records;
@@ -258,7 +258,7 @@ impl GameUi for SnakeUi {
         encode(&self.cfg.rules)
     }
 
-    fn quick_play(&self, size: Size) -> Result<QuickPlay, String> {
+    fn quick_play(&mut self, size: Size) -> Result<QuickStart, String> {
         let rules = quick_rules();
         let too_small = (!ui::room_fits(rules.width, rules.height, size)).then(|| {
             let (w, h) = ui::room_size(rules.width, rules.height);
@@ -268,10 +268,10 @@ impl GameUi for SnakeUi {
                 size.width, size.height
             )
         });
-        Ok(QuickPlay {
+        Ok(QuickStart::Queue(QuickPlay {
             pool: QUICK_POOL,
             too_small,
-        })
+        }))
     }
 
     fn ratings(&self) -> &'static [Category] {

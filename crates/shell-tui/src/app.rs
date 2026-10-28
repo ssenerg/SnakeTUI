@@ -9,7 +9,7 @@ use std::time::Duration;
 use game_api::{AnyView, GameId, PhaseView, PlayerId, RatingKey, RoomKind, is_bot};
 use ratatui::layout::Size;
 
-use crate::game::{Ctx, GameFx, GameUi, Next, Reply, Saved};
+use crate::game::{Ctx, GameFx, GameUi, Next, QuickStart, Reply, Saved};
 use crate::key::Key;
 use crate::online::{
     AccountRow, Field, Form, FormKind, FormRow, FriendsRow, FriendsView, HomeItem, InRoom, Invite,
@@ -167,8 +167,9 @@ pub struct App {
     /// Whether a game has been opened yet. Until one is, the picker is
     /// all there is.
     opened: bool,
-    /// The open game's home entry that its own screens were opened from.
-    game_item: usize,
+    /// The home entry the open game's own screens were opened from, which
+    /// leaving them goes back to.
+    game_item: HomeItem,
 }
 
 impl App {
@@ -193,7 +194,7 @@ impl App {
             games,
             open: 0,
             opened: false,
-            game_item: 0,
+            game_item: HomeItem::Game(0),
         };
         let start = start.and_then(|game| app.index_of(game));
         if let Some(i) = start.or_else(|| (app.games.len() == 1).then_some(0)) {
@@ -211,7 +212,7 @@ impl App {
     fn switch_to(&mut self, i: usize) {
         if i != self.open {
             self.open = i;
-            self.game_item = 0;
+            self.game_item = HomeItem::Game(0);
         }
         self.opened = true;
     }
@@ -250,6 +251,7 @@ impl App {
             size: self.size,
             online: true,
             room: self.online.room.as_ref(),
+            account: self.online.account.as_ref(),
             notice: self.online.notice.as_deref(),
         }
     }
@@ -351,9 +353,10 @@ impl App {
         match reply.next {
             Next::Stay => {}
             Next::Game => self.screen = Screen::Game,
-            Next::Home => self.go_home(HomeItem::Game(self.game_item), None),
+            Next::Home => self.go_home(self.game_item, None),
             Next::Room if self.in_room() => self.screen = Screen::Room,
             Next::Room => self.go_home(HomeItem::QuickPlay, None),
+            Next::Queue(pool) => self.queue(id, pool, effects),
         }
         if reply.notice.is_some() {
             self.online.notice = reply.notice;
@@ -366,6 +369,7 @@ impl App {
             size: self.size,
             online: true,
             room: self.online.room.as_ref(),
+            account: self.online.account.as_ref(),
             notice: None,
         };
         let reply = self.games[self.open].key(key, &ctx);
@@ -509,14 +513,19 @@ impl App {
         let game = self.ui().id();
         match item {
             HomeItem::Game(n) => {
-                self.game_item = n;
+                self.game_item = item;
                 self.games[self.open].open(n);
                 self.screen = Screen::Game;
             }
             HomeItem::QuickPlay => {
                 let online = &mut self.online;
                 let quick = match self.games[self.open].quick_play(self.size) {
-                    Ok(quick) => quick,
+                    Ok(QuickStart::Queue(quick)) => quick,
+                    Ok(QuickStart::Choose) => {
+                        self.game_item = item;
+                        self.screen = Screen::Game;
+                        return;
+                    }
                     Err(why) => {
                         online.notice = Some(why);
                         return;
@@ -529,13 +538,7 @@ impl App {
                     online.confirm_small = true;
                     return;
                 }
-                online.confirm_small = false;
-                online.waited = Duration::ZERO;
-                self.screen = Screen::Finding;
-                effects.push(Effect::QuickPlay {
-                    game,
-                    pool: quick.pool,
-                });
+                self.queue(game, quick.pool, effects);
             }
             HomeItem::CreateRoom => {
                 self.screen = Screen::Joining { by_code: false };
@@ -619,6 +622,16 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    /// Into quick play, waiting in `game`'s `pool`.
+    fn queue(&mut self, game: GameId, pool: &'static str, effects: &mut Vec<Effect>) {
+        let online = &mut self.online;
+        online.confirm_small = false;
+        online.waited = Duration::ZERO;
+        online.pool = Some(pool);
+        self.screen = Screen::Finding;
+        effects.push(Effect::QuickPlay { game, pool });
     }
 
     fn finding_key(&mut self, key: Key, effects: &mut Vec<Effect>) {
@@ -1225,14 +1238,16 @@ impl App {
         ));
     }
 
-    /// A rated round moved this player's rating `key`.
-    pub fn rated(&mut self, key: RatingKey, rating: u32, won: bool) {
+    /// A rated round moved this player's rating `key`, which may still
+    /// be `provisional`.
+    pub fn rated(&mut self, key: RatingKey, rating: u32, provisional: bool, won: bool) {
         let Some(profile) = self.online.account.as_mut() else {
             return;
         };
         match profile.ratings.iter_mut().find(|r| r.key == key) {
             Some(shown) => {
                 shown.rating = rating;
+                shown.provisional = provisional;
                 shown.games += 1;
                 shown.wins += u32::from(won);
             }
@@ -1241,6 +1256,7 @@ impl App {
                 rating,
                 games: 1,
                 wins: u32::from(won),
+                provisional,
             }),
         }
     }

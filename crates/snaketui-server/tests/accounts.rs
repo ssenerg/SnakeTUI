@@ -224,7 +224,7 @@ async fn the_leaderboard_lists_players_after_five_rated_games() {
         for _ in 0..games {
             let results = [RatedResult {
                 account: account.id,
-                rating: Rating { mu, sigma: 4.0 },
+                rating: Rating { mu, sigma: 4.0 }.into(),
                 won: true,
             }];
             store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();

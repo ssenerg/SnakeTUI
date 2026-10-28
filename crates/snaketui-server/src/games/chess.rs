@@ -1,10 +1,12 @@
-//! Chess as this server plays it: private challenges with any time
-//! control, unrated. Quick pairing comes later.
+//! Chess as this server plays it: quick pairing at each preset, rated by
+//! Glicko-2 in the preset's category, and private challenges with any time
+//! control, unrated.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use chess_core::round::{Chess, ChessSettings};
+use chess_core::control::{PRESET_NAMES, PRESETS, TimeControl};
+use chess_core::round::{Chess, ChessSettings, Side};
 use chess_tui::ChessUi;
 use game_api::{Entrant, GameId, Room, RoomKind, RoomSettings};
 use shell_tui::GameUi;
@@ -16,14 +18,44 @@ use crate::room::NewRoom;
 /// rematch starts once both are ready.
 const RESULTS_FOR: Duration = Duration::from_secs(15);
 
+/// One preset's quick pairing: two players, matched as soon as there are
+/// two, rated in its category.
+const fn pool(id: &'static str, category: &'static str) -> PoolInfo {
+    PoolInfo {
+        id,
+        category,
+        seats: 2..=2,
+        fill_wait: Duration::ZERO,
+    }
+}
+
 static INFO: GameInfo = GameInfo {
     id: GameId::Chess,
     title: "Chess",
     ssh_users: &["chess"],
     rating: RatingSystem::Glicko2,
     categories: &["bullet", "blitz", "rapid", "classical"],
-    pools: &[],
+    // Each of chess_core's PRESETS, by its name.
+    pools: &[
+        pool(PRESET_NAMES[0], "bullet"),
+        pool(PRESET_NAMES[1], "bullet"),
+        pool(PRESET_NAMES[2], "blitz"),
+        pool(PRESET_NAMES[3], "blitz"),
+        pool(PRESET_NAMES[4], "blitz"),
+        pool(PRESET_NAMES[5], "blitz"),
+        pool(PRESET_NAMES[6], "rapid"),
+        pool(PRESET_NAMES[7], "rapid"),
+        pool(PRESET_NAMES[8], "rapid"),
+        pool(PRESET_NAMES[9], "classical"),
+        pool(PRESET_NAMES[10], "classical"),
+    ],
 };
+
+/// The preset a pool plays.
+fn preset(pool: &PoolInfo) -> Option<TimeControl> {
+    let i = PRESET_NAMES.iter().position(|&name| name == pool.id)?;
+    Some(PRESETS[i])
+}
 
 /// A room playing by `settings`: a game starts once both players are
 /// ready, never by itself.
@@ -45,10 +77,13 @@ impl GameServer for ChessServer {
         decode_view::<Chess>(body)
     }
 
-    /// Chess has no pools yet, so nothing is matched.
-    fn new_match(&self, _: &PoolInfo, seed: u64, players: Vec<Entrant>) -> Box<dyn NewRoom> {
-        let room = settings(ChessSettings::default(), RoomKind::Match)
-            .expect("chess seats two in any room");
+    /// A game at the pool's preset, with sides drawn.
+    fn new_match(&self, pool: &PoolInfo, seed: u64, players: Vec<Entrant>) -> Box<dyn NewRoom> {
+        let chess = ChessSettings {
+            control: preset(pool).unwrap_or(ChessSettings::default().control),
+            side: Side::Random,
+        };
+        let room = settings(chess, RoomKind::Match).expect("chess seats two in any room");
         Box::new(Room::<Chess>::new_match(room, seed, players))
     }
 
@@ -66,5 +101,20 @@ impl GameServer for ChessServer {
 
     fn ui(&self) -> Box<dyn GameUi> {
         Box::new(ChessUi::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_preset_has_a_pool_rated_in_its_category() {
+        assert_eq!(INFO.pools.len(), PRESETS.len());
+        for (pool, preset) in INFO.pools.iter().zip(PRESETS) {
+            assert_eq!(super::preset(pool), Some(preset));
+            assert_eq!(pool.category, preset.category().name(), "{}", pool.id);
+            assert!(INFO.categories.contains(&pool.category));
+        }
     }
 }

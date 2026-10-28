@@ -77,7 +77,10 @@ impl SessionActor {
     /// The account's standing in `key`, which it's matched by: a new
     /// player's for a guest, or in a rating it hasn't played.
     pub(super) fn standing(&self, key: RatingKey) -> Standing {
-        self.ratings.get(&key).copied().unwrap_or_default()
+        self.ratings
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| Standing::new(key))
     }
 
     /// The account as shown, with its rating in every game here.
@@ -85,10 +88,10 @@ impl SessionActor {
         let ratings = every_rating()
             .map(|key| {
                 let standing = self.standing(key);
-                let system = games::get(key.game).map(|g| g.info().rating);
                 ShownRating {
                     key,
-                    rating: system.map_or(0, |s| s.shown(&standing)),
+                    rating: standing.rating.shown(),
+                    provisional: standing.is_provisional(now()),
                     games: standing.games,
                     wins: standing.wins,
                 }
@@ -160,6 +163,7 @@ impl SessionActor {
         let shared = Arc::clone(&self.shared);
         let who = self.entrant();
         let presence = Arc::downgrade(&self.presence);
+        let on_rated = ctx.address().recipient();
         let back = async move {
             let at = match shared.rooms.seat_of(account) {
                 Some(room) => RoomRef {
@@ -169,7 +173,7 @@ impl SessionActor {
                 None => shared.cluster.as_ref()?.seat_of(account).await?,
             };
             let room = shared.room(at)?;
-            let view = room.rejoin(who, account, presence).await.ok()?;
+            let view = room.rejoin(who, account, presence, on_rated).await.ok()?;
             Some((room, view))
         };
         ctx.spawn(back.into_actor(self).map(move |back, act, ctx| {
@@ -613,6 +617,7 @@ impl SessionActor {
                     rating: r.standing.rating.shown(),
                     games: r.standing.games,
                     wins: r.standing.wins,
+                    provisional: r.standing.is_provisional(now()),
                 })
                 .collect();
             let mine = act.standing(key);
@@ -627,6 +632,7 @@ impl SessionActor {
                             rating: mine.rating.shown(),
                             games: mine.games,
                             wins: mine.wins,
+                            provisional: mine.is_provisional(now()),
                         }
                     }))
                 }
@@ -967,12 +973,17 @@ impl Handler<Rated> for SessionActor {
         if self.account.is_none() {
             return;
         }
-        let standing = self.ratings.entry(msg.key).or_default();
+        let standing = self
+            .ratings
+            .entry(msg.key)
+            .or_insert_with(|| Standing::new(msg.key));
         standing.rating = msg.rating;
         standing.games += 1;
         standing.wins += u32::from(msg.won);
+        standing.rated_at = now();
+        let provisional = standing.is_provisional(standing.rated_at);
         if let Some(app) = self.app.as_mut() {
-            app.rated(msg.key, msg.rating.shown(), msg.won);
+            app.rated(msg.key, msg.rating.shown(), provisional, msg.won);
         }
         self.render(ctx);
     }

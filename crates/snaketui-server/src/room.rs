@@ -27,7 +27,7 @@ use crate::cluster::wire::{JoinAs, RatedAt};
 use crate::games::{self, AnyRoomView, Served};
 use crate::lobby::{LobbyActor, RoomClosed};
 use crate::metrics::TICK_LAG;
-use crate::rating::Rating;
+use crate::rating::Skill;
 use crate::store::{AccountId, Store};
 
 /// A room's views, newest first, of whichever game.
@@ -232,12 +232,14 @@ pub trait RoomPort: Send + Sync {
         account: Option<AccountId>,
         presence: Presence,
     ) -> BoxFuture<'static, Joined>;
-    /// `who` takes back the seat `account` has in the round being played.
+    /// `who` takes back the seat `account` has in the round being played;
+    /// a rated round's new rating goes to `notify`.
     fn rejoin(
         &self,
         who: Entrant,
         account: AccountId,
         presence: Presence,
+        notify: RatedNotify,
     ) -> BoxFuture<'static, Joined>;
     /// Lets `id` watch without a seat.
     fn watch(&self, id: PlayerId, presence: Presence) -> BoxFuture<'static, Joined>;
@@ -270,11 +272,13 @@ impl<G: Served> RoomPort for Addr<RoomActor<G>> {
         who: Entrant,
         account: AccountId,
         presence: Presence,
+        notify: RatedNotify,
     ) -> BoxFuture<'static, Joined> {
         let joined = self.send(Rejoin {
             who,
             account,
             presence,
+            notify,
         });
         Box::pin(async move { joined.await.unwrap_or(Err(JoinError::Closed)) })
     }
@@ -379,16 +383,21 @@ impl RoomHandle {
         }
     }
 
-    /// `who` takes back the seat `account` has in the round being played.
+    /// `who` takes back the seat `account` has in the round being played;
+    /// a rated round's new rating goes to `on_rated`.
     pub fn rejoin(
         &self,
         who: Entrant,
         account: AccountId,
         presence: Presence,
+        on_rated: Recipient<Rated>,
     ) -> BoxFuture<'static, Joined> {
         match self {
-            RoomHandle::Local { port, .. } => port.rejoin(who, account, presence),
+            RoomHandle::Local { port, .. } => {
+                port.rejoin(who, account, presence, RatedNotify::Here(on_rated))
+            }
             RoomHandle::Remote { at, cluster } => {
+                cluster.expect_rated(who.id, on_rated);
                 let how = JoinAs::Rejoin { account };
                 Box::pin(Arc::clone(cluster).join_remote(*at, who, presence, how))
             }
@@ -413,7 +422,7 @@ impl RoomHandle {
 pub struct Rated {
     /// The rating the round changed.
     pub key: RatingKey,
-    pub rating: Rating,
+    pub rating: Skill,
     pub won: bool,
 }
 
@@ -423,7 +432,7 @@ pub struct RatedMember {
     pub account: Option<AccountId>,
     /// What they were matched by. Ratings are worked out from the saved
     /// ones instead.
-    pub rating: Rating,
+    pub rating: Skill,
     pub notify: RatedNotify,
 }
 
@@ -488,6 +497,7 @@ struct Rejoin {
     who: Entrant,
     account: AccountId,
     presence: Presence,
+    notify: RatedNotify,
 }
 
 /// Watching without a seat. A full room of watchers says
@@ -992,9 +1002,14 @@ impl<G: Served> Handler<Rejoin> for RoomActor<G> {
         self.accounts.remove(&old);
         self.accounts.insert(new, msg.account);
         self.present.insert(new, msg.presence);
+        // The new rating goes to the new connection.
         if let Some(ratings) = &mut self.ratings
             && let Some(member) = ratings.members.remove(&old)
         {
+            let member = RatedMember {
+                notify: msg.notify,
+                ..member
+            };
             ratings.members.insert(new, member);
         }
         debug!(game = %G::ID, code = ?self.code, player = new, "back in their seat");
@@ -1057,7 +1072,7 @@ mod tests {
     use actix_rt::Arbiter;
     use chess_core::moves::Move;
     use chess_core::round::{Chess, ChessInput, ChessSettings, Side};
-    use game_api::{PhaseView, Room, RoomKind, SeatView};
+    use game_api::{GameId, PhaseView, Room, RoomKind, SeatView};
     use snake_core::round::{Placement, RoomSettings, Snake, quick_rules};
 
     use super::*;
@@ -1066,6 +1081,14 @@ mod tests {
     /// A private chess room started on this thread as room 7, where player
     /// 1 hosts as white, as it's listed among [`LocalRooms`].
     fn chess_room(rejoin_within: Duration) -> (RoomHandle, ViewRx, LocalRooms) {
+        rated_chess_room(rejoin_within, None)
+    }
+
+    /// [`chess_room`], rated by `ratings`.
+    fn rated_chess_room(
+        rejoin_within: Duration,
+        ratings: Option<Ratings>,
+    ) -> (RoomHandle, ViewRx, LocalRooms) {
         let mut settings = game_api::RoomSettings::<Chess>::new(
             ChessSettings {
                 side: Side::White,
@@ -1075,8 +1098,11 @@ mod tests {
         )
         .unwrap();
         settings.countdown = Duration::ZERO;
-        let (mut room, view) =
-            RoomActor::new(Room::<Chess>::new(settings, 1), RoomSetup::default());
+        let setup = RoomSetup {
+            ratings,
+            ..RoomSetup::default()
+        };
+        let (mut room, view) = RoomActor::new(Room::<Chess>::new(settings, 1), setup);
         room.rejoin_within = rejoin_within;
         let rooms = LocalRooms::default();
         let host = RoomHost::new(0, rooms.clone(), vec![Arbiter::current()]);
@@ -1087,6 +1113,32 @@ mod tests {
         Entrant {
             id,
             name: format!("p{}", id % 10),
+        }
+    }
+
+    /// A session's ears for new ratings: what it heard, and whether it won.
+    #[derive(Clone, Default)]
+    struct Heard(Arc<std::sync::Mutex<Vec<(RatingKey, bool)>>>);
+
+    impl Actor for Heard {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<Rated> for Heard {
+        type Result = ();
+
+        fn handle(&mut self, msg: Rated, _: &mut Self::Context) {
+            self.0.lock().unwrap().push((msg.key, msg.won));
+        }
+    }
+
+    impl Heard {
+        fn ears(&self) -> Recipient<Rated> {
+            self.clone().start().recipient()
+        }
+
+        fn heard(&self) -> Vec<(RatingKey, bool)> {
+            self.0.lock().unwrap().clone()
         }
     }
 
@@ -1158,7 +1210,9 @@ mod tests {
 
         // Back as player 11, signed in to account 10 again, they play on.
         let back = Arc::new(());
-        let rejoined = room.rejoin(who(11), 10, Arc::downgrade(&back)).await;
+        let rejoined = room
+            .rejoin(who(11), 10, Arc::downgrade(&back), Heard::default().ears())
+            .await;
         assert!(rejoined.is_ok());
         let now = until(&mut view, |v| seat(v, 11).is_some()).await;
         let seat = seat(&now, 11).unwrap();
@@ -1169,7 +1223,9 @@ mod tests {
             v.game.as_ref().is_some_and(|g| g.moves.len() == 3)
         })
         .await;
-        let nobody = room.rejoin(who(12), 30, Arc::downgrade(&back)).await;
+        let nobody = room
+            .rejoin(who(12), 30, Arc::downgrade(&back), Heard::default().ears())
+            .await;
         assert!(
             matches!(nobody, Err(JoinError::Closed)),
             "account 30 has no seat"
@@ -1215,7 +1271,7 @@ mod tests {
         let _here = started(&room, &mut view, false).await;
         let back = Arc::new(());
         assert!(
-            room.rejoin(who(11), 10, Arc::downgrade(&back))
+            room.rejoin(who(11), 10, Arc::downgrade(&back), Heard::default().ears())
                 .await
                 .is_ok()
         );
@@ -1230,11 +1286,88 @@ mod tests {
         assert!(matches!(now.shell.phase, PhaseView::Running { .. }));
     }
 
+    #[actix_rt::test]
+    async fn a_rated_game_rates_a_player_back_on_a_new_connection() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let mut accounts = Vec::new();
+        for name in ["ann", "ben"] {
+            let account = store
+                .create_account(name, "x", None, &[], &Default::default())
+                .await
+                .unwrap()
+                .unwrap();
+            accounts.push(account.id);
+        }
+        let key = RatingKey {
+            game: GameId::Chess,
+            category: "blitz",
+        };
+        let (old, new, ben) = (Heard::default(), Heard::default(), Heard::default());
+        let member = |account, heard: &Heard| RatedMember {
+            account: Some(account),
+            rating: Skill::new(games::RatingSystem::Glicko2),
+            notify: RatedNotify::Here(heard.ears()),
+        };
+        let ratings = Ratings {
+            key,
+            store: store.clone(),
+            members: HashMap::from([
+                (1, member(accounts[0], &old)),
+                (2, member(accounts[1], &ben)),
+            ]),
+        };
+        let (room, mut view, _) = rated_chess_room(REJOIN_WITHIN, Some(ratings));
+        let here = [Arc::new(()), Arc::new(())];
+        for ((id, presence), account) in [1, 2].into_iter().zip(&here).zip(&accounts) {
+            room.join(who(id), Some(*account), Arc::downgrade(presence))
+                .await
+                .unwrap();
+            room.send(id, RoomCmd::Ready);
+        }
+        until(&mut view, |v| {
+            matches!(v.shell.phase, PhaseView::Running { .. })
+        })
+        .await;
+        play(&room, 1, "e2e4");
+        play(&room, 2, "e7e5");
+        until(&mut view, |v| {
+            v.game.as_ref().is_some_and(|g| g.moves.len() == 2)
+        })
+        .await;
+
+        // Ann's connection goes, and she's back on another, as player 11.
+        room.send(1, RoomCmd::Gone);
+        until(&mut view, |v| seat(v, 1).is_some_and(|s| s.away.is_some())).await;
+        let back = Arc::new(());
+        room.rejoin(who(11), accounts[0], Arc::downgrade(&back), new.ears())
+            .await
+            .unwrap();
+        room.send(2, RoomCmd::Play(games::encode(&ChessInput::Resign)));
+        until(&mut view, |v| {
+            matches!(v.shell.phase, PhaseView::Results { .. })
+        })
+        .await;
+        let rated = async {
+            while new.heard().is_empty() || ben.heard().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), rated)
+            .await
+            .expect("both heard their new ratings");
+        assert_eq!(new.heard(), [(key, true)], "her new connection hears it");
+        assert_eq!(ben.heard(), [(key, false)]);
+        assert!(old.heard().is_empty(), "nothing for the old one");
+        let saved = store.ratings(accounts[0]).await.unwrap();
+        let blitz = saved.iter().find(|(k, _)| *k == key).unwrap();
+        assert_eq!((blitz.1.games, blitz.1.wins), (1, 1));
+    }
+
     #[test]
     fn only_accounts_are_rated_each_once() {
         let member = |account| RatedMember {
             account,
-            rating: Rating::default(),
+            rating: crate::rating::Rating::default().into(),
             notify: RatedNotify::Nobody,
         };
         let members = HashMap::from([

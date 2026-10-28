@@ -265,6 +265,62 @@ async fn a_dropped_player_comes_back_to_their_game_through_another_server() {
 }
 
 #[tokio::test]
+async fn a_player_back_through_another_server_hears_their_new_rating() {
+    let chess = "enabled_games = [\"snake\", \"chess\"]";
+    let (servers, settings) = cluster_in(&["local", "local"], chess).await;
+    let _queue = MatchmakerProcess::start(&settings, 1.0);
+    // Both on the first server, so their match is there too.
+    let (mut ann, key) = common::chess::account(servers[0].addr, "ann").await;
+    let (mut ben, _) = common::chess::account(servers[0].addr, "ben").await;
+    for p in [&mut ann, &mut ben] {
+        p.send(DOWN).await;
+        p.send(ENTER).await;
+        p.wait_for("5+3 blitz · sides drawn · rated").await;
+        p.send(ENTER).await;
+    }
+    for p in [&mut ann, &mut ben] {
+        p.wait_until("the game", Duration::from_secs(10), |p| {
+            p.text().contains("move within")
+        })
+        .await;
+    }
+    {
+        let ann_white = ann.text().contains("Your move within");
+        let (white, black) = if ann_white {
+            (&mut ann, &mut ben)
+        } else {
+            (&mut ben, &mut ann)
+        };
+        common::chess::play(white, "", "e4").await;
+        common::chess::play(black, "1. e4", "e5").await;
+        white.wait_for("1. e4      e5").await;
+    }
+
+    // ann's connection drops, and she's back through the second server.
+    drop(ann);
+    ben.wait_for("ann (away)").await;
+    let mut ann = common::chess::back(servers[1].addr, &key).await;
+    ben.wait_until("ann to be back", Duration::from_secs(5), |p| {
+        !p.text().contains("away")
+    })
+    .await;
+    ben.send(ESC).await;
+    ben.wait_for("Resign").await;
+    ben.send(DOWN).await;
+    ben.send(ENTER).await;
+    ben.wait_for("Resign this game?").await;
+    ben.send(b"y").await;
+    ann.wait_for("You win!").await;
+    ann.wait_for("+162").await;
+    // Her new rating reached her new connection.
+    ann.send(ENTER).await;
+    ann.wait_until("blitz's new rating", Duration::from_secs(5), |p| {
+        common::accounts::line_of(&p.text(), "Blitz").contains("1662?")
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn friends_watch_games_on_other_servers() {
     let servers = cluster(2).await;
     let (mut ann, _) = signed_up(servers[0].addr, "ann").await;

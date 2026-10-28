@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use actix::Recipient;
 use anyhow::{Context, Result};
 use async_nats::{Client, ConnectOptions, Subscriber};
 use bytes::Bytes;
 use futures::StreamExt;
-use game_api::GameId;
+use game_api::{GameId, PlayerId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
@@ -29,7 +30,7 @@ use tracing::{debug, info, warn};
 use self::rooms::{Export, Import};
 use self::wire::{Alive, decode, encode};
 use crate::config::ClusterConfig;
-use crate::room::{LocalRooms, RoomRef, ServerId};
+use crate::room::{LocalRooms, Rated, RoomRef, ServerId};
 
 /// How often a server says it's alive.
 pub const HEARTBEAT: Duration = Duration::from_millis(500);
@@ -67,6 +68,9 @@ pub struct Cluster {
     exports: Mutex<HashMap<crate::room::RoomId, Export>>,
     /// Rooms elsewhere with players here.
     imports: Mutex<HashMap<RoomRef, Import>>,
+    /// The sessions of players here in rated rooms elsewhere, which the
+    /// rooms' new ratings go to.
+    rated: Mutex<HashMap<PlayerId, Recipient<Rated>>>,
 }
 
 /// The start of every subject of the cluster called `name`.
@@ -129,6 +133,7 @@ impl Cluster {
             rooms,
             exports: Mutex::default(),
             imports: Mutex::default(),
+            rated: Mutex::default(),
         });
         tokio::spawn(Arc::clone(&cluster).send_queued(queued));
         cluster.listen_for_peers().await?;
@@ -146,6 +151,22 @@ impl Cluster {
 
     pub fn subject(&self, tail: &str) -> String {
         format!("{}.{tail}", self.prefix)
+    }
+
+    /// `player`'s new ratings from rated rooms elsewhere go to `session`,
+    /// for as long as it's open.
+    pub fn expect_rated(&self, player: PlayerId, session: Recipient<Rated>) {
+        self.rated.lock().unwrap().insert(player, session);
+    }
+
+    /// Where a new rating for `player` from a room elsewhere goes.
+    pub fn rated_session(&self, player: PlayerId) -> Option<Recipient<Rated>> {
+        self.rated.lock().unwrap().get(&player).cloned()
+    }
+
+    /// Forgets the sessions that have closed.
+    pub fn forget_closed_sessions(&self) {
+        self.rated.lock().unwrap().retain(|_, s| s.connected());
     }
 
     /// `<prefix>.server.<server>.<what>`: for one server's ears only.

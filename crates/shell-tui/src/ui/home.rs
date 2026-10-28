@@ -55,7 +55,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
             }
             HomeItem::Account => {
                 if let Some(shown) = app.main_rating() {
-                    spans.push(Span::styled(format!("  rating {}", shown.rating), dim));
+                    spans.push(Span::styled(format!("  rating {}", shown.text()), dim));
                 }
             }
             _ => {}
@@ -79,7 +79,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 Span::styled(profile.username.clone(), name),
             ];
             if let Some(shown) = app.main_rating() {
-                spans.push(Span::styled(format!(" · rating {}", shown.rating), dim));
+                spans.push(Span::styled(format!(" · rating {}", shown.text()), dim));
             }
             Line::from(spans)
         }

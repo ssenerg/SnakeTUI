@@ -95,14 +95,10 @@ pub enum RatingSystem {
 }
 
 impl RatingSystem {
-    /// The rating `standing` shows.
-    pub fn shown(self, standing: &crate::store::Standing) -> u32 {
-        match self {
-            RatingSystem::WengLin => standing.rating.shown(),
-            // No game of these is rated yet, so everyone shows where
-            // they start.
-            RatingSystem::Glicko2 => chess_core::rating::Rating::default().shown(),
-        }
+    /// How `game`'s ratings are worked out; Weng-Lin for a game this
+    /// server doesn't know, which it never rates.
+    pub fn of(game: GameId) -> RatingSystem {
+        get(game).map_or(RatingSystem::WengLin, |g| g.info().rating)
     }
 }
 

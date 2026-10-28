@@ -1,7 +1,7 @@
 //! Chess's part of the app: its settings, a private room's challenge, and
 //! the keys that play a game.
 
-use chess_core::control::{PRESETS, TimeControl};
+use chess_core::control::{Category as Speed, PRESET_NAMES, PRESETS, TimeControl};
 use chess_core::moves::Move;
 use chess_core::piece::{self, Piece};
 use chess_core::position::Position;
@@ -15,7 +15,7 @@ use ratatui::layout::Size;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use shell_tui::online::{Category, InRoom};
-use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickPlay, Reply, Saved};
+use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickStart, Reply, Saved};
 
 use crate::entry::{self, Entered, MAX_TYPED};
 use crate::prefs::{self, MoveInput, Prefs};
@@ -23,7 +23,7 @@ use crate::ui;
 
 /// Chess's ratings, one per category of time control, by
 /// [`chess_core::control::Category::name`].
-const RATINGS: [Category; 4] = [
+pub(crate) const RATINGS: [Category; 4] = [
     Category {
         id: "bullet",
         label: "Bullet",
@@ -51,6 +51,40 @@ pub enum ChessScreen {
     /// A private room's challenge, at row `selected`: everyone reads it,
     /// the host changes it.
     Challenge { selected: usize },
+    /// Quick pairing's presets, on [`PRESETS`]`[selected]`.
+    Pairing { selected: usize },
+}
+
+/// Quick pairing's presets as its screen lays them out: a row for each
+/// category, fastest first, of indexes into [`PRESETS`].
+pub fn pairing_rows() -> Vec<(Speed, Vec<usize>)> {
+    Speed::ALL
+        .iter()
+        .map(|&speed| {
+            let presets = (0..PRESETS.len()).filter(|&i| PRESETS[i].category() == speed);
+            (speed, presets.collect())
+        })
+        .collect()
+}
+
+/// The preset in the row above or below `selected`'s on the pairing
+/// screen, as near its column as that row allows.
+fn pairing_step(selected: usize, down: bool) -> usize {
+    let rows = pairing_rows();
+    let Some((row, col)) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(r, (_, presets))| Some((r, presets.iter().position(|&i| i == selected)?)))
+    else {
+        return selected;
+    };
+    let next = if down {
+        (row + 1).min(rows.len() - 1)
+    } else {
+        row.saturating_sub(1)
+    };
+    let presets = &rows[next].1;
+    presets[col.min(presets.len() - 1)]
 }
 
 /// What the menu a player opens with Esc during their game offers.
@@ -455,6 +489,33 @@ impl ChessUi {
         }
     }
 
+    fn pairing_key(&mut self, selected: usize, key: Key) -> Reply {
+        let selected = selected.min(PRESETS.len() - 1);
+        let moved = match key {
+            Key::Left | Key::Char('a' | 'h') => Some(selected.saturating_sub(1)),
+            Key::Right | Key::Char('d' | 'l') => Some((selected + 1).min(PRESETS.len() - 1)),
+            Key::Up | Key::Char('w' | 'k') => Some(pairing_step(selected, false)),
+            Key::Down | Key::Char('s' | 'j') => Some(pairing_step(selected, true)),
+            _ => None,
+        };
+        if let Some(selected) = moved {
+            self.screen = ChessScreen::Pairing { selected };
+            return Reply::default();
+        }
+        match key {
+            Key::Esc | Key::Char('q') => Reply::to(Next::Home),
+            Key::Enter | Key::Char(' ') => {
+                self.prefs.pairing = PRESETS[selected];
+                Reply {
+                    fx: vec![self.save()],
+                    next: Next::Queue(PRESET_NAMES[selected]),
+                    ..Reply::default()
+                }
+            }
+            _ => Reply::default(),
+        }
+    }
+
     fn challenge_key(&mut self, selected: usize, key: Key, room: Option<&InRoom>) -> Reply {
         let Some((room, view)) = room.and_then(|r| Some((r, chess_view(r)?))) else {
             return Reply::to(Next::Room);
@@ -525,8 +586,17 @@ impl GameUi for ChessUi {
         encode(&self.prefs.challenge)
     }
 
-    fn quick_play(&self, _: Size) -> Result<QuickPlay, String> {
-        Err("Quick pairing for chess is on its way. Make a private room for now, and invite a friend or share its code.".to_string())
+    fn quick_play(&mut self, _: Size) -> Result<QuickStart, String> {
+        let last = PRESETS.iter().position(|&p| p == self.prefs.pairing);
+        self.screen = ChessScreen::Pairing {
+            selected: last.unwrap_or_default(),
+        };
+        Ok(QuickStart::Choose)
+    }
+
+    fn pool_name(&self, pool: &str) -> Option<String> {
+        let i = PRESET_NAMES.iter().position(|&name| name == pool)?;
+        Some(format!("{pool} {}", speed(PRESETS[i])))
     }
 
     fn ratings(&self) -> &'static [Category] {
@@ -538,6 +608,7 @@ impl GameUi for ChessUi {
         match self.screen {
             ChessScreen::Settings => self.settings_key(key),
             ChessScreen::Challenge { selected } => self.challenge_key(selected, key, ctx.room),
+            ChessScreen::Pairing { selected } => self.pairing_key(selected, key),
         }
     }
 
@@ -674,8 +745,6 @@ impl GameUi for ChessUi {
 
 #[cfg(test)]
 mod tests {
-    use chess_core::control::Category as Speed;
-
     use super::*;
 
     #[test]
@@ -683,5 +752,18 @@ mod tests {
         let ids: Vec<&str> = RATINGS.iter().map(|c| c.id).collect();
         let speeds: Vec<&str> = Speed::ALL.iter().map(|s| s.name()).collect();
         assert_eq!(ids, speeds);
+    }
+
+    #[test]
+    fn pairing_shows_every_preset_once_and_steps_between_rows() {
+        let all: Vec<usize> = pairing_rows().into_iter().flat_map(|(_, p)| p).collect();
+        assert_eq!(all, (0..PRESETS.len()).collect::<Vec<_>>());
+        // Below bullet's 2+1 is blitz's second, 3+2.
+        assert_eq!(pairing_step(1, true), 3);
+        // Below blitz's fourth, 5+3, rapid's last, 15+10.
+        assert_eq!(pairing_step(5, true), 8);
+        assert_eq!(pairing_step(8, false), 4);
+        assert_eq!(pairing_step(0, false), 0);
+        assert_eq!(pairing_step(10, true), 10);
     }
 }

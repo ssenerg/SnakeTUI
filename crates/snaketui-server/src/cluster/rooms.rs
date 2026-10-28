@@ -24,7 +24,7 @@ use tokio::task::AbortHandle;
 use super::Cluster;
 use super::wire::{Input, JoinAs, JoinReply, JoinRequest, SeatQuery, SeatReply, WireView, decode};
 use crate::games::{self, AnyRoomView};
-use crate::room::{RoomCmd, RoomId, RoomRef, ServerId, ViewRx};
+use crate::room::{RatedNotify, RoomCmd, RoomId, RoomRef, ServerId, ViewRx};
 use crate::store::AccountId;
 
 pub const ROOM_LOST: &str = "The server running this room went away.";
@@ -121,7 +121,14 @@ impl Cluster {
         let view = match request.how {
             JoinAs::Watch => port.watch(player, presence).await,
             JoinAs::Seat { account } => port.join(request.who, account, presence).await,
-            JoinAs::Rejoin { account } => port.rejoin(request.who, account, presence).await,
+            JoinAs::Rejoin { account } => {
+                let notify = RatedNotify::There {
+                    cluster: Arc::clone(self),
+                    server: request.from,
+                    player,
+                };
+                port.rejoin(request.who, account, presence, notify).await
+            }
         }?;
         let now = view.borrow().to_wire();
         self.exports

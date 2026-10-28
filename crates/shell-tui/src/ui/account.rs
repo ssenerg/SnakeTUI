@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
         };
         lines.push(Line::from(vec![
             Span::styled("  Rating ", dim),
-            Span::styled(shown.rating.to_string(), bold.fg(Color::LightCyan)),
+            Span::styled(shown.text(), bold.fg(Color::LightCyan)),
             Span::styled(
                 format!(
                     " · {} games · {} wins in {}",

@@ -21,7 +21,7 @@ use crate::cluster::wire::{
 };
 use crate::games::{self, PoolKey};
 use crate::matcher::{Pools, Ticket};
-use crate::rating::Rating;
+use crate::rating::Skill;
 use crate::room::{
     Drain, Presence, Rated, RatedMember, RatedNotify, Ratings, RoomCmd, RoomHandle, RoomHost,
     RoomSetup, ViewRx,
@@ -32,9 +32,6 @@ const RUN_EVERY: Duration = Duration::from_secs(1);
 /// In a cluster: every waiting player is sent to the queue again this
 /// often, in case a message went missing.
 const RESEND_EVERY: Duration = Duration::from_secs(15);
-/// In a cluster: how long a player's server waits for news of their rating
-/// after their match started elsewhere.
-const RATED_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Puts a player in `pool`'s queue. They get [`Matched`] once a match
 /// forms.
@@ -44,7 +41,7 @@ pub struct Enqueue {
     pub pool: PoolKey,
     pub who: Entrant,
     pub account: Option<AccountId>,
-    pub rating: Rating,
+    pub rating: Skill,
     pub region: String,
     pub presence: Presence,
     pub reply: Recipient<Matched>,
@@ -73,7 +70,7 @@ struct Waiter {
     pool: PoolKey,
     who: Entrant,
     account: Option<AccountId>,
-    rating: Rating,
+    rating: Skill,
     region: String,
     presence: Presence,
     reply: Recipient<Matched>,
@@ -91,8 +88,6 @@ enum Queue {
         /// The queue's instance last heard from; a new one has restarted
         /// and needs every waiting player again.
         heard: Option<u64>,
-        /// Players whose match runs elsewhere, until their rating arrives.
-        rated: HashMap<PlayerId, (Recipient<Rated>, Instant)>,
     },
 }
 
@@ -122,7 +117,6 @@ impl MatchmakerActor {
             Some(cluster) => Queue::Cluster {
                 cluster,
                 heard: None,
-                rated: HashMap::new(),
             },
             None => Queue::Here {
                 matcher: Pools::default(),
@@ -342,7 +336,7 @@ impl MatchmakerActor {
         MatchedAt { player, room }: MatchedAt,
         ctx: &mut Context<Self>,
     ) {
-        let Queue::Cluster { cluster, rated, .. } = &mut self.queue else {
+        let Queue::Cluster { cluster, .. } = &mut self.queue else {
             return;
         };
         let cluster = Arc::clone(cluster);
@@ -354,7 +348,7 @@ impl MatchmakerActor {
             cluster.send_input(room, player, RoomCmd::Leave);
             return;
         };
-        rated.insert(player, (w.on_rated.clone(), Instant::now()));
+        cluster.expect_rated(player, w.on_rated.clone());
         let how = JoinAs::Seat { account: w.account };
         let join = Arc::clone(&cluster).join_remote(room, w.who.clone(), w.presence.clone(), how);
         ctx.spawn(
@@ -377,8 +371,8 @@ impl MatchmakerActor {
     }
 
     fn rated_elsewhere(&mut self, news: RatedAt) {
-        if let Queue::Cluster { rated, .. } = &mut self.queue
-            && let Some((session, _)) = rated.remove(&news.player)
+        if let Queue::Cluster { cluster, .. } = &self.queue
+            && let Some(session) = cluster.rated_session(news.player)
             && let Some(key) = games::rating_key(news.game.as_str(), &news.category)
         {
             session.do_send(Rated {
@@ -441,8 +435,8 @@ impl MatchmakerActor {
         });
         ctx.run_interval(RUN_EVERY, |act, _| {
             act.drop_gone();
-            if let Queue::Cluster { rated, .. } = &mut act.queue {
-                rated.retain(|_, (_, since)| since.elapsed() < RATED_WAIT);
+            if let Queue::Cluster { cluster, .. } = &act.queue {
+                cluster.forget_closed_sessions();
             }
         });
     }

@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::games::PoolKey;
 use crate::presence::Doing;
-use crate::rating::Rating;
+use crate::rating::Skill;
 use crate::room::{RoomCmd, RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 11;
+pub const VERSION: u8 = 12;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -64,7 +64,7 @@ pub struct QueueTicket {
     pub pool: PoolKey,
     pub who: Entrant,
     pub account: Option<AccountId>,
-    pub rating: Rating,
+    pub rating: Skill,
     pub region: String,
     pub server: ServerId,
     /// How long they've waited so far, which a restarted queue keeps.
@@ -81,7 +81,7 @@ pub struct QueueLeave {
 pub struct MatchSeat {
     pub who: Entrant,
     pub account: Option<AccountId>,
-    pub rating: Rating,
+    pub rating: Skill,
     pub server: ServerId,
 }
 
@@ -109,7 +109,7 @@ pub struct RatedAt {
     pub player: PlayerId,
     pub game: GameId,
     pub category: String,
-    pub rating: Rating,
+    pub rating: Skill,
     pub won: bool,
 }
 

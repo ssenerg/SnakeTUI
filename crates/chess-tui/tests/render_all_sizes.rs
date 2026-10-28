@@ -5,14 +5,14 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use chess_core::control::TimeControl;
+use chess_core::control::{PRESETS, TimeControl};
 use chess_core::moves::Move;
 use chess_core::round::Chess;
 use chess_core::round::ChessInput;
 use chess_tui::{BoardLook, ChessScreen, MoveInput, PieceStyle};
 use common::*;
-use game_api::{PhaseView, RoomView};
-use shell_tui::online::HomeItem;
+use game_api::{GameId, PhaseView, RatingKey, RoomView};
+use shell_tui::online::{HomeItem, Profile, ShownRating};
 use shell_tui::{App, Key, Screen};
 
 /// Every phase of a room worth drawing, with its moves and offers.
@@ -171,11 +171,46 @@ fn screens() -> Vec<App> {
     chess(&mut noted).screen = ChessScreen::Challenge { selected: 0 };
     noted.notify("ann-with-a-long-name made it 3+2 blitz".into());
     apps.push(noted);
-    // The home menu, and its notice that quick play waits.
+    // The home menu; quick pairing's presets, with every one chosen, a
+    // signed-in player's ratings and a notice; and waiting in a pool.
     apps.push(app(ANN, &views[1], home));
+    for selected in 0..PRESETS.len() {
+        let mut app = app(ANN, &views[1], home);
+        app.go_home(HomeItem::QuickPlay, None);
+        app.handle(Key::Enter);
+        chess(&mut app).screen = ChessScreen::Pairing { selected };
+        apps.push(app);
+    }
+    let rated = |app: &mut App| {
+        home(app);
+        app.online.account = Some(Profile {
+            username: "ann-with-a-long-name".into(),
+            ratings: ["bullet", "blitz", "rapid", "classical"]
+                .into_iter()
+                .map(|category| ShownRating {
+                    key: RatingKey {
+                        game: GameId::Chess,
+                        category,
+                    },
+                    rating: 2999,
+                    games: 1,
+                    wins: 0,
+                    provisional: true,
+                })
+                .collect(),
+        });
+        app.go_home(HomeItem::QuickPlay, None);
+        app.handle(Key::Enter);
+    };
+    apps.push(app(ANN, &views[1], rated));
+    let mut noted = app(ANN, &views[1], rated);
+    noted.notify("Couldn't reach the matchmaker.".into());
+    apps.push(noted);
     let mut waiting = app(ANN, &views[1], home);
     waiting.go_home(HomeItem::QuickPlay, None);
     waiting.handle(Key::Enter);
+    waiting.handle(Key::Enter);
+    assert_eq!(waiting.screen, Screen::Finding);
     apps.push(waiting);
     apps
 }

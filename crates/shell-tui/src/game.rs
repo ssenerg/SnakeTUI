@@ -12,7 +12,7 @@ use ratatui::style::Color;
 use ratatui::text::Span;
 
 use crate::key::Key;
-use crate::online::{Category, InRoom};
+use crate::online::{Category, InRoom, Profile};
 
 /// Work a game leaves to whoever runs it, in the order given.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -41,6 +41,8 @@ pub enum Next {
     Home,
     /// Back to the room they're in.
     Room,
+    /// Into quick play, waiting in this pool of the game's.
+    Queue(&'static str),
 }
 
 /// What a game made of a key.
@@ -83,6 +85,8 @@ pub struct Ctx<'a> {
     pub online: bool,
     /// The room the player is in.
     pub room: Option<&'a InRoom>,
+    /// The account they're signed in to, if any.
+    pub account: Option<&'a Profile>,
     /// Something to tell the player, until their next key.
     pub notice: Option<&'a str>,
 }
@@ -94,6 +98,7 @@ impl Ctx<'_> {
             size,
             online: false,
             room: None,
+            account: None,
             notice: None,
         }
     }
@@ -105,6 +110,16 @@ pub struct Saved {
     /// Their preferences, as the game writes them; empty for none yet.
     pub prefs: String,
     pub records: Records,
+}
+
+/// What choosing quick play does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuickStart {
+    /// Waits in one of the game's pools.
+    Queue(QuickPlay),
+    /// Opens the game's own screens, where the player picks a pool and
+    /// answers with [`Next::Queue`].
+    Choose,
 }
 
 /// How a player gets into quick play.
@@ -150,7 +165,14 @@ pub trait GameUi: Any + Send + Sync {
 
     /// How this player, on a terminal of `size`, gets into quick play; or
     /// why they can't yet.
-    fn quick_play(&self, size: Size) -> Result<QuickPlay, String>;
+    fn quick_play(&mut self, size: Size) -> Result<QuickStart, String>;
+
+    /// One of its pools as the player knows it, such as chess's "5+3
+    /// blitz", while they wait in it.
+    fn pool_name(&self, pool: &str) -> Option<String> {
+        let _ = pool;
+        None
+    }
 
     /// Its ratings, at least one, each with its own leaderboard; the first
     /// is the one the home menu shows.
