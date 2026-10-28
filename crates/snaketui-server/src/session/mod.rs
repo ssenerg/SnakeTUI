@@ -2,7 +2,7 @@
 
 mod account;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use actix::prelude::*;
 use bytes::Bytes;
-use game_api::{Entrant, GameId, JoinError, PhaseView, PlayerId};
+use game_api::{Entrant, GameId, JoinError, PhaseView, PlayerId, RatingKey, Records};
 use ratatui::layout::{Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use russh::ChannelId;
@@ -32,9 +32,8 @@ use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
 use crate::metrics::{FRAME_HOLDS, PINGS, TCP_RESENT, TCP_RTTS, TCP_SENT, UNACKED};
 use crate::presence::Doing;
-use crate::rating::{Rating, SNAKE_QUICK};
 use crate::room::{RESULTS_GRACE, RoomCmd, RoomHandle, ViewRx};
-use crate::store::{self, Account, AccountData, now};
+use crate::store::{self, Account, AccountData, Standing, now};
 use crate::tcp::TcpState;
 use crate::{Shared, Stopping};
 
@@ -256,6 +255,8 @@ impl Load {
 pub(super) struct Loads {
     pub(super) friends: Load,
     pub(super) leaderboard: Load,
+    /// The rating whose leaderboard was asked for last.
+    pub(super) leaderboard_key: Option<RatingKey>,
     pub(super) keys: Load,
 }
 
@@ -321,6 +322,8 @@ pub struct SessionActor {
     wrong_codes: u8,
     /// Signed in to this account.
     account: Option<Account>,
+    /// The account's standing in every rating it has played.
+    ratings: HashMap<RatingKey, Standing>,
     /// The game saved as the one to open next time, for the account or
     /// the key.
     last_game: Option<GameId>,
@@ -425,6 +428,7 @@ impl SessionActor {
             queued: false,
             wrong_codes: 0,
             account: None,
+            ratings: HashMap::new(),
             last_game: None,
             sign_in_failures: 0,
             invite: None,
@@ -511,25 +515,24 @@ impl SessionActor {
             match loaded {
                 Loaded::Account(AccountData {
                     account,
+                    ratings,
                     prefs,
                     records,
                     last_game,
                 }) => {
                     debug!(peer = %act.peer, user = %account.username, "signed in by key");
-                    act.open_screen(Saved { prefs, records }, last_game, ctx);
-                    act.became(account, ctx);
+                    act.open_screen(prefs, records, last_game, ctx);
+                    act.became(account, ratings, ctx);
                 }
                 Loaded::Guest(Some(saved)) => {
                     if let Some(player) = act.player.as_mut() {
                         player.nick = saved.nick;
                     }
-                    let snake = Saved {
-                        prefs: saved.prefs,
-                        records: saved.records,
-                    };
-                    act.open_screen(snake, saved.last_game, ctx);
+                    act.open_screen(saved.prefs, saved.records, saved.last_game, ctx);
                 }
-                Loaded::Guest(None) => act.open_screen(Saved::default(), None, ctx),
+                Loaded::Guest(None) => {
+                    act.open_screen(Vec::new(), Records::default(), None, ctx);
+                }
             }
             act.note_game(ctx);
             act.report_status();
@@ -537,11 +540,17 @@ impl SessionActor {
         }));
     }
 
-    /// Sets up the terminal and the app, with Snake's `saved` settings and
-    /// records. It opens the game the player asked for by their SSH
-    /// username, or else the one they played last. The caller draws the
-    /// first frame.
-    fn open_screen(&mut self, saved: Saved, last_game: Option<GameId>, ctx: &mut Context<Self>) {
+    /// Sets up the terminal and the app, with each game's saved `prefs` and
+    /// Snake's `records`. It opens the game the player asked for by their
+    /// SSH username, or else the one they played last. The caller draws
+    /// the first frame.
+    fn open_screen(
+        &mut self,
+        prefs: Vec<(GameId, String)>,
+        records: Records,
+        last_game: Option<GameId>,
+        ctx: &mut Context<Self>,
+    ) {
         let viewport = Viewport::Fixed(Rect::new(0, 0, self.size.width, self.size.height));
         let terminal = match Terminal::with_options(
             SshBackend::new(self.size),
@@ -560,7 +569,7 @@ impl SessionActor {
             self.guest_name(),
             self.fingerprint().is_some(),
         );
-        app.restore(GameId::Snake, saved);
+        restore(&mut app, prefs, records);
         self.last_game = last_game;
         if let Some(cluster) = &self.shared.cluster {
             app.set_region(QueueRegion {
@@ -796,18 +805,13 @@ impl SessionActor {
             }
             return self.render(ctx);
         }
-        // Only Snake's rating is kept so far.
-        let rating = if pool.rating() == Some(SNAKE_QUICK) {
-            self.rating()
-        } else {
-            Rating::default()
-        };
+        let rating = pool.rating().map(|key| self.standing(key).rating);
         self.queued = true;
         self.shared.matchmaker.do_send(Enqueue {
             pool,
             who: self.entrant(),
             account: self.account_id(),
-            rating,
+            rating: rating.unwrap_or_default(),
             region: self
                 .shared
                 .cluster
@@ -1023,6 +1027,25 @@ enum Loaded {
     Account(AccountData),
     /// A guest: what's saved for their key, if they have one.
     Guest(Option<store::Saved>),
+}
+
+/// Hands every game's screens what was kept for the player: each game's
+/// preferences, or none for a game they haven't changed, and Snake's
+/// records.
+fn restore(app: &mut App, prefs: Vec<(GameId, String)>, records: Records) {
+    let mut records = Some(records);
+    for game in games::GAMES.iter().map(|g| g.info().id) {
+        let prefs = prefs
+            .iter()
+            .find(|(g, _)| *g == game)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        let records = match game {
+            GameId::Snake => records.take().unwrap_or_default(),
+            _ => Records::default(),
+        };
+        app.restore(game, Saved { prefs, records });
+    }
 }
 
 /// Takes a seat in `room`.
@@ -1528,7 +1551,7 @@ mod tests {
         let steer = GameFx::Play(games::encode(&snake_core::geom::Direction::Up));
         assert!(!costly(&Effect::Game(GameId::Snake, steer)));
         assert!(
-            !costly(&Effect::LoadLeaderboard(SNAKE_QUICK)),
+            !costly(&Effect::LoadLeaderboard(crate::rating::SNAKE_QUICK)),
             "coalesced instead"
         );
     }

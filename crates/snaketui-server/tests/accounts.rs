@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::accounts::*;
 use common::*;
 use snake_core::round::{Entrant, Room, RoomKind, RoomSettings, quick_rules};
-use snaketui_server::rating::Rating;
+use snaketui_server::rating::{Rating, SNAKE_QUICK};
 use snaketui_server::store::{RatedResult, Store};
 
 #[tokio::test]
@@ -227,7 +227,7 @@ async fn the_leaderboard_lists_players_after_five_rated_games() {
                 rating: Rating { mu, sigma: 4.0 },
                 won: true,
             }];
-            store.save_rated_round(&results).await.unwrap();
+            store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();
         }
     }
     store.close().await;

@@ -24,6 +24,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 use tracing::{info, warn};
 
+use crate::games::{self, RatingSystem};
 use crate::rating::{self, Rating, RatingKey, SNAKE_QUICK};
 use crate::room::{RoomRef, ServerId};
 
@@ -214,6 +215,12 @@ const MIGRATIONS: &[Migration] = &[
         postgres: POSTGRES_PER_GAME,
         breaks_older: false,
     },
+    Migration {
+        name: "catch up the copies for each game",
+        sqlite: RECONCILE,
+        postgres: RECONCILE,
+        breaks_older: false,
+    },
 ];
 
 /// Step 2: ratings and settings are kept for each game, apart, starting
@@ -311,30 +318,85 @@ SELECT fingerprint, 'snake', config, last_seen FROM players WHERE config <> ''
 ON CONFLICT DO NOTHING;
 ";
 
-/// The game whose settings the accounts' and players' `config` columns
-/// hold, and that their copies in `account_prefs` and `player_prefs` are
-/// kept for.
-const SNAKE: &str = SNAKE_QUICK.game.as_str();
+/// Step 3: from here on, ratings and settings are read from step 2's tables.
+/// Servers from before step 2 wrote only the accounts' and players' own
+/// columns, so whatever they wrote after step 2's copy is copied again: a
+/// rating with more games is newer, since games only go up, and settings
+/// are copied where there are none yet. The same SQL suits both databases.
+const RECONCILE: &str = "
+INSERT INTO ratings
+    (account_id, game, category, rating, deviation, volatility, games, wins, draws, rated_at)
+SELECT id, 'snake', 'ffa', rating_mu, rating_sigma, NULL, games, wins, 0, last_seen
+FROM accounts WHERE games > 0
+ON CONFLICT (account_id, game, category) DO UPDATE SET
+    rating = excluded.rating, deviation = excluded.deviation,
+    games = excluded.games, wins = excluded.wins, rated_at = excluded.rated_at
+WHERE excluded.games > ratings.games;
+INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+SELECT id, 'snake', config, last_seen FROM accounts WHERE config <> ''
+ON CONFLICT DO NOTHING;
+INSERT INTO player_prefs (fingerprint, game, prefs, updated_at)
+SELECT fingerprint, 'snake', config, last_seen FROM players WHERE config <> ''
+ON CONFLICT DO NOTHING;
+";
 
-/// Copies an account's quick-play rating, as just saved in `accounts`,
-/// into `ratings`, so the two stay the same until `ratings` is what's read.
-async fn mirror_rating(conn: &mut AnyConnection, id: AccountId) -> Result<()> {
-    sqlx::query(
+/// `id`'s standing in `key`; a new player's if they haven't played it.
+async fn standing(conn: &mut AnyConnection, id: AccountId, key: RatingKey) -> Result<Standing> {
+    let row = sqlx::query(
+        "SELECT rating, deviation, games, wins FROM ratings
+         WHERE account_id = $1 AND game = $2 AND category = $3",
+    )
+    .bind(id)
+    .bind(key.game.as_str())
+    .bind(key.category)
+    .fetch_optional(conn)
+    .await?;
+    row.map_or(Ok(Standing::default()), |row| standing_from(&row, 0))
+}
+
+/// Saves `id`'s new `rating` in `key` after a rated round, counting the
+/// round and any win. Snake's quick play also goes in the account's own
+/// columns, which servers from before step 3 read.
+async fn save_standing(
+    conn: &mut AnyConnection,
+    id: AccountId,
+    key: RatingKey,
+    rating: Rating,
+    won: bool,
+) -> Result<()> {
+    let row = sqlx::query(
         "INSERT INTO ratings
              (account_id, game, category, rating, deviation, volatility,
               games, wins, draws, rated_at)
-         SELECT id, $2, $3, rating_mu, rating_sigma, NULL, games, wins, 0, $4
-         FROM accounts WHERE id = $1
+         VALUES ($1, $2, $3, $4, $5, NULL, 1, $6, 0, $7)
          ON CONFLICT (account_id, game, category) DO UPDATE SET
              rating = excluded.rating, deviation = excluded.deviation,
-             games = excluded.games, wins = excluded.wins, rated_at = excluded.rated_at",
+             games = ratings.games + 1, wins = ratings.wins + excluded.wins,
+             rated_at = excluded.rated_at
+         RETURNING games, wins",
     )
     .bind(id)
-    .bind(SNAKE)
-    .bind(SNAKE_QUICK.category)
+    .bind(key.game.as_str())
+    .bind(key.category)
+    .bind(rating.mu)
+    .bind(rating.sigma)
+    .bind(i64::from(won))
     .bind(now())
-    .execute(conn)
+    .fetch_one(&mut *conn)
     .await?;
+    if key == SNAKE_QUICK {
+        sqlx::query(
+            "UPDATE accounts SET rating_mu = $2, rating_sigma = $3, games = $4, wins = $5
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(rating.mu)
+        .bind(rating.sigma)
+        .bind(row.try_get::<i64, _>(0)?)
+        .bind(row.try_get::<i64, _>(1)?)
+        .execute(conn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -416,7 +478,7 @@ pub type AccountId = i64;
 /// it are still fixed strings.
 macro_rules! account_columns {
     () => {
-        "id, username, rating_mu, rating_sigma, games, wins"
+        "id, username"
     };
 }
 
@@ -428,27 +490,38 @@ pub struct Store {
 /// What's saved for a returning guest with a key.
 pub struct Saved {
     pub nick: String,
-    /// Snake's preferences, as Snake writes them.
-    pub prefs: String,
+    /// Each game's preferences they changed, as the game writes them.
+    pub prefs: Vec<(GameId, String)>,
+    /// Snake's records.
     pub records: Records,
     /// The game they played last, if this server knows it.
     pub last_game: Option<GameId>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     pub id: AccountId,
     pub username: String,
+}
+
+/// An account's standing in one rating: how good it's thought to be, and
+/// its rated games.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Standing {
     pub rating: Rating,
     pub games: u32,
     pub wins: u32,
 }
 
-/// An account with its settings and records, as a session needs it.
+/// An account with its ratings, settings and records, as a session needs
+/// it.
 pub struct AccountData {
     pub account: Account,
-    /// Snake's preferences, as Snake writes them.
-    pub prefs: String,
+    /// Every rating it has played in; the rest are a new player's.
+    pub ratings: Vec<(RatingKey, Standing)>,
+    /// Each game's preferences, as the game writes them.
+    pub prefs: Vec<(GameId, String)>,
+    /// Snake's records.
     pub records: Records,
     /// The game they played last, if this server knows it.
     pub last_game: Option<GameId>,
@@ -472,9 +545,7 @@ pub struct Friend {
 #[derive(Clone, Debug)]
 pub struct Ranked {
     pub username: String,
-    pub rating: Rating,
-    pub games: u32,
-    pub wins: u32,
+    pub standing: Standing,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -629,20 +700,23 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
-        let player =
-            sqlx::query("SELECT nick, config, last_game FROM players WHERE fingerprint = $1")
-                .bind(fingerprint)
-                .fetch_one(&self.pool)
-                .await?;
+        let player = sqlx::query("SELECT nick, last_game FROM players WHERE fingerprint = $1")
+            .bind(fingerprint)
+            .fetch_one(&self.pool)
+            .await?;
+        let prefs = sqlx::query("SELECT game, prefs FROM player_prefs WHERE fingerprint = $1")
+            .bind(fingerprint)
+            .fetch_all(&self.pool)
+            .await?;
         let rows = sqlx::query("SELECT record_key, best FROM solo_records WHERE fingerprint = $1")
             .bind(fingerprint)
             .fetch_all(&self.pool)
             .await?;
         Ok(Saved {
             nick: player.try_get(0)?,
-            prefs: player.try_get(1)?,
+            prefs: prefs_from(prefs)?,
             records: records_from(rows)?,
-            last_game: game_from(player.try_get(2)?),
+            last_game: game_from(player.try_get(1)?),
         })
     }
 
@@ -658,8 +732,7 @@ impl Store {
     /// Keeps a guest's preferences in `game`, as the game writes them.
     pub async fn save_prefs(&self, fingerprint: &str, game: GameId, text: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        // Snake's are read from here until every server reads them from
-        // `player_prefs`.
+        // Snake's also go where servers from before step 3 read them.
         if game == GameId::Snake {
             sqlx::query("UPDATE players SET config = $2 WHERE fingerprint = $1")
                 .bind(fingerprint)
@@ -712,16 +785,21 @@ impl Store {
     // Accounts.
 
     /// Makes an account, remembered by `key` if there is one; `prefs`
-    /// (Snake's) and `records` are what the guest had. `Ok(None)` if the
-    /// username is taken, ignoring case.
+    /// (each game's) and `records` (Snake's) are what the guest had.
+    /// `Ok(None)` if the username is taken, ignoring case.
     pub async fn create_account(
         &self,
         username: &str,
         password_hash: &str,
         key: Option<&str>,
-        prefs: &str,
+        prefs: &[(GameId, String)],
         records: &Records,
     ) -> Result<Option<Account>> {
+        // Snake's also go where servers from before step 3 read them.
+        let snake = prefs
+            .iter()
+            .find(|(game, _)| *game == GameId::Snake)
+            .map_or("", |(_, text)| text.as_str());
         let mut tx = self.pool.begin().await?;
         let start = Rating::default();
         let created = sqlx::query(
@@ -732,7 +810,7 @@ impl Store {
         )
         .bind(username)
         .bind(password_hash)
-        .bind(prefs)
+        .bind(snake)
         .bind(start.mu)
         .bind(start.sigma)
         .bind(now())
@@ -743,16 +821,18 @@ impl Store {
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        sqlx::query(
-            "INSERT INTO account_prefs (account_id, game, prefs, updated_at)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(SNAKE)
-        .bind(prefs)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+        for (game, text) in prefs {
+            sqlx::query(
+                "INSERT INTO account_prefs (account_id, game, prefs, updated_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(game.as_str())
+            .bind(text)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        }
         for (record_key, best) in records.iter() {
             sqlx::query(
                 "INSERT INTO account_records (account_id, record_key, best) VALUES ($1, $2, $3)",
@@ -779,9 +859,6 @@ impl Store {
         Ok(Some(Account {
             id,
             username: username.to_string(),
-            rating: start,
-            games: 0,
-            wins: 0,
         }))
     }
 
@@ -811,7 +888,7 @@ impl Store {
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| Ok((account_from(&row)?, row.try_get(6)?)))
+        row.map(|row| Ok((account_from(&row)?, row.try_get(2)?)))
             .transpose()
     }
 
@@ -825,11 +902,15 @@ impl Store {
         let row = sqlx::query(concat!(
             "SELECT ",
             account_columns!(),
-            ", config, last_game FROM accounts WHERE id = $1"
+            ", last_game FROM accounts WHERE id = $1"
         ))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
+        let prefs = sqlx::query("SELECT game, prefs FROM account_prefs WHERE account_id = $1")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
         let rows =
             sqlx::query("SELECT record_key, best FROM account_records WHERE account_id = $1")
                 .bind(id)
@@ -837,10 +918,30 @@ impl Store {
                 .await?;
         Ok(AccountData {
             account: account_from(&row)?,
-            prefs: row.try_get(6)?,
+            ratings: self.ratings(id).await?,
+            prefs: prefs_from(prefs)?,
             records: records_from(rows)?,
-            last_game: game_from(row.try_get(7)?),
+            last_game: game_from(row.try_get(2)?),
         })
+    }
+
+    /// Every rating `id` has played in, in games this server serves.
+    pub async fn ratings(&self, id: AccountId) -> Result<Vec<(RatingKey, Standing)>> {
+        let rows = sqlx::query(
+            "SELECT game, category, rating, deviation, games, wins FROM ratings
+             WHERE account_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ratings = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (game, category): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+            if let Some(key) = games::rating_key(&game, &category) {
+                ratings.push((key, standing_from(&row, 2)?));
+            }
+        }
+        Ok(ratings)
     }
 
     /// Notes that the account was just around, for friends' lists.
@@ -952,20 +1053,25 @@ impl Store {
         Ok(())
     }
 
-    /// Rates a round between these accounts, given each one's place (1 is
-    /// first) and whether they won: works out their new ratings from the
-    /// ones saved now, saves them, and answers each account's rating
-    /// before and after, in the same order. Rounds ending at once, with
-    /// the same account in both, take turns, so neither overwrites the
-    /// other. Only Snake's quick-play ratings are kept so far.
+    /// Rates a round between these accounts in the rating `key`, given each
+    /// one's place (1 is first) and whether they won: works out their new
+    /// ratings from the ones saved now, saves them, and answers each
+    /// account's rating before and after, in the same order. Rounds ending
+    /// at once, with the same account in both, take turns, so neither
+    /// overwrites the other. Only Weng-Lin ratings are worked out so far.
     pub async fn rate_round(
         &self,
         key: RatingKey,
         players: &[(AccountId, usize, bool)],
     ) -> Result<Vec<(Rating, Rating)>> {
-        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
+        let system = games::get(key.game).map(|g| g.info().rating);
+        anyhow::ensure!(
+            system == Some(RatingSystem::WengLin)
+                && games::rating_key(key.game.as_str(), key.category) == Some(key),
+            "no ratings are worked out for {key:?}"
+        );
         let mut tx = self.pool.begin().await?;
-        // Taking each row's lock first, in one order for every round.
+        // Taking each account's lock first, in one order for every round.
         let mut ids: Vec<AccountId> = players.iter().map(|p| p.0).collect();
         ids.sort_unstable();
         for id in &ids {
@@ -976,52 +1082,22 @@ impl Store {
         }
         let mut before = Vec::with_capacity(players.len());
         for &(id, place, _) in players {
-            let row = sqlx::query("SELECT rating_mu, rating_sigma FROM accounts WHERE id = $1")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
-            let now = Rating {
-                mu: row.try_get(0)?,
-                sigma: row.try_get(1)?,
-            };
-            before.push((now, place));
+            before.push((standing(&mut tx, id, key).await?.rating, place));
         }
         let after = rating::after_round(&before);
-        for (&(id, _, won), rating) in players.iter().zip(&after) {
-            sqlx::query(
-                "UPDATE accounts SET rating_mu = $2, rating_sigma = $3,
-                     games = games + 1, wins = wins + $4
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(rating.mu)
-            .bind(rating.sigma)
-            .bind(i64::from(won))
-            .execute(&mut *tx)
-            .await?;
-            mirror_rating(&mut tx, id).await?;
+        for (&(id, _, won), &rating) in players.iter().zip(&after) {
+            save_standing(&mut tx, id, key, rating, won).await?;
         }
         tx.commit().await?;
         Ok(before.into_iter().map(|(r, _)| r).zip(after).collect())
     }
 
-    /// Saves everyone's new rating after a quick-play round, and counts the
+    /// Saves everyone's new rating in `key` after a round, and counts the
     /// game and any win.
-    pub async fn save_rated_round(&self, results: &[RatedResult]) -> Result<()> {
+    pub async fn save_rated_round(&self, key: RatingKey, results: &[RatedResult]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for r in results {
-            sqlx::query(
-                "UPDATE accounts SET rating_mu = $2, rating_sigma = $3,
-                     games = games + 1, wins = wins + $4
-                 WHERE id = $1",
-            )
-            .bind(r.account)
-            .bind(r.rating.mu)
-            .bind(r.rating.sigma)
-            .bind(i64::from(r.won))
-            .execute(&mut *tx)
-            .await?;
-            mirror_rating(&mut tx, r.account).await?;
+            save_standing(&mut tx, r.account, key, r.rating, r.won).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1029,20 +1105,21 @@ impl Store {
 
     /// The best accounts by the rating `key` with at least `min_games`
     /// rated games, best first: by rating, then games played, then name.
-    /// Only Snake's quick-play ratings are kept so far.
     pub async fn leaderboard(
         &self,
         key: RatingKey,
         min_games: u32,
         limit: u32,
     ) -> Result<Vec<Ranked>> {
-        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
         let rows = sqlx::query(
-            "SELECT username, rating_mu, rating_sigma, games, wins FROM accounts
-             WHERE games >= $1
-             ORDER BY rating_mu DESC, games DESC, lower(username)
-             LIMIT $2",
+            "SELECT a.username, r.rating, r.deviation, r.games, r.wins
+             FROM ratings r JOIN accounts a ON a.id = r.account_id
+             WHERE r.game = $1 AND r.category = $2 AND r.games >= $3
+             ORDER BY r.rating DESC, r.games DESC, lower(a.username)
+             LIMIT $4",
         )
+        .bind(key.game.as_str())
+        .bind(key.category)
         .bind(i64::from(min_games))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -1051,47 +1128,52 @@ impl Store {
             .map(|row| {
                 Ok(Ranked {
                     username: row.try_get(0)?,
-                    rating: Rating {
-                        mu: row.try_get(1)?,
-                        sigma: row.try_get(2)?,
-                    },
-                    games: row.try_get::<i64, _>(3)? as u32,
-                    wins: row.try_get::<i64, _>(4)? as u32,
+                    standing: standing_from(row, 1)?,
                 })
             })
             .collect()
     }
 
-    /// Where `account` stands on [`Self::leaderboard`], 1 for the best;
-    /// `None` until it has `min_games` rated games.
+    /// Where `account` stands on [`Self::leaderboard`] for `key`, 1 for the
+    /// best; `None` until it has `min_games` rated games.
     pub async fn place_of(
         &self,
         key: RatingKey,
         account: AccountId,
         min_games: u32,
     ) -> Result<Option<u32>> {
-        anyhow::ensure!(key == SNAKE_QUICK, "no ratings are kept for {key:?}");
         let min_games = i64::from(min_games);
         let ahead = sqlx::query(
-            "SELECT COUNT(*) FROM accounts o, accounts me
-             WHERE me.id = $1 AND me.games >= $2 AND o.games >= $2
-               AND (o.rating_mu > me.rating_mu
-                    OR (o.rating_mu = me.rating_mu
+            "SELECT COUNT(*)
+             FROM ratings o JOIN accounts oa ON oa.id = o.account_id,
+                  ratings me JOIN accounts ma ON ma.id = me.account_id
+             WHERE me.account_id = $1 AND me.game = $2 AND me.category = $3
+               AND o.game = $2 AND o.category = $3
+               AND me.games >= $4 AND o.games >= $4
+               AND (o.rating > me.rating
+                    OR (o.rating = me.rating
                         AND (o.games > me.games
                              OR (o.games = me.games
-                                 AND lower(o.username) < lower(me.username)))))",
+                                 AND lower(oa.username) < lower(ma.username)))))",
         )
         .bind(account)
+        .bind(key.game.as_str())
+        .bind(key.category)
         .bind(min_games)
         .fetch_one(&self.pool)
         .await?
         .try_get::<i64, _>(0)?;
-        let ranked = sqlx::query("SELECT 1 FROM accounts WHERE id = $1 AND games >= $2")
-            .bind(account)
-            .bind(min_games)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some();
+        let ranked = sqlx::query(
+            "SELECT 1 FROM ratings
+             WHERE account_id = $1 AND game = $2 AND category = $3 AND games >= $4",
+        )
+        .bind(account)
+        .bind(key.game.as_str())
+        .bind(key.category)
+        .bind(min_games)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
         Ok(ranked.then_some(ahead as u32 + 1))
     }
 
@@ -1387,13 +1469,32 @@ fn account_from(row: &AnyRow) -> Result<Account> {
     Ok(Account {
         id: row.try_get(0)?,
         username: row.try_get(1)?,
-        rating: Rating {
-            mu: row.try_get(2)?,
-            sigma: row.try_get(3)?,
-        },
-        games: row.try_get::<i64, _>(4)? as u32,
-        wins: row.try_get::<i64, _>(5)? as u32,
     })
+}
+
+/// A standing from `rating, deviation, games, wins`, starting at column
+/// `at`.
+fn standing_from(row: &AnyRow, at: usize) -> Result<Standing> {
+    Ok(Standing {
+        rating: Rating {
+            mu: row.try_get(at)?,
+            sigma: row.try_get(at + 1)?,
+        },
+        games: row.try_get::<i64, _>(at + 2)? as u32,
+        wins: row.try_get::<i64, _>(at + 3)? as u32,
+    })
+}
+
+/// Each game's preferences from `game, prefs` rows, leaving out games this
+/// server doesn't know.
+fn prefs_from(rows: Vec<AnyRow>) -> Result<Vec<(GameId, String)>> {
+    let mut prefs = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(game) = GameId::from_name(&row.try_get::<String, _>(0)?) {
+            prefs.push((game, row.try_get(1)?));
+        }
+    }
+    Ok(prefs)
 }
 
 fn records_from(rows: Vec<AnyRow>) -> Result<Records> {
@@ -1497,6 +1598,7 @@ mod tests {
         room_codes_are_claimed_once_and_expire,
         snake_ratings_and_settings_are_copied_for_the_game,
         the_last_game_is_kept_for_guests_and_accounts,
+        each_rating_is_ranked_apart,
     );
 
     async fn sqlite() -> Store {
@@ -1533,6 +1635,7 @@ mod tests {
         a_database_from_before_migrations_is_taken_as_step_one,
         newer_databases_are_refused_only_when_they_must_be,
         step_two_copies_what_was_saved_for_snake,
+        step_three_catches_up_what_older_servers_wrote,
     );
 
     /// A SQLite file in the temporary directory, removed afterwards.
@@ -1662,6 +1765,83 @@ mod tests {
         assert!(refused.contains("newer code"), "{refused}");
     }
 
+    async fn step_three_catches_up_what_older_servers_wrote(url: String) {
+        let postgres = !url.starts_with("sqlite");
+        let sql = |step: &Migration| if postgres { step.postgres } else { step.sqlite };
+        let mut conn = raw(&url).await;
+        let account = |id: i64, name: &'static str, config: &'static str, mu: f64, games: i64| {
+            sqlx::query(
+                "INSERT INTO accounts (id, username, password_hash, config, rating_mu,
+                     rating_sigma, games, wins, created_at, last_seen)
+                 VALUES ($1, $2, 'hash', $3, $4, 5.0, $5, 1, 1, 2)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(config)
+            .bind(mu)
+            .bind(games)
+        };
+        // Step 1, with an account that had played, then step 2's copy.
+        sqlx::raw_sql(sql(&MIGRATIONS[0]))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        account(1, "ann", "width=40\n", 30.0, 7)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        account(4, "dan", "", 25.0, 3)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(sql(&MIGRATIONS[1]))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATIONS_TABLE)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for version in [1_i64, 2] {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, needs, applied_at) \
+                 VALUES ($1, 'earlier', 0, 0)",
+            )
+            .bind(version)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        // Then a server from before step 2, which only knows the accounts'
+        // own columns: ann played twice more, and cat signed up and played.
+        sqlx::query("UPDATE accounts SET rating_mu = 33.0, games = 9, wins = 5 WHERE id = 1")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        account(3, "cat", "width=50\n", 27.0, 2)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // And a copy that's ahead of the account's columns stays as it is.
+        sqlx::query("UPDATE ratings SET games = 4, rating = 26.0 WHERE account_id = 4")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = Store::open(&url).await.unwrap();
+        assert_eq!(steps(&url).await, every_step());
+        let ann = quick(&store, 1).await;
+        assert_eq!((ann.rating.mu, ann.games, ann.wins), (33.0, 9, 5));
+        let cat = store.load_account(3).await.unwrap();
+        assert_eq!(cat.prefs, [(GameId::Snake, "width=50\n".to_string())]);
+        assert_eq!(quick(&store, 3).await.games, 2);
+        let dan = quick(&store, 4).await;
+        assert_eq!((dan.rating.mu, dan.games), (26.0, 4), "the newer one");
+        let ann = store.load_account(1).await.unwrap();
+        assert_eq!(ann.prefs, [(GameId::Snake, "width=40\n".to_string())]);
+    }
+
     async fn step_two_copies_what_was_saved_for_snake(url: String) {
         // Saved by the code from before steps: a rated account, a new one,
         // and two guests with a key, one of whom changed settings.
@@ -1783,10 +1963,7 @@ mod tests {
     async fn settings_and_records_survive_a_reconnect(store: Store) {
         let first = store.visit("SHA256:abc", "alice").await.unwrap();
         assert_eq!(first.nick, "alice");
-        assert_eq!(
-            GameConfig::from_saved_text(&first.prefs),
-            GameConfig::default()
-        );
+        assert_eq!(first.prefs, [], "nothing changed yet");
 
         let mut cfg = GameConfig::default();
         cfg.adjust(0, 3);
@@ -1807,7 +1984,7 @@ mod tests {
         assert_eq!(again.nick, "alice", "the first name sticks");
         store.set_nick("SHA256:abc", "alicia").await.unwrap();
         assert_eq!(store.visit("SHA256:abc", "x").await.unwrap().nick, "alicia");
-        assert_eq!(again.prefs, cfg.to_saved_text());
+        assert_eq!(again.prefs, [(GameId::Snake, cfg.to_saved_text())]);
         assert_eq!(again.records.get("size:30x20"), 12, "records only go up");
         let other = store.visit("SHA256:xyz", "bob").await.unwrap();
         assert_eq!(other.records.get("size:30x20"), 0);
@@ -1815,10 +1992,20 @@ mod tests {
 
     async fn account(store: &Store, name: &str, key: Option<&str>) -> Account {
         store
-            .create_account(name, "hash", key, "", &Records::default())
+            .create_account(name, "hash", key, &[], &Records::default())
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// `id`'s standing in Snake's quick play, as a session loads it.
+    async fn quick(store: &Store, id: AccountId) -> Standing {
+        let ratings = store.load_account(id).await.unwrap().ratings;
+        ratings
+            .into_iter()
+            .find(|(key, _)| *key == SNAKE_QUICK)
+            .map(|(_, standing)| standing)
+            .unwrap_or_default()
     }
 
     async fn snake_ratings_and_settings_are_copied_for_the_game(store: Store) {
@@ -1860,7 +2047,7 @@ mod tests {
                 "ann",
                 "hash",
                 Some("SHA256:ann"),
-                &wide.to_saved_text(),
+                &[(GameId::Snake, wide.to_saved_text())],
                 &Records::default(),
             )
             .await
@@ -1879,17 +2066,16 @@ mod tests {
             .unwrap();
         assert_eq!(account_prefs(ann.id).await, Some(fast.to_saved_text()));
 
-        // Ratings, as each account has them.
+        // Ratings, also where older servers read them.
         let ben = account(&store, "ben", None).await;
         store
             .rate_round(SNAKE_QUICK, &[(ann.id, 1, true), (ben.id, 2, false)])
             .await
             .unwrap();
         for id in [ann.id, ben.id] {
-            let account = store.load_account(id).await.unwrap().account;
-            let copy = sqlx::query(
-                "SELECT rating, deviation, games, wins FROM ratings
-                 WHERE account_id = $1 AND game = 'snake' AND category = 'ffa'",
+            let standing = quick(&store, id).await;
+            let old = sqlx::query(
+                "SELECT rating_mu, rating_sigma, games, wins FROM accounts WHERE id = $1",
             )
             .bind(id)
             .fetch_one(&store.pool)
@@ -1897,19 +2083,58 @@ mod tests {
             .unwrap();
             assert_eq!(
                 (
-                    copy.try_get::<f64, _>(0).unwrap(),
-                    copy.try_get::<f64, _>(1).unwrap(),
-                    copy.try_get::<i64, _>(2).unwrap(),
-                    copy.try_get::<i64, _>(3).unwrap(),
+                    old.try_get::<f64, _>(0).unwrap(),
+                    old.try_get::<f64, _>(1).unwrap(),
+                    old.try_get::<i64, _>(2).unwrap(),
+                    old.try_get::<i64, _>(3).unwrap(),
                 ),
                 (
-                    account.rating.mu,
-                    account.rating.sigma,
-                    i64::from(account.games),
-                    i64::from(account.wins),
+                    standing.rating.mu,
+                    standing.rating.sigma,
+                    i64::from(standing.games),
+                    i64::from(standing.wins),
                 )
             );
+            assert_eq!(standing.games, 1);
         }
+    }
+
+    async fn each_rating_is_ranked_apart(store: Store) {
+        // A category this server's games don't have, as a newer server's
+        // might.
+        let duels = RatingKey {
+            game: GameId::Snake,
+            category: "duel",
+        };
+        let ann = account(&store, "ann", None).await;
+        let ben = account(&store, "ben", None).await;
+        let rating = Rating {
+            mu: 30.0,
+            sigma: 4.0,
+        };
+        for (who, key) in [(ann.id, duels), (ben.id, SNAKE_QUICK)] {
+            for _ in 0..5 {
+                let results = [RatedResult {
+                    account: who,
+                    rating,
+                    won: true,
+                }];
+                store.save_rated_round(key, &results).await.unwrap();
+            }
+        }
+        let names = |board: Vec<Ranked>| board.into_iter().map(|r| r.username).collect::<Vec<_>>();
+        let quick_board = store.leaderboard(SNAKE_QUICK, 5, 20).await.unwrap();
+        assert_eq!(names(quick_board), ["ben"]);
+        let duel_board = store.leaderboard(duels, 5, 20).await.unwrap();
+        assert_eq!(names(duel_board), ["ann"]);
+        assert_eq!(store.place_of(duels, ann.id, 5).await.unwrap(), Some(1));
+        assert_eq!(store.place_of(duels, ben.id, 5).await.unwrap(), None);
+        assert_eq!(quick(&store, ann.id).await.games, 0, "not quick play's");
+        let ratings = store.load_account(ann.id).await.unwrap().ratings;
+        assert!(ratings.is_empty(), "not a rating here: {ratings:?}");
+        let round = [(ann.id, 1, true), (ben.id, 2, false)];
+        let refused = store.rate_round(duels, &round).await;
+        assert!(refused.is_err(), "only ratings this server keeps");
     }
 
     async fn the_last_game_is_kept_for_guests_and_accounts(store: Store) {
@@ -1948,13 +2173,13 @@ mod tests {
     async fn usernames_are_unique_ignoring_case(store: Store) {
         account(&store, "Alice", None).await;
         let clash = store
-            .create_account("aLICE", "h", None, "", &Records::default())
+            .create_account("aLICE", "h", None, &[], &Records::default())
             .await
             .unwrap();
         assert!(clash.is_none());
         let (found, hash) = store.find_account("ALICE").await.unwrap().unwrap();
         assert_eq!((found.username.as_str(), hash.as_str()), ("Alice", "hash"));
-        assert_eq!(found.rating.shown(), 1000);
+        assert_eq!(quick(&store, found.id).await.rating.shown(), 1000);
     }
 
     async fn signing_up_with_a_key_brings_the_guest_profile_along(store: Store) {
@@ -1968,7 +2193,7 @@ mod tests {
                 "alice",
                 "h",
                 Some("SHA256:k1"),
-                &cfg.to_saved_text(),
+                &[(GameId::Snake, cfg.to_saved_text())],
                 &records,
             )
             .await
@@ -1976,7 +2201,7 @@ mod tests {
             .unwrap();
         let data = store.account_for_key("SHA256:k1").await.unwrap().unwrap();
         assert_eq!(data.account.id, made.id);
-        assert_eq!(data.prefs, cfg.to_saved_text());
+        assert_eq!(data.prefs, [(GameId::Snake, cfg.to_saved_text())]);
         assert_eq!(data.records.get("size:30x20"), 9);
         let guest = store.visit("SHA256:k1", "x").await.unwrap();
         assert_eq!(
@@ -2029,7 +2254,7 @@ mod tests {
             rating: strong,
             won: true,
         }];
-        store.save_rated_round(&results).await.unwrap();
+        store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();
 
         let changes = store
             .rate_round(SNAKE_QUICK, &[(ann.id, 2, false), (ben.id, 1, true)])
@@ -2037,11 +2262,11 @@ mod tests {
             .unwrap();
         assert_eq!(changes[0].0, strong, "rated from what's saved");
         assert!(changes[0].1.mu < strong.mu && changes[1].1.mu > changes[1].0.mu);
-        let ann_now = store.load_account(ann.id).await.unwrap();
-        assert_eq!(ann_now.account.rating, changes[0].1);
-        assert_eq!((ann_now.account.games, ann_now.account.wins), (2, 1));
-        let ben_now = store.load_account(ben.id).await.unwrap();
-        assert_eq!((ben_now.account.games, ben_now.account.wins), (1, 1));
+        let ann_now = quick(&store, ann.id).await;
+        assert_eq!(ann_now.rating, changes[0].1);
+        assert_eq!((ann_now.games, ann_now.wins), (2, 1));
+        let ben_now = quick(&store, ben.id).await;
+        assert_eq!((ben_now.games, ben_now.wins), (1, 1));
     }
 
     async fn rated_rounds_count_games_wins_and_new_ratings(store: Store) {
@@ -2051,14 +2276,17 @@ mod tests {
             sigma: 7.0,
         };
         store
-            .save_rated_round(&[RatedResult {
-                account: a.id,
-                rating: better,
-                won: true,
-            }])
+            .save_rated_round(
+                SNAKE_QUICK,
+                &[RatedResult {
+                    account: a.id,
+                    rating: better,
+                    won: true,
+                }],
+            )
             .await
             .unwrap();
-        let after = store.load_account(a.id).await.unwrap().account;
+        let after = quick(&store, a.id).await;
         assert_eq!((after.games, after.wins, after.rating), (1, 1, better));
     }
 
@@ -2075,7 +2303,7 @@ mod tests {
                         rating,
                         won,
                     }];
-                    store.save_rated_round(&results).await.unwrap();
+                    store.save_rated_round(SNAKE_QUICK, &results).await.unwrap();
                 }
             }
         };
@@ -2091,8 +2319,8 @@ mod tests {
         let names = |board: Vec<Ranked>| board.into_iter().map(|r| r.username).collect::<Vec<_>>();
         let board = store.leaderboard(SNAKE_QUICK, 5, 20).await.unwrap();
         assert_eq!(names(board.clone()), ["ben", "Dan", "ann"]);
-        assert_eq!((board[0].games, board[0].wins), (6, 3));
-        assert_eq!(board[0].rating.mu, 27.0);
+        assert_eq!((board[0].standing.games, board[0].standing.wins), (6, 3));
+        assert_eq!(board[0].standing.rating.mu, 27.0);
         assert_eq!(
             names(store.leaderboard(SNAKE_QUICK, 5, 2).await.unwrap()),
             ["ben", "Dan"]

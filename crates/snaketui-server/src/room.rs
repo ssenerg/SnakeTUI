@@ -15,8 +15,8 @@ use actix::prelude::*;
 use actix_rt::ArbiterHandle;
 use futures::future::BoxFuture;
 use game_api::{
-    Entrant, GameId, JoinError, PhaseView, Placement, PlayerId, RatingChange, RatingKey, Room,
-    RoomKind, RoomView, RoundEnd,
+    Entrant, JoinError, PhaseView, Placement, PlayerId, RatingChange, RatingKey, Room, RoomKind,
+    RoomView, RoundEnd,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -317,7 +317,8 @@ impl RoomHandle {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Rated {
-    pub game: GameId,
+    /// The rating the round changed.
+    pub key: RatingKey,
     pub rating: Rating,
     pub won: bool,
 }
@@ -358,7 +359,8 @@ impl RatedNotify {
             } => {
                 let news = RatedAt {
                     player: *player,
-                    game: rated.game,
+                    game: rated.key.game,
+                    category: rated.key.category.to_string(),
                     rating: rated.rating,
                     won: rated.won,
                 };
@@ -588,7 +590,7 @@ impl<G: Served> RoomActor<G> {
             {
                 if let Some(notify) = notify {
                     notify.send(Rated {
-                        game: key.game,
+                        key,
                         rating: after,
                         won: *won,
                     });

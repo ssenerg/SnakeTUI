@@ -4,12 +4,12 @@
 use std::time::Duration;
 
 use game_api::codec::encode;
-use game_api::{AnyView, PlayerId, RatingKey};
+use game_api::{AnyView, PlayerId};
 use ratatui::Frame;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::text::Span;
-use shell_tui::online::InRoom;
+use shell_tui::online::{Category, InRoom};
 use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickPlay, Reply, Saved};
 use snake_core::config::{GameConfig, Rules, TICK_MS_MAX, TICK_MS_MIN, TICK_MS_STEP};
 use snake_core::geom::Direction;
@@ -274,8 +274,11 @@ impl GameUi for SnakeUi {
         }
     }
 
-    fn leaderboard(&self) -> RatingKey {
-        QUICK_RATING
+    fn ratings(&self) -> &'static [Category] {
+        &[Category {
+            id: QUICK_RATING.category,
+            label: "Quick play",
+        }]
     }
 
     fn bots(&self) -> bool {

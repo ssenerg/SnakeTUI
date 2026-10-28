@@ -10,8 +10,10 @@ use super::centered_rect;
 use crate::app::App;
 use crate::online::{LeaderRow, MyPlace, RANKED_AFTER};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &App, category: usize) {
     let online = &app.online;
+    let categories = app.ui().ratings();
+    let label = categories[category.min(categories.len() - 1)].label;
     let [body_area, footer_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(frame.area());
     let dim = Style::default().fg(Color::DarkGray);
@@ -25,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Some(view) if view.rows.is_empty() => vec![
             Line::default(),
             Line::from(format!("Nobody has played {RANKED_AFTER} rated games yet.")).centered(),
-            Line::styled("Quick play is rated.", dim).centered(),
+            Line::styled(format!("{label} is rated."), dim).centered(),
             Line::default(),
         ],
         Some(view) => {
@@ -56,11 +58,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     };
 
+    // Which game's, and which of its ratings, when there's a choice.
+    let mut title = " Leaderboard ".to_string();
+    if app.games().count() > 1 {
+        title.push_str(&format!("· {} ", app.ui().title()));
+    }
+    if categories.len() > 1 {
+        title.push_str(&format!("· {label} "));
+    }
     let rect = centered_rect(body_area, 48, lines.len() as u16 + 2);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim)
-        .title(" Leaderboard ")
+        .title(title)
         .title_alignment(Alignment::Center);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -93,7 +103,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Cyan),
         ),
     };
-    let footer = vec![status, Line::styled("Esc back", dim)];
+    let keys = if categories.len() > 1 {
+        "←→ rating · Esc back"
+    } else {
+        "Esc back"
+    };
+    let footer = vec![status, Line::styled(keys, dim)];
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)

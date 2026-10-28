@@ -55,7 +55,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
         Screen::Account { selected } => account::draw(frame, app, selected),
         Screen::Friends { selected } => friends::draw(frame, app, selected),
-        Screen::Leaderboard => leaderboard::draw(frame, app),
+        Screen::Leaderboard { category } => leaderboard::draw(frame, app, category),
         Screen::JoiningToWatch => {
             friends::draw(frame, app, 0);
             dialogs::draw_joining(frame);

@@ -133,8 +133,8 @@ Guests can play everything except friends and ratings. To get those, pick
 - **Your settings and records come along.** If you played as a guest with a
   key before signing up, your single-player settings and records move into
   the new account.
-- **Account** shows your rating, games and wins, and the machines that sign
-  you in, each of which you can remove. You can change your password there,
+- **Account** shows your rating, games and wins in the game you have open,
+  and the machines that sign you in, each of which you can remove. You can change your password there,
   or sign out, which also forgets this machine.
 - **Friends.** Add a friend by username. They accept in their own Friends
   screen, and if they're online they hear about it at once. Your list shows
@@ -153,9 +153,11 @@ Guests can play everything except friends and ratings. To get those, pick
   results show by how much. Quick play looks for players of a close rating
   first, and widens the range the longer you wait. Only accounts are rated,
   against each other: guests can join rated matches, but beating them, or
-  losing to them, doesn't count.
-- **Leaderboard**, on the home screen, lists the top 20 accounts by rating,
-  and your own place. You're listed after 5 rated games.
+  losing to them, doesn't count. Each game keeps its own ratings, and a game
+  can keep several apart, as chess will its time controls.
+- **Leaderboard**, on the home screen, lists the open game's top 20 accounts
+  by rating, and your own place; ←→ picks another of its ratings, when it has
+  several. You're listed after 5 rated games.
 - **Passwords** are typed into the game's own masked form, never into ssh's
   password prompt, which stays off. The server keeps only an Argon2id hash.
   A connection closes after 5 wrong tries, and 5 wrong tries for one username

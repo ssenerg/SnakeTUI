@@ -24,7 +24,9 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
     draw_logo(frame, app, logo_area);
 
     let rows = online.account_rows();
-    let rect = centered_rect(body_area, 64, rows.len() as u16 + 9);
+    let categories = app.ui().ratings();
+    let height = rows.len() + categories.len() + 8;
+    let rect = centered_rect(body_area, 64, height as u16);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -35,22 +37,31 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
 
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    let mut lines = vec![
-        Line::default(),
-        Line::from(vec![
+    let mut lines = vec![Line::default()];
+    // The open game's ratings, each kept apart.
+    for (i, category) in categories.iter().enumerate() {
+        let Some(shown) = profile.rating(app.rating_key(i)) else {
+            continue;
+        };
+        lines.push(Line::from(vec![
             Span::styled("  Rating ", dim),
-            Span::styled(profile.rating.to_string(), bold.fg(Color::LightCyan)),
+            Span::styled(shown.rating.to_string(), bold.fg(Color::LightCyan)),
             Span::styled(
                 format!(
-                    " · {} games · {} wins in quick play",
-                    profile.games, profile.wins
+                    " · {} games · {} wins in {}",
+                    shown.games,
+                    shown.wins,
+                    category.label.to_lowercase()
                 ),
                 dim,
             ),
-        ]),
-        Line::default(),
-        Line::styled("  Machines that sign you in by themselves", dim),
-    ];
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  Machines that sign you in by themselves",
+        dim,
+    ));
     if online.keys.is_empty() {
         lines.push(Line::styled("    none", dim));
     }

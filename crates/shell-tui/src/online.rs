@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use game_api::{AnyView, GameId, PlayerId, SeatView, ShellView};
+use game_api::{AnyView, GameId, PlayerId, RatingKey, SeatView, ShellView};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Longest password, in characters; they're all ASCII.
@@ -187,13 +187,37 @@ pub struct Form {
     pub busy: bool,
 }
 
-/// The signed-in account, as shown, with its rating in the open game.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Profile {
-    pub username: String,
+/// One of a game's ratings, kept apart from its others, as chess keeps
+/// blitz apart from bullet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Category {
+    /// As the server keys it, such as Snake's `ffa`.
+    pub id: &'static str,
+    /// As players see it, such as "Quick play".
+    pub label: &'static str,
+}
+
+/// An account's rating in one category, as shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShownRating {
+    pub key: RatingKey,
     pub rating: u32,
     pub games: u32,
     pub wins: u32,
+}
+
+/// The signed-in account, as shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub username: String,
+    /// Its rating in every category of every game, played or not.
+    pub ratings: Vec<ShownRating>,
+}
+
+impl Profile {
+    pub fn rating(&self, key: RatingKey) -> Option<&ShownRating> {
+        self.ratings.iter().find(|r| r.key == key)
+    }
 }
 
 /// A key the account is remembered by.
@@ -264,6 +288,8 @@ pub enum MyPlace {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaderboardView {
+    /// The rating it ranks by.
+    pub key: RatingKey,
     /// The best players, best first.
     pub rows: Vec<LeaderRow>,
     pub me: MyPlace,

@@ -10,6 +10,7 @@ use ratatui::layout::Size;
 use shell_tui::app::BOTS_OFFERED_AFTER;
 use shell_tui::online::{
     Field, FormKind, FormRow, FriendRow, FriendsView, HomeItem, LeaderboardView, MyPlace, Profile,
+    ShownRating,
 };
 use shell_tui::{App, Effect, GameFx, Key, Screen};
 use snake_core::config::{Rules, TICK_MS_MAX, TICK_MS_MIN};
@@ -35,6 +36,16 @@ fn quick_play() -> Effect {
     }
 }
 
+/// A Snake quick-play rating as an account shows it.
+fn snake_rating(rating: u32, games: u32, wins: u32) -> ShownRating {
+    ShownRating {
+        key: QUICK_RATING,
+        rating,
+        games,
+        wins,
+    }
+}
+
 fn snake(app: &App) -> &SnakeUi {
     app.game_ui().expect("Snake")
 }
@@ -50,9 +61,7 @@ fn signed_in() -> App {
     let mut app = online();
     app.set_profile(Some(Profile {
         username: "alice".into(),
-        rating: 1000,
-        games: 0,
-        wins: 0,
+        ratings: vec![snake_rating(1000, 0, 0)],
     }));
     app
 }
@@ -346,8 +355,9 @@ fn the_leaderboard_sits_above_quit_and_loads_fresh_each_time() {
             choose(&mut app, HomeItem::Leaderboard),
             [Effect::LoadLeaderboard(QUICK_RATING)]
         );
-        assert_eq!(app.screen, Screen::Leaderboard);
+        assert_eq!(app.screen, Screen::Leaderboard { category: 0 });
         app.set_leaderboard(LeaderboardView {
+            key: QUICK_RATING,
             rows: Vec::new(),
             me: MyPlace::Guest,
         });
@@ -362,7 +372,7 @@ fn the_leaderboard_sits_above_quit_and_loads_fresh_each_time() {
             "the old list is gone until the new one loads"
         );
         assert_eq!(app.handle(Key::Char('x')), []);
-        assert_eq!(app.screen, Screen::Leaderboard);
+        assert_eq!(app.screen, Screen::Leaderboard { category: 0 });
         app.handle(Key::Enter);
         assert_eq!(app.screen, Screen::Home { selected: at });
     }
@@ -426,9 +436,7 @@ fn sign_in_offers_to_remember_only_a_machine_with_a_key() {
     ));
     app.signed_in(Profile {
         username: "alice".into(),
-        rating: 1040,
-        games: 3,
-        wins: 1,
+        ratings: vec![snake_rating(1040, 3, 1)],
     });
     assert!(app.home_items().contains(&HomeItem::Account));
 }

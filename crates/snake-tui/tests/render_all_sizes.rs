@@ -11,14 +11,15 @@ use ratatui::layout::Size;
 use shell_tui::app::BOTS_OFFERED_AFTER;
 use shell_tui::online::{
     Field, FormKind, FriendRow, FriendsView, KeyRow, LeaderRow, LeaderboardView, MyPlace, Profile,
-    QueueRegion,
+    QueueRegion, ShownRating,
 };
 use shell_tui::{App, Screen};
 use snake_core::config::{GameConfig, Rules};
 use snake_core::records::Records;
 use snake_core::round::RatingChange;
 use snake_core::round::{
-    Entrant, PhaseView, Room, RoomKind, RoomSettings, RoomView, bot_entrant, quick_rules,
+    Entrant, PhaseView, QUICK_RATING, Room, RoomKind, RoomSettings, RoomView, bot_entrant,
+    quick_rules,
 };
 use snake_core::solo::{GameOverReason, SoloGame};
 use snake_tui::{SnakeScreen, SnakeUi, ui};
@@ -34,6 +35,16 @@ fn snake(app: &mut App) -> &mut SnakeUi {
     app.game_ui_mut().expect("Snake")
 }
 
+/// A Snake quick-play rating as an account shows it.
+fn snake_rating(rating: u32, games: u32, wins: u32) -> ShownRating {
+    ShownRating {
+        key: QUICK_RATING,
+        rating,
+        games,
+        wins,
+    }
+}
+
 /// A leaderboard of `len` players with long names, and `me`.
 fn leaderboard(len: u32, me: MyPlace) -> LeaderboardView {
     let rows = (1..=len)
@@ -45,7 +56,11 @@ fn leaderboard(len: u32, me: MyPlace) -> LeaderboardView {
             wins: 50,
         })
         .collect();
-    LeaderboardView { rows, me }
+    LeaderboardView {
+        key: QUICK_RATING,
+        rows,
+        me,
+    }
 }
 
 fn ranked(place: u32) -> MyPlace {
@@ -222,9 +237,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         let mut app = new_app(screen);
         app.set_profile(Some(Profile {
             username: "player0123456789".into(),
-            rating: 1043,
-            games: 12,
-            wins: 4,
+            ratings: vec![snake_rating(1043, 12, 4)],
         }));
         let online = &mut app.online;
         online.requests = 2;
@@ -270,7 +283,7 @@ fn online_screens(rules: &Rules) -> Vec<App> {
     for selected in [0, 2, 5, 23] {
         apps.push(account(Screen::Friends { selected }));
     }
-    apps.push(account(Screen::Leaderboard));
+    apps.push(account(Screen::Leaderboard { category: 0 }));
     for (signed_in, view) in [
         (false, leaderboard(0, MyPlace::Guest)),
         (false, leaderboard(20, MyPlace::Guest)),
@@ -279,9 +292,9 @@ fn online_screens(rules: &Rules) -> Vec<App> {
         (true, leaderboard(4, MyPlace::Unranked { games_left: 1 })),
     ] {
         let mut app = if signed_in {
-            account(Screen::Leaderboard)
+            account(Screen::Leaderboard { category: 0 })
         } else {
-            new_app(Screen::Leaderboard)
+            new_app(Screen::Leaderboard { category: 0 })
         };
         app.set_leaderboard(view);
         apps.push(app);
@@ -602,7 +615,7 @@ fn only_the_host_sees_how_to_change_the_speed() {
 fn the_leaderboard_shows_what_fits_and_always_your_place() {
     let app = |view: Option<LeaderboardView>| {
         let mut app = app_with(GameConfig::default(), "~guest");
-        app.screen = Screen::Leaderboard;
+        app.screen = Screen::Leaderboard { category: 0 };
         if let Some(view) = view {
             app.set_leaderboard(view);
         }

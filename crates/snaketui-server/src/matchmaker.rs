@@ -378,9 +378,10 @@ impl MatchmakerActor {
     fn rated_elsewhere(&mut self, news: RatedAt) {
         if let Queue::Cluster { rated, .. } = &mut self.queue
             && let Some((session, _)) = rated.remove(&news.player)
+            && let Some(key) = games::rating_key(news.game.as_str(), &news.category)
         {
             session.do_send(Rated {
-                game: news.game,
+                key,
                 rating: news.rating,
                 won: news.won,
             });

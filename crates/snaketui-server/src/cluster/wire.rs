@@ -16,7 +16,7 @@ use crate::rating::Rating;
 use crate::room::{RoomCmd, RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 9;
+pub const VERSION: u8 = 10;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {
@@ -102,11 +102,13 @@ pub struct MatchedAt {
     pub room: RoomRef,
 }
 
-/// To a player's server: how their last match moved their rating.
+/// To a player's server: how their last match moved their rating in a
+/// game's `category`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct RatedAt {
     pub player: PlayerId,
     pub game: GameId,
+    pub category: String,
     pub rating: Rating,
     pub won: bool,
 }

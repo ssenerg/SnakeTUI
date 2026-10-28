@@ -150,6 +150,18 @@ pub fn get(id: GameId) -> Option<&'static dyn GameServer> {
     GAMES.iter().copied().find(|g| g.info().id == id)
 }
 
+/// The rating a database names `game` and `category`, if this server
+/// serves that game and the game has that rating.
+pub fn rating_key(game: &str, category: &str) -> Option<RatingKey> {
+    let game = get(GameId::from_name(game)?)?;
+    let info = game.info();
+    let category = info.categories.iter().find(|c| **c == category)?;
+    Some(RatingKey {
+        game: info.id,
+        category,
+    })
+}
+
 /// The game a player asked for by connecting as `ssh <user>@…`, such as
 /// `snake`, ignoring case.
 pub fn for_ssh_user(user: &str) -> Option<GameId> {

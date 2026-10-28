@@ -5,14 +5,14 @@
 use std::any::Any;
 use std::time::Duration;
 
-use game_api::{AnyView, GameId, PhaseView, PlayerId, RatingKey, Records};
+use game_api::{AnyView, GameId, PhaseView, PlayerId, Records};
 use ratatui::Frame;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::text::Span;
 
 use crate::key::Key;
-use crate::online::InRoom;
+use crate::online::{Category, InRoom};
 
 /// Work a game leaves to whoever runs it, in the order given.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -151,8 +151,9 @@ pub trait GameUi: Any + Send + Sync {
     /// How this player, on a terminal of `size`, gets into quick play.
     fn quick_play(&self, size: Size) -> QuickPlay;
 
-    /// The rating the leaderboard ranks players by.
-    fn leaderboard(&self) -> RatingKey;
+    /// Its ratings, at least one, each with its own leaderboard; the first
+    /// is the one the home menu shows.
+    fn ratings(&self) -> &'static [Category];
 
     /// Whether its rooms take bots, which hosts add and quick play offers.
     fn bots(&self) -> bool {

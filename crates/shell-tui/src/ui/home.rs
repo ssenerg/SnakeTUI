@@ -54,8 +54,8 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 ));
             }
             HomeItem::Account => {
-                if let Some(profile) = &online.account {
-                    spans.push(Span::styled(format!("  rating {}", profile.rating), dim));
+                if let Some(shown) = app.main_rating() {
+                    spans.push(Span::styled(format!("  rating {}", shown.rating), dim));
                 }
             }
             _ => {}
@@ -73,11 +73,16 @@ pub fn draw(frame: &mut Frame, app: &App, selected: usize) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        (None, Some(profile)) => Line::from(vec![
-            Span::styled("Signed in as ", dim),
-            Span::styled(profile.username.clone(), name),
-            Span::styled(format!(" · rating {}", profile.rating), dim),
-        ]),
+        (None, Some(profile)) => {
+            let mut spans = vec![
+                Span::styled("Signed in as ", dim),
+                Span::styled(profile.username.clone(), name),
+            ];
+            if let Some(shown) = app.main_rating() {
+                spans.push(Span::styled(format!(" · rating {}", shown.rating), dim));
+            }
+            Line::from(spans)
+        }
         (None, None) => Line::from(vec![
             Span::styled("Playing as ", dim),
             Span::styled(online.name.clone(), name),

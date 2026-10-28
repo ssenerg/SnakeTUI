@@ -13,7 +13,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 
-use crate::online::{HomeItem, InRoom};
+use crate::online::{Category, HomeItem, InRoom, LeaderboardView, MyPlace, Profile, ShownRating};
 use crate::{App, Ctx, Effect, GameUi, Key, QuickPlay, Screen, ui};
 
 /// A game with nothing to it, played as Snake or as Chess, so the app
@@ -93,11 +93,17 @@ impl GameUi for ToyUi {
         }
     }
 
-    fn leaderboard(&self) -> RatingKey {
-        RatingKey {
-            game: self.id,
-            category: "duel",
-        }
+    fn ratings(&self) -> &'static [Category] {
+        &[
+            Category {
+                id: "duel",
+                label: "Duels",
+            },
+            Category {
+                id: "brawl",
+                label: "Brawls",
+            },
+        ]
     }
 
     fn draw_round(&self, _: &mut Frame, _: &InRoom, _: &Ctx) {}
@@ -280,11 +286,18 @@ fn invites_to_another_game_say_which() {
 }
 
 #[test]
-fn the_picker_draws_at_every_size() {
+fn the_picker_and_games_ratings_draw_at_every_size() {
     let apps = [app(None), app(Some(GameId::Chess))].map(|mut app| {
         app.screen = Screen::Picker { selected: 1 };
         app
     });
+    let mut account = app(Some(GameId::Snake));
+    sign_in(&mut account);
+    account.screen = Screen::Account { selected: 0 };
+    let mut board_shown = app(Some(GameId::Snake));
+    board_shown.screen = Screen::Leaderboard { category: 1 };
+    board_shown.set_leaderboard(board(key(GameId::Snake, "brawl")));
+    let apps: Vec<App> = apps.into_iter().chain([account, board_shown]).collect();
     for w in 1..=90 {
         for h in 1..=30 {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -313,4 +326,103 @@ fn hosts_of_games_without_bots_add_none() {
     let lobby = shown(&app);
     assert!(!lobby.contains("add a bot"), "{lobby}");
     assert!(lobby.contains("Enter ready · Esc leave"), "{lobby}");
+}
+
+fn key(game: GameId, category: &'static str) -> RatingKey {
+    RatingKey { game, category }
+}
+
+/// Signed in as ann, with a rating in each of both games' categories.
+fn sign_in(app: &mut App) {
+    let shown = |key, rating, games, wins| ShownRating {
+        key,
+        rating,
+        games,
+        wins,
+    };
+    app.set_profile(Some(Profile {
+        username: "ann".into(),
+        ratings: vec![
+            shown(key(GameId::Snake, "duel"), 1100, 3, 2),
+            shown(key(GameId::Snake, "brawl"), 900, 1, 0),
+            shown(key(GameId::Chess, "duel"), 1500, 0, 0),
+            shown(key(GameId::Chess, "brawl"), 1500, 0, 0),
+        ],
+    }));
+}
+
+fn board(key: RatingKey) -> LeaderboardView {
+    LeaderboardView {
+        key,
+        rows: Vec::new(),
+        me: MyPlace::Guest,
+    }
+}
+
+#[test]
+fn each_rating_has_its_own_leaderboard() {
+    let mut app = app(Some(GameId::Snake));
+    let at = app
+        .home_items()
+        .iter()
+        .position(|i| *i == HomeItem::Leaderboard);
+    app.screen = Screen::Home {
+        selected: at.unwrap(),
+    };
+    let duels = key(GameId::Snake, "duel");
+    let brawls = key(GameId::Snake, "brawl");
+    assert_eq!(app.handle(Key::Enter), [Effect::LoadLeaderboard(duels)]);
+    assert_eq!(app.screen, Screen::Leaderboard { category: 0 });
+    assert!(shown(&app).contains("Leaderboard · Snake · Duels"));
+
+    assert_eq!(app.handle(Key::Right), [Effect::LoadLeaderboard(brawls)]);
+    assert_eq!(app.screen, Screen::Leaderboard { category: 1 });
+    // The duels' board, answering too late, is dropped.
+    app.set_leaderboard(board(duels));
+    assert_eq!(app.online.leaderboard, None);
+    app.set_leaderboard(board(brawls));
+    assert!(app.online.leaderboard.is_some());
+    let brawl = shown(&app);
+    assert!(brawl.contains("Brawls is rated."), "{brawl}");
+    assert!(brawl.contains("←→ rating · Esc back"), "{brawl}");
+
+    assert_eq!(app.handle(Key::Char('d')), [Effect::LoadLeaderboard(duels)]);
+    assert_eq!(app.online.leaderboard, None, "loads afresh");
+    assert_eq!(app.handle(Key::Left), [Effect::LoadLeaderboard(brawls)]);
+    app.handle(Key::Esc);
+    assert!(matches!(app.screen, Screen::Home { .. }));
+}
+
+#[test]
+fn the_account_shows_the_open_games_ratings() {
+    let mut app = app(Some(GameId::Snake));
+    sign_in(&mut app);
+    let home = shown(&app);
+    assert!(home.contains("Signed in as ann · rating 1100"), "{home}");
+    app.screen = Screen::Account { selected: 0 };
+    let account = shown(&app);
+    assert!(
+        account.contains("Rating 1100 · 3 games · 2 wins in duels"),
+        "{account}"
+    );
+    assert!(
+        account.contains("Rating 900 · 1 games · 0 wins in brawls"),
+        "{account}"
+    );
+
+    // A rated round moves only its own rating.
+    app.rated(key(GameId::Snake, "brawl"), 950, true);
+    let profile = app.online.account.as_ref().unwrap();
+    let brawl = profile.rating(key(GameId::Snake, "brawl")).unwrap();
+    assert_eq!((brawl.rating, brawl.games, brawl.wins), (950, 2, 1));
+    let duel = profile.rating(key(GameId::Snake, "duel")).unwrap();
+    assert_eq!((duel.rating, duel.games), (1100, 3));
+
+    // Another game shows its own.
+    app.screen = Screen::Home { selected: 0 };
+    app.handle(Key::Char('g'));
+    app.handle(Key::Down);
+    app.handle(Key::Enter);
+    assert_eq!(app.game(), Some(GameId::Chess));
+    assert!(shown(&app).contains("rating 1500"));
 }

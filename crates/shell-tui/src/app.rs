@@ -13,7 +13,7 @@ use crate::game::{Ctx, GameFx, GameUi, Next, Reply, Saved};
 use crate::key::Key;
 use crate::online::{
     AccountRow, Field, Form, FormKind, FormRow, FriendsRow, FriendsView, HomeItem, InRoom, Invite,
-    KeyRow, LeaderboardView, Online, Profile, QueueRegion, Secret,
+    KeyRow, LeaderboardView, Online, Profile, QueueRegion, Secret, ShownRating,
 };
 
 /// How long quick play waits for people before offering a match against
@@ -40,8 +40,9 @@ pub enum Screen {
     Account { selected: usize },
     /// Friends and friend requests.
     Friends { selected: usize },
-    /// The best players by rating.
-    Leaderboard,
+    /// The best players by the open game's rating number `category`, in
+    /// [`GameUi::ratings`].
+    Leaderboard { category: usize },
     /// On the way to watching a friend's game.
     JoiningToWatch,
     /// The open game's own screens, such as Snake's single player, or a
@@ -335,7 +336,7 @@ impl App {
             Screen::Form(kind) => self.form_key(kind, key, effects),
             Screen::Account { selected } => self.account_key(selected, key, effects),
             Screen::Friends { selected } => self.friends_key(selected, key, effects),
-            Screen::Leaderboard => self.leaderboard_key(key),
+            Screen::Leaderboard { category } => self.leaderboard_keys(category, key, effects),
             Screen::Game => self.game_key(key, effects),
         }
     }
@@ -552,12 +553,7 @@ impl App {
             HomeItem::SignUp => self.start_form(FormKind::SignUp),
             HomeItem::SignIn => self.start_form(FormKind::SignIn),
             HomeItem::Games => self.pick_game(),
-            HomeItem::Leaderboard => {
-                // Fresh every time, so it never shows old places.
-                self.online.leaderboard = None;
-                self.screen = Screen::Leaderboard;
-                effects.push(Effect::LoadLeaderboard(self.ui().leaderboard()));
-            }
+            HomeItem::Leaderboard => self.show_leaderboard(0, effects),
             HomeItem::Quit => effects.push(Effect::Quit),
         }
     }
@@ -851,9 +847,40 @@ impl App {
         }
     }
 
-    fn leaderboard_key(&mut self, key: Key) {
-        if matches!(key, Key::Esc | Key::Enter | Key::Char('q')) {
-            self.go_home(HomeItem::Leaderboard, None);
+    /// The open game's rating number `category`, in [`GameUi::ratings`].
+    pub fn rating_key(&self, category: usize) -> RatingKey {
+        let ratings = self.ui().ratings();
+        RatingKey {
+            game: self.ui().id(),
+            category: ratings[category.min(ratings.len() - 1)].id,
+        }
+    }
+
+    /// The account's rating that the home menu shows: the open game's
+    /// first.
+    pub fn main_rating(&self) -> Option<&ShownRating> {
+        self.online.account.as_ref()?.rating(self.rating_key(0))
+    }
+
+    fn show_leaderboard(&mut self, category: usize, effects: &mut Vec<Effect>) {
+        // Fresh every time, so it never shows old places.
+        self.online.leaderboard = None;
+        self.screen = Screen::Leaderboard { category };
+        effects.push(Effect::LoadLeaderboard(self.rating_key(category)));
+    }
+
+    fn leaderboard_keys(&mut self, category: usize, key: Key, effects: &mut Vec<Effect>) {
+        let len = self.ui().ratings().len();
+        match key {
+            Key::Esc | Key::Enter | Key::Char('q') => self.go_home(HomeItem::Leaderboard, None),
+            // The game's other ratings, when it has some.
+            Key::Left | Key::Char('a' | 'h') if len > 1 => {
+                self.show_leaderboard(category.checked_sub(1).unwrap_or(len - 1), effects);
+            }
+            Key::Right | Key::Char('d' | 'l') if len > 1 => {
+                self.show_leaderboard((category + 1) % len, effects);
+            }
+            _ => {}
         }
     }
 
@@ -1149,7 +1176,14 @@ impl App {
         }
     }
 
+    /// The leaderboard loaded; one for another rating than the one now
+    /// showing is too late, and dropped.
     pub fn set_leaderboard(&mut self, view: LeaderboardView) {
+        if let Screen::Leaderboard { category } = self.screen
+            && view.key != self.rating_key(category)
+        {
+            return;
+        }
         self.online.leaderboard = Some(view);
     }
 
@@ -1171,12 +1205,23 @@ impl App {
         ));
     }
 
-    /// A rated round moved this player's rating.
-    pub fn rated(&mut self, rating: u32, won: bool) {
-        if let Some(profile) = self.online.account.as_mut() {
-            profile.rating = rating;
-            profile.games += 1;
-            profile.wins += u32::from(won);
+    /// A rated round moved this player's rating `key`.
+    pub fn rated(&mut self, key: RatingKey, rating: u32, won: bool) {
+        let Some(profile) = self.online.account.as_mut() else {
+            return;
+        };
+        match profile.ratings.iter_mut().find(|r| r.key == key) {
+            Some(shown) => {
+                shown.rating = rating;
+                shown.games += 1;
+                shown.wins += u32::from(won);
+            }
+            None => profile.ratings.push(ShownRating {
+                key,
+                rating,
+                games: 1,
+                wins: u32::from(won),
+            }),
         }
     }
 }
