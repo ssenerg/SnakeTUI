@@ -1092,12 +1092,13 @@ impl SessionActor {
                         PhaseView::Closed { reason } => Some(reason.clone()),
                         _ => None,
                     };
-                    if open {
-                        app.update_room(latest);
+                    let effects = if open {
+                        app.update_room(latest)
                     } else {
                         // The room is gone. Its last view may say why.
                         app.room_closed(reason);
-                    }
+                        Vec::new()
+                    };
                     if open && app.in_room() {
                         let watch = act.watch_room(view, stay, ctx);
                         if let Some(room) = act.room.as_mut() {
@@ -1107,6 +1108,7 @@ impl SessionActor {
                         // The room carries on without this player: say so.
                         link.room.leave(act.id);
                     }
+                    act.apply(effects, ctx);
                     act.report_status();
                     act.render(ctx);
                     act.leave_if_free(ctx);

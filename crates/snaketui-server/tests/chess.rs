@@ -329,3 +329,17 @@ async fn iterm2_shows_pieces_as_pictures_and_the_mouse_moves_them() {
     play(&mut ben, "1. e4", "e5").await;
     ann.wait_for("1. e4      e5").await;
 }
+
+#[tokio::test]
+async fn a_premove_is_played_the_moment_the_other_side_moves() {
+    let server = chess_server();
+    let (mut ann, mut ben) = (guest(&server).await, guest(&server).await);
+    challenge(&mut ann, &mut ben, &[]).await;
+    start(&mut ann, &mut ben).await;
+    // Ben, black, types his answer while white still thinks.
+    ben.send(b"e5\r").await;
+    ben.wait_for("Premove e5").await;
+    play(&mut ann, "", "e4").await;
+    ann.wait_for("1. e4      e5").await;
+    ann.wait_for("Your move").await;
+}

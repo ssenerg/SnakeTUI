@@ -154,6 +154,15 @@ fn screens() -> Vec<App> {
         app.show_pictures((8, 16));
         typed(app, "e8\r");
     }));
+    // A premove waiting; and where a piece picked up can go, as pictures.
+    apps.push(app(BEN, &views[3], |app| {
+        typed(app, "e5\r");
+    }));
+    apps.push(app(ANN, &views[3], |app| {
+        app.show_pictures((8, 16));
+        app.handle(Key::Up);
+        app.handle(Key::Enter);
+    }));
     let mut preview = app(ANN, &views[1], home);
     preview.show_pictures((8, 16));
     preview.screen = Screen::Game;

@@ -164,14 +164,18 @@ opens it, and new players choose between the two.
   one move fits. Or pick a piece with the arrows and Enter, then its
   square. Esc opens a menu to offer or accept a draw, resign (it asks
   first), abort before both sides have moved, and flip the board.
+- **Premoves.** A move made while the other side thinks, typed or picked,
+  waits and is played the moment your turn comes, if it's legal then; a
+  pawn reaching the end becomes a queen. Backspace, or a click on another
+  square, calls it off. They're on unless the settings turn them off.
 - **Clocks** are the server's, with the increment added after each move
   and a little of each move's lag given back. Each side has 30 seconds for
   their first move, or the game is aborted.
 - **Settings**, on chess's home menu: the board's colors, pieces as
   pictures or not, glyphs or letters for them otherwise (some terminals
-  draw the glyphs badly), coordinates,
-  promoting to a queen without asking, whether letter keys type moves or
-  move the cursor like WASD and HJKL, and asking before resigning.
+  draw the glyphs badly), coordinates, promoting to a queen without
+  asking, premoves, whether letter keys type moves or move the cursor like
+  WASD and HJKL, and asking before resigning.
 - **Dropped connections.** If a signed-in player's connection drops
   mid-game, or they quit, their seat waits 90 seconds while their clock
   runs on; the other player sees how long. Connecting again, with their

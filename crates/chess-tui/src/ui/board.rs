@@ -53,6 +53,8 @@ pub struct Marks {
     pub from: Vec<Square>,
     /// Where it can go.
     pub to: Vec<Square>,
+    /// The move waiting for the player's turn.
+    pub premove: Option<(Square, Square)>,
 }
 
 /// Light and dark squares.
@@ -70,8 +72,9 @@ const LAST: (Color, Color) = (Color::Indexed(186), Color::Indexed(143));
 const FROM: Color = Color::Indexed(113);
 const TARGET: Color = Color::Indexed(174);
 const CURSOR: Color = Color::Indexed(117);
+const PREMOVE: Color = Color::Indexed(140);
 const CHECK: Color = Color::Indexed(167);
-const DOT: Color = Color::Indexed(58);
+pub(super) const DOT: Color = Color::Indexed(58);
 
 pub fn piece_color(color: piece::Color) -> Color {
     match color {
@@ -115,6 +118,29 @@ fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
     }
 }
 
+/// The mark for where a piece can go, in the middle of the square at `at`
+/// of `size`: half blocks where the middle falls between rows or columns,
+/// so it's centered either way.
+fn dot(buf: &mut Buffer, at: (u16, u16), size: SquareSize, bg: Color) {
+    let ((x, y), (w, h)) = (at, size);
+    let style = Style::default().fg(DOT).bg(bg);
+    let (cx, cy) = (x + w / 2, y + h / 2);
+    match (w % 2 == 1, h % 2 == 1) {
+        (true, true) => put(buf, cx, cy, "●", style),
+        (true, false) => {
+            put(buf, cx, cy - 1, "▄", style);
+            put(buf, cx, cy, "▀", style);
+        }
+        (false, false) if w >= 4 => {
+            for dx in [cx - 1, cx] {
+                put(buf, dx, cy - 1, "▄", style);
+                put(buf, dx, cy, "▀", style);
+            }
+        }
+        _ => put(buf, x + (w - 1) / 2, y + (h - 1) / 2, "•", style),
+    }
+}
+
 /// Draws `position` with its top left at `at`, its squares `square` big,
 /// as `prefs` say, and `bottom`'s side at the bottom.
 #[allow(clippy::too_many_arguments)]
@@ -149,6 +175,11 @@ pub fn draw(
                 CHECK
             } else if marks.from.contains(&sq) {
                 FROM
+            } else if marks
+                .premove
+                .is_some_and(|(from, to)| sq == from || sq == to)
+            {
+                PREMOVE
             } else if marks.to.contains(&sq) && piece.is_some() {
                 TARGET
             } else if last {
@@ -176,15 +207,20 @@ pub fn draw(
                         .add_modifier(Modifier::BOLD);
                     put(buf, mid, top, symbol(prefs.pieces, color, kind), style);
                 }
-                None if marks.to.contains(&sq) => {
-                    put(buf, mid, top, "•", Style::default().fg(DOT).bg(bg));
-                }
+                None if marks.to.contains(&sq) => dot(buf, (x, y), square, bg),
                 None => {}
             }
             let area = Rect::new(x, y, w, h);
-            if let (Some(pictures), Some((color, kind))) = (pictures, piece) {
+            if let Some(pictures) = pictures {
                 let size = pictures::pixels(square, pictures.cell);
-                pictures.place(buf, area, pictures::picture(color, kind, bg, size));
+                let picture = match piece {
+                    Some((color, kind)) => Some(pictures::picture(color, kind, bg, size)),
+                    None if marks.to.contains(&sq) => Some(pictures::dot(bg, size)),
+                    None => None,
+                };
+                if let Some(picture) = picture {
+                    pictures.place(buf, area, picture);
+                }
             }
             if let Some(hits) = extras.hits {
                 hits.add(area, Hit::Square(sq));
@@ -227,5 +263,39 @@ pub fn area_of(at: (u16, u16), square: SquareSize, coords: bool) -> Rect {
         y: at.1,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dot_where_a_piece_can_go_is_centered_on_any_square() {
+        for size in SQUARES {
+            let (w, h) = size;
+            let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+            dot(&mut buf, (0, 0), size, Color::Indexed(223));
+            let marked: Vec<(u16, u16, String)> = buf
+                .area
+                .positions()
+                .filter(|&at| buf[at].symbol() != " ")
+                .map(|at| (at.x, at.y, buf[at].symbol().to_string()))
+                .collect();
+            assert!(!marked.is_empty(), "{size:?}");
+            // Turned around the middle, it's the same: a half block on top
+            // becomes one below.
+            if size.0 >= 3 {
+                for (x, y, symbol) in &marked {
+                    let mirror = match symbol.as_str() {
+                        "▄" => "▀",
+                        "▀" => "▄",
+                        s => s,
+                    };
+                    let at = (w - 1 - x, h - 1 - y, mirror.to_string());
+                    assert!(marked.contains(&at), "{size:?}: {marked:?}");
+                }
+            }
+        }
     }
 }

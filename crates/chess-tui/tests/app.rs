@@ -55,6 +55,11 @@ fn only_your_own_moves_go_and_only_in_turn() {
     let mut app = app_in(BEN, playing(&[]).view());
     assert_eq!(inputs(&typed(&mut app, "e5\r")), [], "white moves first");
     let screen = shown(&app, 80, 24);
+    assert!(screen.contains("Premove e5"), "kept for his turn: {screen}");
+    let mut app = app_in(BEN, playing(&[]).view());
+    chess(&mut app).prefs.premoves = false;
+    typed(&mut app, "e5\r");
+    let screen = shown(&app, 80, 24);
     assert!(screen.contains("Wait for your move."), "{screen}");
     let mut app = app_in(ANN, playing(&[]).view());
     assert_eq!(inputs(&typed(&mut app, "e5\r")), [], "not a white move");
@@ -502,6 +507,16 @@ fn pieces_are_pictures_where_nothing_covers_them() {
     assert!(screen.contains("Offer a draw"), "{screen}");
     let some = app.pictures().unwrap().take().len();
     assert!((16..32).contains(&some), "{some} left");
+    // Where a picked-up piece can go shows as pictures too.
+    app.handle(Key::Esc);
+    click(&mut app, Hit::Square(square("g1")));
+    shown(&app, 120, 40);
+    assert_eq!(
+        app.pictures().unwrap().take().len(),
+        32 + 3,
+        "e2, f3 and h3"
+    );
+    click(&mut app, Hit::Square(square("g1")));
     // Turned off, they're letters or glyphs again.
     app.handle(Key::Esc);
     chess(&mut app).prefs.images = false;
@@ -509,4 +524,59 @@ fn pieces_are_pictures_where_nothing_covers_them() {
     assert!(app.pictures().unwrap().take().is_empty());
     let screen = shown(&app, 120, 40);
     assert!(screen.contains('♜'), "{screen}");
+}
+
+/// What the app does when the room's view becomes `room`'s.
+fn moved(app: &mut App, room: game_api::Room<chess_core::round::Chess>) -> Vec<Effect> {
+    app.update_room(std::sync::Arc::new(room.view()))
+}
+
+#[test]
+fn a_premove_is_played_as_soon_as_the_turn_comes() {
+    // Ben, black, picks e7 and e5 while white thinks.
+    let mut app = app_in(BEN, playing(&[]).view());
+    click(&mut app, Hit::Square(square("e7")));
+    assert_eq!(inputs(&click(&mut app, Hit::Square(square("e5")))), []);
+    let screen = shown(&app, 80, 24);
+    assert!(screen.contains("Premove e7e5"), "{screen}");
+    assert_eq!(inputs(&moved(&mut app, playing(&["e2e4"]))), [uci("e7e5")]);
+    assert!(!shown(&app, 80, 24).contains("Premove"), "gone once played");
+
+    // Typed, too, and played however the position turned out.
+    let mut app = app_in(BEN, playing(&[]).view());
+    assert_eq!(inputs(&typed(&mut app, "Nf6\r")), []);
+    assert_eq!(inputs(&moved(&mut app, playing(&["d2d4"]))), [uci("g8f6")]);
+
+    // Not legal by then: nothing goes, and the player hears why.
+    let mut app = app_in(BEN, playing(&[]).view());
+    typed(&mut app, "Qh4\r");
+    assert_eq!(inputs(&moved(&mut app, playing(&["e2e4"]))), []);
+    assert!(shown(&app, 80, 24).contains("Your premove wasn't legal by then."));
+}
+
+#[test]
+fn a_premove_can_be_called_off_or_turned_off() {
+    let mut app = app_in(BEN, playing(&[]).view());
+    click(&mut app, Hit::Square(square("e7")));
+    click(&mut app, Hit::Square(square("e5")));
+    app.handle(Key::Backspace);
+    assert_eq!(
+        inputs(&moved(&mut app, playing(&["e2e4"]))),
+        [],
+        "called off"
+    );
+
+    // A click elsewhere calls it off too.
+    let mut app = app_in(BEN, playing(&[]).view());
+    click(&mut app, Hit::Square(square("e7")));
+    click(&mut app, Hit::Square(square("e5")));
+    click(&mut app, Hit::Square(square("a4")));
+    assert_eq!(inputs(&moved(&mut app, playing(&["e2e4"]))), []);
+
+    let mut app = app_in(BEN, playing(&[]).view());
+    chess(&mut app).prefs.premoves = false;
+    click(&mut app, Hit::Square(square("e7")));
+    click(&mut app, Hit::Square(square("e5")));
+    assert!(shown(&app, 80, 24).contains("Wait for your move."));
+    assert_eq!(inputs(&moved(&mut app, playing(&["e2e4"]))), []);
 }

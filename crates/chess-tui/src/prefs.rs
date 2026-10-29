@@ -87,6 +87,9 @@ pub struct Prefs {
     pub coordinates: bool,
     /// Pawns reaching the last rank become queens without asking.
     pub auto_queen: bool,
+    /// A move made during the other side's turn waits, and is played as
+    /// soon as the player's comes, if it's legal then.
+    pub premoves: bool,
     pub input: MoveInput,
     /// Resigning asks first.
     pub confirm_resign: bool,
@@ -106,6 +109,7 @@ impl Default for Prefs {
             pieces: PieceStyle::default(),
             coordinates: true,
             auto_queen: false,
+            premoves: true,
             input: MoveInput::default(),
             confirm_resign: true,
             challenge: ChessSettings::default(),
@@ -132,6 +136,7 @@ impl Prefs {
             ("pieces", self.pieces.name().to_string()),
             ("coordinates", on_off(self.coordinates).to_string()),
             ("auto_queen", on_off(self.auto_queen).to_string()),
+            ("premoves", on_off(self.premoves).to_string()),
             ("input", self.input.name().to_string()),
             ("confirm_resign", on_off(self.confirm_resign).to_string()),
             ("base_s", control.base.as_secs().to_string()),
@@ -170,6 +175,7 @@ impl Prefs {
                 ),
                 "coordinates" => set(&mut prefs.coordinates, flag(value)),
                 "auto_queen" => set(&mut prefs.auto_queen, flag(value)),
+                "premoves" => set(&mut prefs.premoves, flag(value)),
                 "input" => set(
                     &mut prefs.input,
                     named(&MoveInput::ALL, MoveInput::name, value),
@@ -268,6 +274,7 @@ mod tests {
             pieces: PieceStyle::Letters,
             coordinates: false,
             auto_queen: true,
+            premoves: false,
             input: MoveInput::Cursor,
             confirm_resign: false,
             challenge: ChessSettings {

@@ -34,16 +34,18 @@ pub enum Setting {
     Pieces,
     Coordinates,
     AutoQueen,
+    Premoves,
     Input,
     ConfirmResign,
 }
 
-pub const SETTINGS: [Setting; 7] = [
+pub const SETTINGS: [Setting; 8] = [
     Setting::Board,
     Setting::Images,
     Setting::Pieces,
     Setting::Coordinates,
     Setting::AutoQueen,
+    Setting::Premoves,
     Setting::Input,
     Setting::ConfirmResign,
 ];
@@ -63,6 +65,7 @@ impl Setting {
             Setting::Pieces => "Pieces as text",
             Setting::Coordinates => "Coordinates",
             Setting::AutoQueen => "Promote to a queen",
+            Setting::Premoves => "Premoves",
             Setting::Input => "Letter keys",
             Setting::ConfirmResign => "Ask before resigning",
         }
@@ -88,6 +91,7 @@ impl Setting {
                     "ask"
                 }
             }
+            Setting::Premoves => yes_no(prefs.premoves),
             Setting::Input => match prefs.input {
                 MoveInput::Typed => "type moves",
                 MoveInput::Cursor => "move the cursor",
@@ -103,6 +107,7 @@ impl Setting {
             Setting::Pieces => prefs.pieces = cycle(&PieceStyle::ALL, prefs.pieces, back),
             Setting::Coordinates => prefs.coordinates = !prefs.coordinates,
             Setting::AutoQueen => prefs.auto_queen = !prefs.auto_queen,
+            Setting::Premoves => prefs.premoves = !prefs.premoves,
             Setting::Input => prefs.input = cycle(&MoveInput::ALL, prefs.input, back),
             Setting::ConfirmResign => prefs.confirm_resign = !prefs.confirm_resign,
         }

@@ -335,6 +335,13 @@ pub trait GameUi: Any + Send + Sync {
         None
     }
 
+    /// The room's view changed: what the game does about it, such as play
+    /// a move it was keeping for the player's turn.
+    fn room_changed(&mut self, room: &InRoom) -> Vec<GameFx> {
+        let _ = room;
+        Vec::new()
+    }
+
     /// What the host changed going from `old` to the room's settings now,
     /// to tell everyone else.
     fn settings_note(&self, old: &dyn AnyView, room: &InRoom) -> Option<String> {

@@ -1117,17 +1117,18 @@ impl App {
         }
     }
 
-    /// The room changed.
-    pub fn update_room(&mut self, view: Arc<dyn AnyView>) {
+    /// The room changed. Answers what its game does about it.
+    pub fn update_room(&mut self, view: Arc<dyn AnyView>) -> Vec<Effect> {
         if let PhaseView::Closed { reason } = &view.shell().phase {
-            return self.room_closed(Some(reason.clone()));
+            self.room_closed(Some(reason.clone()));
+            return Vec::new();
         }
         let Some(room) = self.online.room.as_mut() else {
-            return;
+            return Vec::new();
         };
         // A room plays one game all its life.
         if view.game() != room.view.game() {
-            return;
+            return Vec::new();
         }
         let lobby = matches!(view.shell().phase, PhaseView::Waiting { .. });
         let old = std::mem::replace(&mut room.view, view);
@@ -1153,6 +1154,12 @@ impl App {
         {
             self.screen = Screen::Room;
         }
+        let id = self.games[i.unwrap_or(self.open)].id();
+        let Some(room) = self.online.room.as_ref() else {
+            return Vec::new();
+        };
+        let fx = self.games[i.unwrap_or(self.open)].room_changed(room);
+        fx.into_iter().map(|fx| Effect::Game(id, fx)).collect()
     }
 
     /// The room is gone; `reason` says why, if the room said.

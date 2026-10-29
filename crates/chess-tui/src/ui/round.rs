@@ -21,7 +21,7 @@ use shell_tui::online::InRoom;
 use shell_tui::ui::{centered_rect, dim, secs};
 
 use super::board::{self, Marks, SQUARES, SquareSize, board_size};
-use crate::app::{ChessUi, Hit, MenuItem, PROMOTIONS, bottom, chess_view, my_color};
+use crate::app::{ChessUi, Hit, MenuItem, PROMOTIONS, Premove, bottom, chess_view, my_color};
 use crate::entry;
 use crate::prefs::MoveInput;
 
@@ -288,6 +288,18 @@ impl Scene<'_> {
         if let Some(notice) = desk.notice.or(self.notice) {
             return Line::styled(notice.to_string(), Style::default().fg(Color::LightYellow));
         }
+        if desk.typed.is_empty()
+            && let Some(premove) = &desk.premove
+        {
+            let premove = match premove {
+                Premove::Squares(from, to) => format!("{from}{to}"),
+                Premove::Typed(typed) => typed.clone(),
+            };
+            return Line::styled(
+                format!("Premove {premove} · Backspace calls it off"),
+                Style::default().fg(Color::Indexed(140)),
+            );
+        }
         if desk.typed.is_empty() {
             let hint = match self.ui.prefs.input {
                 MoveInput::Typed => "Type, click or arrows · Esc menu",
@@ -338,6 +350,9 @@ impl Scene<'_> {
             return marks;
         };
         marks.cursor = desk.cursor;
+        if let Some(Premove::Squares(from, to)) = desk.premove {
+            marks.premove = Some((from, to));
+        }
         let mine = |sq| self.position.piece_at(sq).is_some_and(|(c, _)| c == me);
         if let Some(from) = desk.selected.filter(|&sq| mine(sq)) {
             marks.from.push(from);

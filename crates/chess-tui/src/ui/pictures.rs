@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chess_core::piece::{self, Piece};
 use ratatui::style::Color;
-use resvg::tiny_skia::{self, Pixmap, Transform};
+use resvg::tiny_skia::{self, FillRule, Paint, PathBuilder, Pixmap, Transform};
 use resvg::usvg::{Options, Tree};
 use shell_tui::Picture;
 
@@ -132,25 +132,42 @@ pub fn pixels(cells: (u16, u16), cell: (u16, u16)) -> (u32, u32) {
     }
 }
 
-/// `color`'s `piece` on a square of `bg`, `size` pixels big: made once,
-/// then kept.
-pub fn picture(color: piece::Color, piece: Piece, bg: Color, size: (u32, u32)) -> Picture {
+/// What a picture shows, besides the square's color and size: a piece, or
+/// the dot where one can go.
+#[derive(Clone, Copy)]
+enum Mark {
+    Piece(piece::Color, Piece),
+    Dot,
+}
+
+/// `mark` on a square of `bg`, `size` pixels big: made once, then kept.
+fn kept(mark: Mark, bg: Color, size: (u32, u32)) -> Picture {
     static KEPT_PICTURES: OnceLock<Mutex<HashMap<u64, Picture>>> = OnceLock::new();
-    let [r, g, b] = rgb(bg);
+    let bg = rgb(bg);
     let (w, h) = (size.0.clamp(1, 4095), size.1.clamp(1, 4095));
     // Every part of what's drawn, packed: no two pictures share an id.
-    let id = u64::from(color == piece::Color::Black)
-        | (index(piece) as u64) << 1
-        | u64::from(u32::from_be_bytes([0, r, g, b])) << 4
+    let what = match mark {
+        Mark::Piece(color, piece) => {
+            u64::from(color == piece::Color::Black) | (index(piece) as u64) << 1
+        }
+        Mark::Dot => 6 << 1,
+    };
+    let id = what
+        | u64::from(u32::from_be_bytes([0, bg[0], bg[1], bg[2]])) << 4
         | u64::from(w) << 28
         | u64::from(h) << 40;
     let kept = KEPT_PICTURES.get_or_init(Mutex::default);
     if let Some(picture) = kept.lock().unwrap().get(&id) {
         return picture.clone();
     }
+    let mut pixmap = square(bg, (w, h));
+    match mark {
+        Mark::Piece(color, piece) => draw(&mut pixmap, tree(color, piece)),
+        Mark::Dot => disc(&mut pixmap),
+    }
     let picture = Picture {
         id,
-        png: draw(tree(color, piece), [r, g, b], (w, h)).into(),
+        png: pixmap.encode_png().expect("a pixmap encodes as PNG").into(),
     };
     let mut kept = kept.lock().unwrap();
     if kept.len() >= KEPT {
@@ -160,10 +177,47 @@ pub fn picture(color: piece::Color, piece: Piece, bg: Color, size: (u32, u32)) -
     picture
 }
 
-/// `tree` centered on a `bg` square `size` pixels big, as PNG.
-fn draw(tree: &Tree, [r, g, b]: [u8; 3], (w, h): (u32, u32)) -> Vec<u8> {
+/// `color`'s `piece` on a square of `bg`, `size` pixels big.
+pub fn picture(color: piece::Color, piece: Piece, bg: Color, size: (u32, u32)) -> Picture {
+    kept(Mark::Piece(color, piece), bg, size)
+}
+
+/// The dot for where a piece can go, in the middle of a square of `bg`,
+/// `size` pixels big.
+pub fn dot(bg: Color, size: (u32, u32)) -> Picture {
+    kept(Mark::Dot, bg, size)
+}
+
+/// A square of `bg`, `size` pixels big.
+fn square([r, g, b]: [u8; 3], (w, h): (u32, u32)) -> Pixmap {
     let mut pixmap = Pixmap::new(w, h).expect("a square has pixels");
     pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, 255));
+    pixmap
+}
+
+/// A disc of the board's dot color, a third of the square across, in its
+/// middle.
+fn disc(pixmap: &mut Pixmap) {
+    let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
+    let Some(path) = PathBuilder::from_circle(w / 2.0, h / 2.0, w.min(h) / 6.0) else {
+        return;
+    };
+    let [r, g, b] = rgb(super::board::DOT);
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(r, g, b, 210);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
+/// `tree` centered on `pixmap`, as big as fits.
+fn draw(pixmap: &mut Pixmap, tree: &Tree) {
+    let (w, h) = (pixmap.width(), pixmap.height());
     let scale = w.min(h) as f32 / DRAWN;
     let (dx, dy) = (
         (w as f32 - DRAWN * scale) / 2.0,
@@ -171,7 +225,6 @@ fn draw(tree: &Tree, [r, g, b]: [u8; 3], (w, h): (u32, u32)) -> Vec<u8> {
     );
     let at = Transform::from_scale(scale, scale).post_translate(dx, dy);
     resvg::render(tree, at, &mut pixmap.as_mut());
-    pixmap.encode_png().expect("a pixmap encodes as PNG")
 }
 
 #[cfg(test)]

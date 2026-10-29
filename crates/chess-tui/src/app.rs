@@ -193,6 +193,16 @@ impl Hits {
 /// The pieces a pawn can become, in the order the prompt offers them.
 pub const PROMOTIONS: [Piece; 4] = Piece::PROMOTIONS;
 
+/// A move made during the other side's turn, played as soon as the
+/// player's comes, if it's legal then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Premove {
+    /// From one square to another, as picked.
+    Squares(Square, Square),
+    /// As typed.
+    Typed(String),
+}
+
 /// How the player is entering their move, and what they've opened, during
 /// a game. None of it outlives the game.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -211,6 +221,8 @@ pub(crate) struct Desk {
     pub flipped: bool,
     /// The piece the mouse picked up, while its button is down.
     pub dragging: Option<Square>,
+    /// The move waiting for the player's turn.
+    pub premove: Option<Premove>,
     /// What went wrong with the last try.
     pub notice: Option<&'static str>,
     /// Moves in the game this belongs to, to notice a new one.
@@ -403,7 +415,14 @@ impl ChessUi {
         match self.desk.selected {
             Some(from) if from == at => self.desk.selected = None,
             _ if mine => self.desk.selected = Some(at),
-            Some(_) if position.side_to_move() != me => self.desk.notice = Some(NOT_YET),
+            Some(from) if position.side_to_move() != me => {
+                if self.prefs.premoves {
+                    self.desk.premove = Some(Premove::Squares(from, at));
+                    self.desk.selected = None;
+                } else {
+                    self.desk.notice = Some(NOT_YET);
+                }
+            }
             Some(from) => {
                 let moves = entry::between(position, from, at);
                 let entered = entry::choose(&moves, self.prefs.auto_queen)
@@ -413,9 +432,31 @@ impl ChessUi {
                 }
                 return self.entered(entered);
             }
-            None => {}
+            // Anywhere else, a premove is called off.
+            None => self.desk.premove = None,
         }
         Reply::default()
+    }
+
+    /// The move kept for `me`'s turn in `position`, now it has come: played
+    /// if it's legal, a pawn reaching the end becoming a queen.
+    fn premove(&mut self, position: &Position) -> Vec<GameFx> {
+        let Some(premove) = self.desk.premove.take() else {
+            return Vec::new();
+        };
+        let entered = match &premove {
+            Premove::Squares(from, to) => {
+                entry::choose(&entry::between(position, *from, *to), true)
+            }
+            Premove::Typed(text) => Some(entry::enter(position, text, true)),
+        };
+        match entered {
+            Some(Entered::Play(mv)) => self.play(mv).fx,
+            _ => {
+                self.desk.notice = Some("Your premove wasn't legal by then.");
+                Vec::new()
+            }
+        }
     }
 
     /// A key while `me` plays `game`, which goes on.
@@ -489,7 +530,10 @@ impl ChessUi {
         match key {
             Key::Esc => self.desk.menu = Some(0),
             Key::Enter | Key::Char(' ') if !self.desk.typed.is_empty() => {
-                if position.side_to_move() != me {
+                if position.side_to_move() != me && self.prefs.premoves {
+                    let typed = std::mem::take(&mut self.desk.typed);
+                    self.desk.premove = Some(Premove::Typed(typed));
+                } else if position.side_to_move() != me {
                     self.desk.notice = Some(NOT_YET);
                 } else {
                     let entered = entry::enter(&position, &self.desk.typed, self.prefs.auto_queen);
@@ -497,6 +541,7 @@ impl ChessUi {
                 }
             }
             Key::Enter | Key::Char(' ') => return self.pick(&position, me),
+            Key::Backspace if self.desk.typed.is_empty() => self.desk.premove = None,
             Key::Backspace => {
                 self.desk.typed.pop();
             }
@@ -821,6 +866,27 @@ impl GameUi for ChessUi {
                 Some(Reply::default())
             }
             _ => None,
+        }
+    }
+
+    /// The other side moved: a premove waiting for this turn goes now.
+    fn room_changed(&mut self, room: &InRoom) -> Vec<GameFx> {
+        let Some(view) = chess_view(room) else {
+            return Vec::new();
+        };
+        self.sync(view);
+        let Some(game) = view.game.as_ref() else {
+            return Vec::new();
+        };
+        let playing =
+            matches!(view.shell.phase, PhaseView::Running { .. }) && game.outcome.is_none();
+        let Some(me) = my_color(room, game).filter(|_| playing) else {
+            self.desk.premove = None;
+            return Vec::new();
+        };
+        match game.replay() {
+            Some((position, _)) if position.side_to_move() == me => self.premove(&position),
+            _ => Vec::new(),
         }
     }
 
