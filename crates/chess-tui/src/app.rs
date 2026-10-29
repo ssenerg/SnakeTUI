@@ -10,12 +10,14 @@ use chess_core::square::Square;
 use chess_core::view::GameView;
 use game_api::codec::encode;
 use game_api::{AnyView, GameId, PhaseView, PlayerId, RoomView};
+use std::sync::Mutex;
+
 use ratatui::Frame;
-use ratatui::layout::Size;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use shell_tui::online::{Category, InRoom};
-use shell_tui::{Ctx, GameFx, GameUi, Key, Next, QuickStart, Reply, Saved};
+use shell_tui::{Ctx, GameFx, GameUi, Key, Mouse, MouseKind, Next, QuickStart, Reply, Saved};
 
 use crate::entry::{self, Entered, MAX_TYPED};
 use crate::prefs::{self, MoveInput, Prefs};
@@ -134,6 +136,60 @@ impl MenuItem {
     }
 }
 
+/// Something on chess's screens that a click does something to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// A square of the board.
+    Square(Square),
+    /// The game menu's entry at this row.
+    MenuItem(usize),
+    /// The promotion prompt's piece, at this place in [`PROMOTIONS`].
+    Promote(usize),
+    /// The resign box's "Resign", or its "Keep playing".
+    Resign(bool),
+    /// What opens the game menu.
+    OpenMenu,
+    /// Quick pairing's preset, at this place in [`PRESETS`].
+    Preset(usize),
+    /// The settings screen's row.
+    Setting(usize),
+    /// The challenge screen's row.
+    Challenge(usize),
+}
+
+/// Where the last frame drew what a click does something to, the last
+/// drawn on top.
+#[derive(Debug, Default)]
+pub struct Hits(Mutex<Vec<(Rect, Hit)>>);
+
+impl Hits {
+    pub(crate) fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    pub(crate) fn add(&self, area: Rect, hit: Hit) {
+        self.0.lock().unwrap().push((area, hit));
+    }
+
+    /// What's on top where `mouse` is.
+    pub fn at(&self, mouse: Mouse) -> Option<Hit> {
+        let hits = self.0.lock().unwrap();
+        hits.iter()
+            .rev()
+            .find(|(area, _)| mouse.within(*area))
+            .map(|&(_, hit)| hit)
+    }
+
+    /// Where `hit` was drawn.
+    pub fn spot(&self, hit: Hit) -> Option<Rect> {
+        let hits = self.0.lock().unwrap();
+        hits.iter()
+            .rev()
+            .find(|(_, h)| *h == hit)
+            .map(|&(area, _)| area)
+    }
+}
+
 /// The pieces a pawn can become, in the order the prompt offers them.
 pub const PROMOTIONS: [Piece; 4] = Piece::PROMOTIONS;
 
@@ -153,6 +209,8 @@ pub(crate) struct Desk {
     pub confirm_resign: bool,
     /// The board turned around from how it's usually seen.
     pub flipped: bool,
+    /// The piece the mouse picked up, while its button is down.
+    pub dragging: Option<Square>,
     /// What went wrong with the last try.
     pub notice: Option<&'static str>,
     /// Moves in the game this belongs to, to notice a new one.
@@ -170,6 +228,8 @@ pub struct ChessUi {
     /// shows it: keys pressed meanwhile step on from there.
     pending: Option<ChessSettings>,
     pub(crate) size: Size,
+    /// What the last frame drew that a click does something to.
+    pub hits: Hits,
 }
 
 /// The room's view, if it's a chess room.
@@ -209,6 +269,11 @@ fn sides(side: Side, host: &str, hosting: bool) -> String {
 }
 
 impl ChessUi {
+    /// The piece picked up to move, if any.
+    pub fn picked(&self) -> Option<Square> {
+        self.desk.selected
+    }
+
     fn save(&self) -> GameFx {
         GameFx::SavePrefs(self.prefs.to_saved_text())
     }
@@ -323,12 +388,17 @@ impl ChessUi {
         }
     }
 
-    /// Enter on the cursor's square: picks up one of `me`'s pieces, or
-    /// moves the one picked up there.
+    /// Enter on the cursor's square: see [`Self::pick_at`].
     fn pick(&mut self, position: &Position, me: piece::Color) -> Reply {
-        let Some(at) = self.desk.cursor else {
-            return Reply::default();
-        };
+        match self.desk.cursor {
+            Some(at) => self.pick_at(at, position, me),
+            None => Reply::default(),
+        }
+    }
+
+    /// Picks up one of `me`'s pieces at `at`, or moves the one picked up
+    /// there.
+    fn pick_at(&mut self, at: Square, position: &Position, me: piece::Color) -> Reply {
         let mine = position.piece_at(at).is_some_and(|(c, _)| c == me);
         match self.desk.selected {
             Some(from) if from == at => self.desk.selected = None,
@@ -353,6 +423,9 @@ impl ChessUi {
         let Some((position, _)) = game.replay() else {
             return Reply::default();
         };
+        if let Key::Mouse(mouse) = key {
+            return self.play_mouse(mouse, &position, game, me);
+        }
         self.desk.notice = None;
         if let Some((from, to, at)) = self.desk.promoting {
             let chosen = match key.lower() {
@@ -436,6 +509,93 @@ impl ChessUi {
             _ => {}
         }
         Reply::default()
+    }
+
+    /// The mouse while `me` plays `game`: a click on a piece and then a
+    /// square, or a piece dragged to its square, moves it; menus and
+    /// prompts take clicks on what they offer, and close at one elsewhere.
+    fn play_mouse(
+        &mut self,
+        mouse: Mouse,
+        position: &Position,
+        game: &GameView,
+        me: piece::Color,
+    ) -> Reply {
+        let hit = self.hits.at(mouse);
+        // A release keeps what its press said.
+        if mouse.kind == MouseKind::Release {
+            return match (self.desk.dragging.take(), hit) {
+                (Some(from), Some(Hit::Square(to)))
+                    if to != from && self.desk.selected == Some(from) =>
+                {
+                    self.pick_at(to, position, me)
+                }
+                _ => Reply::default(),
+            };
+        }
+        self.desk.notice = None;
+        if let Some((from, to, _)) = self.desk.promoting {
+            if let Some(Hit::Promote(i)) = hit {
+                return self.play(Move {
+                    from,
+                    to,
+                    promotion: Some(PROMOTIONS[i]),
+                });
+            }
+            self.desk.promoting = None;
+            return Reply::default();
+        }
+        if self.desk.confirm_resign {
+            self.desk.confirm_resign = false;
+            return match hit {
+                Some(Hit::Resign(true)) => Reply::fx(GameFx::Play(encode(&ChessInput::Resign))),
+                _ => Reply::default(),
+            };
+        }
+        if self.desk.menu.is_some() {
+            return match hit {
+                Some(Hit::MenuItem(row)) => self.menu_key(Key::Enter, row, game, me),
+                _ => {
+                    self.desk.menu = None;
+                    Reply::default()
+                }
+            };
+        }
+        match hit {
+            Some(Hit::OpenMenu) => {
+                self.desk.menu = Some(0);
+                Reply::default()
+            }
+            Some(Hit::Square(at)) => {
+                let reply = self.pick_at(at, position, me);
+                // Just picked up: it may be dragged, too.
+                if self.desk.selected == Some(at) {
+                    self.desk.dragging = Some(at);
+                }
+                reply
+            }
+            _ => Reply::default(),
+        }
+    }
+
+    /// A click on chess's own screens: on a preset, a setting or a row of
+    /// the challenge, as Enter or → there.
+    fn own_mouse(&mut self, mouse: Mouse, ctx: &Ctx) -> Reply {
+        if mouse.kind != MouseKind::Press {
+            return Reply::default();
+        }
+        match (self.screen, self.hits.at(mouse)) {
+            (ChessScreen::Pairing { .. }, Some(Hit::Preset(i))) => self.pairing_key(i, Key::Enter),
+            (ChessScreen::Settings, Some(Hit::Setting(row))) => {
+                self.selected = row;
+                self.settings_key(Key::Right)
+            }
+            (ChessScreen::Challenge { .. }, Some(Hit::Challenge(row))) => {
+                self.screen = ChessScreen::Challenge { selected: row };
+                self.challenge_key(row, Key::Right, ctx.room)
+            }
+            _ => Reply::default(),
+        }
     }
 
     fn menu_key(&mut self, key: Key, row: usize, game: &GameView, me: piece::Color) -> Reply {
@@ -604,6 +764,9 @@ impl GameUi for ChessUi {
     }
 
     fn key(&mut self, key: Key, ctx: &Ctx) -> Reply {
+        if let Key::Mouse(mouse) = key {
+            return self.own_mouse(mouse, ctx);
+        }
         let key = key.lower();
         match self.screen {
             ChessScreen::Settings => self.settings_key(key),
@@ -614,6 +777,21 @@ impl GameUi for ChessUi {
 
     fn resize(&mut self, size: Size) {
         self.size = size;
+    }
+
+    fn wants_mouse(&self) -> bool {
+        true
+    }
+
+    /// While the player's own game goes on.
+    fn room_wants_mouse(&self, room: &InRoom) -> bool {
+        let Some(view) = chess_view(room) else {
+            return false;
+        };
+        let playing = matches!(view.shell.phase, PhaseView::Running { .. });
+        view.game
+            .as_ref()
+            .is_some_and(|g| playing && g.outcome.is_none() && my_color(room, g).is_some())
     }
 
     fn draw(&self, frame: &mut Frame, ctx: &Ctx) {

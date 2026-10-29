@@ -22,6 +22,9 @@ use crate::app::{App, Screen};
 use crate::online::{Field, FormKind, HomeItem};
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    if let Some(pictures) = app.pictures() {
+        pictures.clear();
+    }
     // The home menu behind dialogs, with the entry that opened them.
     let items = app.home_items();
     let home = |item: HomeItem| items.iter().position(|i| *i == item).unwrap_or(0);
@@ -78,6 +81,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.invite_showing() {
         draw_invite(frame, app);
+    }
+    // Pictures show only where nothing was drawn over them.
+    if let Some(pictures) = app.pictures() {
+        pictures.settle(frame.buffer_mut());
     }
 }
 

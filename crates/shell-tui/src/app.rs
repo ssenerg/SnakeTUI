@@ -9,7 +9,7 @@ use std::time::Duration;
 use game_api::{AnyView, GameId, PhaseView, PlayerId, RatingKey, RoomKind, is_bot};
 use ratatui::layout::Size;
 
-use crate::game::{Ctx, GameFx, GameUi, Next, QuickStart, Reply, Saved};
+use crate::game::{Ctx, GameFx, GameUi, Next, Pictures, QuickStart, Reply, Saved};
 use crate::key::Key;
 use crate::online::{
     AccountRow, Field, Form, FormKind, FormRow, FriendsRow, FriendsView, HomeItem, InRoom, Invite,
@@ -170,6 +170,9 @@ pub struct App {
     /// The home entry the open game's own screens were opened from, which
     /// leaving them goes back to.
     game_item: HomeItem,
+    /// The pictures each frame shows, once the terminal is known to show
+    /// them.
+    pictures: Option<Pictures>,
 }
 
 impl App {
@@ -195,6 +198,7 @@ impl App {
             open: 0,
             opened: false,
             game_item: HomeItem::Game(0),
+            pictures: None,
         };
         let start = start.and_then(|game| app.index_of(game));
         if let Some(i) = start.or_else(|| (app.games.len() == 1).then_some(0)) {
@@ -252,7 +256,31 @@ impl App {
             online: true,
             room: self.online.room.as_ref(),
             account: self.online.account.as_ref(),
+            pictures: self.pictures.as_ref(),
             notice: self.online.notice.as_deref(),
+        }
+    }
+
+    /// The terminal shows pictures, with cells `cell` pixels big: games
+    /// may draw with them from the next frame.
+    pub fn show_pictures(&mut self, cell: (u16, u16)) {
+        self.pictures = Some(Pictures::new(cell));
+    }
+
+    /// The pictures the last frame showed, if the terminal shows them.
+    pub fn pictures(&self) -> Option<&Pictures> {
+        self.pictures.as_ref()
+    }
+
+    /// Whether what shows now takes the mouse, as its game says.
+    pub fn wants_mouse(&self) -> bool {
+        match self.screen {
+            Screen::Game => self.ui().wants_mouse(),
+            Screen::Room => self.online.room.as_ref().is_some_and(|room| {
+                let i = self.index_of(room.view.game()).unwrap_or(self.open);
+                self.games[i].room_wants_mouse(room)
+            }),
+            _ => false,
         }
     }
 
@@ -322,6 +350,10 @@ impl App {
         let raw = key;
         let typing = matches!(self.screen, Screen::Input(_) | Screen::Form(_));
         let key = if typing { key } else { key.lower() };
+        // Only a game that asked for the mouse hears it.
+        if matches!(key, Key::Mouse(_)) && !self.wants_mouse() {
+            return;
+        }
         if key == Key::CtrlC {
             effects.extend(self.unfinished());
             effects.push(Effect::Quit);
@@ -370,6 +402,7 @@ impl App {
             online: true,
             room: self.online.room.as_ref(),
             account: self.online.account.as_ref(),
+            pictures: self.pictures.as_ref(),
             notice: None,
         };
         let reply = self.games[self.open].key(key, &ctx);

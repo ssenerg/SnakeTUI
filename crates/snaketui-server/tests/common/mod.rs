@@ -187,6 +187,12 @@ pub struct Player {
     pub exit_status: Option<u32>,
     pub closed: bool,
     pub received: usize,
+    /// Everything the server sent.
+    pub raw: Vec<u8>,
+    /// What to answer when asked about pictures (`CSI c` ends the
+    /// questions), as a terminal that shows them would; `None` answers
+    /// nothing, as a test terminal doesn't.
+    pub answers: Option<&'static [u8]>,
 }
 
 impl Player {
@@ -216,6 +222,8 @@ impl Player {
             exit_status: None,
             closed: false,
             received: 0,
+            raw: Vec::new(),
+            answers: None,
         }
     }
 
@@ -227,11 +235,22 @@ impl Player {
         self.screen.screen().contents()
     }
 
+    /// Whether the server sent `bytes` at some point.
+    pub fn got(&self, bytes: &[u8]) -> bool {
+        self.raw.windows(bytes.len()).any(|w| w == bytes)
+    }
+
     /// Shows what the server sent, and answers its status queries the way
     /// a terminal does.
     async fn take(&mut self, data: &[u8]) {
         self.received += data.len();
+        self.raw.extend_from_slice(data);
         self.screen.process(data);
+        if data.windows(3).any(|w| w == b"\x1b[c")
+            && let Some(answers) = self.answers.take()
+        {
+            let _ = self.channel.data(answers).await;
+        }
         let asked = data
             .windows(STATUS_QUERY.len())
             .filter(|w| *w == STATUS_QUERY)

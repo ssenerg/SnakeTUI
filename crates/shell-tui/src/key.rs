@@ -11,6 +11,31 @@ pub enum Key {
     Backspace,
     Char(char),
     CtrlC,
+    /// The left mouse button, at a cell of the screen. Only screens that
+    /// ask for the mouse get these: see [`crate::GameUi::wants_mouse`].
+    Mouse(Mouse),
+}
+
+/// The left button went down or came up at column `x`, row `y`, from the
+/// top left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Mouse {
+    pub kind: MouseKind,
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseKind {
+    Press,
+    Release,
+}
+
+impl Mouse {
+    /// Whether it's within `area`.
+    pub fn within(self, area: ratatui::layout::Rect) -> bool {
+        area.contains(ratatui::layout::Position::new(self.x, self.y))
+    }
 }
 
 impl Key {

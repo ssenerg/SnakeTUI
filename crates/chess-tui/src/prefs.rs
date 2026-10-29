@@ -35,8 +35,8 @@ impl BoardLook {
     }
 }
 
-/// How pieces are drawn. Some terminals show chess glyphs as emoji, or
-/// too wide; letters always line up.
+/// How pieces are drawn where pictures can't be. Some terminals show chess
+/// glyphs as emoji, or too wide; letters always line up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieceStyle {
     #[default]
@@ -80,6 +80,8 @@ impl MoveInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prefs {
     pub board: BoardLook,
+    /// Pieces as pictures, in terminals that show them.
+    pub images: bool,
     pub pieces: PieceStyle,
     /// Files and ranks along the board's edges.
     pub coordinates: bool,
@@ -100,6 +102,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             board: BoardLook::default(),
+            images: true,
             pieces: PieceStyle::default(),
             coordinates: true,
             auto_queen: false,
@@ -125,6 +128,7 @@ impl Prefs {
         let control = self.challenge.control;
         [
             ("board", self.board.name().to_string()),
+            ("images", on_off(self.images).to_string()),
             ("pieces", self.pieces.name().to_string()),
             ("coordinates", on_off(self.coordinates).to_string()),
             ("auto_queen", on_off(self.auto_queen).to_string()),
@@ -159,6 +163,7 @@ impl Prefs {
                     &mut prefs.board,
                     named(&BoardLook::ALL, BoardLook::name, value),
                 ),
+                "images" => set(&mut prefs.images, flag(value)),
                 "pieces" => set(
                     &mut prefs.pieces,
                     named(&PieceStyle::ALL, PieceStyle::name, value),
@@ -259,6 +264,7 @@ mod tests {
     fn prefs_round_trip_and_bad_lines_are_skipped() {
         let prefs = Prefs {
             board: BoardLook::Blue,
+            images: false,
             pieces: PieceStyle::Letters,
             coordinates: false,
             auto_queen: true,

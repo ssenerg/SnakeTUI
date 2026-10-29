@@ -25,8 +25,9 @@ use self::account::{JoinedRoom, PendingInvite};
 use crate::auth::Refused;
 use crate::backend::SshBackend;
 use crate::games::{self, PoolKey};
+use crate::graphics::{self, Graphics, Protocol};
 use crate::identity::{Player, nickname};
-use crate::input::{Budget, KeyParser, STATUS_QUERY};
+use crate::input::{Answer, Budget, KeyParser, STATUS_QUERY};
 use crate::lobby::{CodeUnavailable, CreateRoom, FindRoom};
 use crate::matcher::REGION_WAIT;
 use crate::matchmaker::{BotMatch, Dequeue, Enqueue, Matched};
@@ -89,7 +90,24 @@ const LOCAL_REGION: &str = "local";
 
 /// Switch to the alternate screen and hide the cursor; and undo both.
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H";
-const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+/// The terminal reports the mouse's left button, as `CSI <` sequences.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+/// How long a terminal has to say whether it shows pictures.
+const PROBE_WAIT: Duration = Duration::from_secs(2);
+/// A cell's size in pixels, when the terminal doesn't say: only its shape
+/// matters, since terminals fit pictures to the cells.
+const CELL_PIXELS: (u16, u16) = (8, 16);
+
+/// What a terminal has said of itself, while it's being asked.
+#[derive(Default)]
+struct Probe {
+    version: Option<String>,
+    kitty: bool,
+    cell: Option<(u16, u16)>,
+    timer: Option<SpawnHandle>,
+}
 
 pub const NEEDS_PTY: &str =
     "SnakeTUI is a game and needs a terminal. Connect without -T, or with: ssh -t <host>\r\n";
@@ -176,6 +194,8 @@ pub struct ChannelOpened {
 pub struct PtyRequested {
     pub cols: u32,
     pub rows: u32,
+    /// The window in pixels, width then height, if the client said.
+    pub pixels: (u32, u32),
 }
 
 #[derive(Message)]
@@ -197,6 +217,8 @@ pub struct Input(pub Bytes);
 pub struct Resized {
     pub cols: u32,
     pub rows: u32,
+    /// The window in pixels, width then height, if the client said.
+    pub pixels: (u32, u32),
 }
 
 #[derive(Message)]
@@ -341,6 +363,14 @@ pub struct SessionActor {
     unwritten: Arc<AtomicUsize>,
     player: Option<Player>,
     size: Size,
+    /// The window in pixels, if the client said.
+    pixels: (u32, u32),
+    /// What the terminal has said of itself so far, until it's said all.
+    probe: Option<Probe>,
+    /// How pictures reach the terminal, if it shows them.
+    graphics: Option<Graphics>,
+    /// Whether the terminal reports the mouse now.
+    mouse: bool,
     /// Both exist from when the game screen opens.
     terminal: Option<Terminal<SshBackend>>,
     app: Option<App>,
@@ -443,6 +473,10 @@ impl SessionActor {
             size: Size::new(80, 24),
             terminal: None,
             app: None,
+            pixels: (0, 0),
+            probe: None,
+            graphics: None,
+            mouse: false,
             parser: KeyParser::default(),
             keys: Budget::new(KEY_BURST, KEYS_PER_SEC, now),
             actions: Budget::new(ACTION_BURST, ACTIONS_PER_SEC, now),
@@ -584,6 +618,7 @@ impl SessionActor {
         self.terminal = Some(terminal);
         self.last_input = Instant::now();
         self.send(Out::Data(Bytes::from_static(ENTER_SCREEN)));
+        self.probe_terminal(ctx);
         self.sample_tcp();
         ctx.run_interval(PING_EVERY, |act, _| {
             act.ping();
@@ -609,6 +644,68 @@ impl SessionActor {
         TCP_RESENT.fetch_add(state.resent.saturating_sub(resent), Ordering::Relaxed);
         self.tcp_counted = (state.sent, state.resent);
         Some(state)
+    }
+
+    /// Asks the terminal whether, and how, it shows pictures.
+    fn probe_terminal(&mut self, ctx: &mut Context<Self>) {
+        if !self.send(Out::Data(Bytes::from_static(graphics::PROBE))) {
+            return;
+        }
+        self.parser.expect_answers(true);
+        let timer = ctx.run_later(PROBE_WAIT, |act, ctx| {
+            if let Some(probe) = act.probe.as_mut() {
+                probe.timer = None;
+            }
+            act.probed(ctx);
+        });
+        self.probe = Some(Probe {
+            timer: Some(timer),
+            ..Probe::default()
+        });
+    }
+
+    fn on_answer(&mut self, answer: Answer, ctx: &mut Context<Self>) {
+        let Some(probe) = self.probe.as_mut() else {
+            return;
+        };
+        match answer {
+            Answer::Version(version) => probe.version = Some(version),
+            Answer::Kitty(ok) => probe.kitty = ok,
+            Answer::CellSize(w, h) => probe.cell = Some((w, h)),
+            Answer::Attributes => self.probed(ctx),
+        }
+    }
+
+    /// The terminal has said what it will: pictures go its way from now,
+    /// if it shows them.
+    fn probed(&mut self, ctx: &mut Context<Self>) {
+        let Some(probe) = self.probe.take() else {
+            return;
+        };
+        if let Some(timer) = probe.timer {
+            ctx.cancel_future(timer);
+        }
+        self.parser.expect_answers(false);
+        let Some(protocol) = Protocol::of(probe.version.as_deref(), probe.kitty) else {
+            debug!(peer = %self.peer, version = ?probe.version, "no pictures");
+            return;
+        };
+        let (cols, rows) = (u32::from(self.size.width), u32::from(self.size.height));
+        let said = (self.pixels.0 / cols.max(1), self.pixels.1 / rows.max(1));
+        let cell = probe
+            .cell
+            .filter(|&(w, h)| w > 0 && h > 0)
+            .or_else(|| {
+                let fits = |n: u32| u16::try_from(n).ok().filter(|&n| n > 0);
+                Some((fits(said.0)?, fits(said.1)?))
+            })
+            .unwrap_or(CELL_PIXELS);
+        debug!(peer = %self.peer, ?protocol, ?cell, "showing pictures");
+        self.graphics = Some(Graphics::new(protocol));
+        if let Some(app) = self.app.as_mut() {
+            app.show_pictures(cell);
+        }
+        self.render(ctx);
     }
 
     /// Asks the terminal for a status report: the wait for its answer is the
@@ -1217,7 +1314,15 @@ impl SessionActor {
         let drawn = catch_unwind(AssertUnwindSafe(|| {
             terminal.draw(|frame| ui::draw(frame, app)).map(|_| ())
         }));
-        let bytes = terminal.backend_mut().take_output();
+        let mut bytes = terminal.backend_mut().take_output();
+        if let (Some(graphics), Some(pictures)) = (self.graphics.as_mut(), app.pictures()) {
+            graphics.frame(&pictures.take(), &mut bytes);
+        }
+        let mouse = app.wants_mouse();
+        if mouse != self.mouse {
+            self.mouse = mouse;
+            bytes.extend_from_slice(if mouse { MOUSE_ON } else { MOUSE_OFF });
+        }
         if !bytes.is_empty() && out.try_send(Out::Data(bytes.into())).is_ok() {
             self.unwritten.fetch_add(1, Ordering::Relaxed);
         }
@@ -1295,6 +1400,9 @@ impl SessionActor {
         }
         self.closing = true;
         if self.app.is_some() {
+            if let Some(graphics) = &self.graphics {
+                self.send(Out::Data(Bytes::from_static(graphics.leave())));
+            }
             self.send(Out::Data(Bytes::from_static(LEAVE_SCREEN)));
         }
         if let Some(message) = message {
@@ -1426,6 +1534,7 @@ impl Handler<PtyRequested> for SessionActor {
 
     fn handle(&mut self, msg: PtyRequested, _: &mut Self::Context) {
         self.size = Self::clamp_size(msg.cols, msg.rows);
+        self.pixels = msg.pixels;
     }
 }
 
@@ -1461,6 +1570,9 @@ impl Handler<Input> for SessionActor {
         }
         let mut keys = Vec::new();
         self.parser.feed(&bytes, &mut keys);
+        for answer in self.parser.take_answers() {
+            self.on_answer(answer, ctx);
+        }
         let allowed = self.keys.take(keys.len(), Instant::now());
         keys.truncate(allowed);
         let answers = self.parser.take_reports();
@@ -1491,11 +1603,19 @@ impl Handler<Resized> for SessionActor {
 
     fn handle(&mut self, msg: Resized, ctx: &mut Self::Context) {
         self.size = Self::clamp_size(msg.cols, msg.rows);
+        self.pixels = msg.pixels;
         let area = Rect::new(0, 0, self.size.width, self.size.height);
         if let Some(terminal) = self.terminal.as_mut() {
             terminal.backend_mut().set_size(self.size);
             if let Err(e) = terminal.resize(area) {
                 warn!(peer = %self.peer, error = %e, "couldn't resize");
+            }
+        }
+        // The screen is cleared: pictures go up again with the next frame.
+        if let Some(graphics) = self.graphics.as_mut() {
+            let gone = graphics.reset();
+            if !gone.is_empty() {
+                self.send(Out::Data(gone.into()));
             }
         }
         if let Some(app) = self.app.as_mut() {

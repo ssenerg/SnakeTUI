@@ -21,7 +21,7 @@ use shell_tui::online::InRoom;
 use shell_tui::ui::{centered_rect, dim, secs};
 
 use super::board::{self, Marks, SQUARES, SquareSize, board_size};
-use crate::app::{ChessUi, MenuItem, PROMOTIONS, bottom, chess_view, my_color};
+use crate::app::{ChessUi, Hit, MenuItem, PROMOTIONS, bottom, chess_view, my_color};
 use crate::entry;
 use crate::prefs::MoveInput;
 
@@ -290,8 +290,8 @@ impl Scene<'_> {
         }
         if desk.typed.is_empty() {
             let hint = match self.ui.prefs.input {
-                MoveInput::Typed => "Type or arrows · Esc menu",
-                MoveInput::Cursor => "Arrows · Enter · Esc menu",
+                MoveInput::Typed => "Type, click or arrows · Esc menu",
+                MoveInput::Cursor => "Click or arrows · Esc menu",
             };
             return Line::styled(hint, dim());
         }
@@ -373,6 +373,7 @@ fn capitalized(word: &str) -> String {
 }
 
 pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &Ctx) {
+    ui.hits.clear();
     let Some(view) = chess_view(room) else {
         return;
     };
@@ -415,6 +416,10 @@ pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &C
         scene.bottom,
         &ui.prefs,
         &scene.marks(),
+        board::Extras {
+            pictures: ctx.pictures,
+            hits: Some(&ui.hits),
+        },
     );
     let (top, under) = (!scene.bottom, scene.bottom);
     let (bw, bh) = board_size(layout.square, ui.prefs.coordinates);
@@ -434,6 +439,16 @@ pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &C
                 scene.status(),
                 scene.input(),
             ]);
+            let input = panel.y + lines.len() as u16 - 1;
+            ui.hits.add(
+                Rect {
+                    y: input,
+                    height: 1,
+                    ..panel
+                }
+                .intersection(panel),
+                Hit::OpenMenu,
+            );
             frame.render_widget(Paragraph::new(lines), panel);
         }
         None => {
@@ -446,6 +461,7 @@ pub(crate) fn draw_round(frame: &mut Frame, ui: &ChessUi, room: &InRoom, ctx: &C
             line(frame, row(bh), scene.player(under, bw));
             line(frame, row(bh + 1), scene.status());
             line(frame, row(bh + 2), scene.input());
+            ui.hits.add(row(bh + 2).intersection(area), Hit::OpenMenu);
         }
     }
     let board_area = board::area_of(layout.board, layout.square, ui.prefs.coordinates);
@@ -461,6 +477,7 @@ fn draw_asking(frame: &mut Frame, ui: &ChessUi, game: &GameView, me: piece::Colo
         .fg(Color::Black)
         .bg(Color::LightYellow)
         .add_modifier(Modifier::BOLD);
+    // Returns the space inside, where `lines` went, centered.
     let mut box_over = |title: &str, lines: Vec<Line<'static>>, width: u16| {
         let height = lines.len() as u16 + 2;
         let rect = centered_rect(over, width, height);
@@ -473,7 +490,10 @@ fn draw_asking(frame: &mut Frame, ui: &ChessUi, game: &GameView, me: piece::Colo
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+        inner
     };
+    // Where a centered line of `width` starts, and its parts' columns.
+    let centered = |inner: Rect, width: u16| inner.x + inner.width.saturating_sub(width) / 2;
     if let Some((_, _, at)) = desk.promoting {
         let mut spans = Vec::new();
         for (i, piece) in PROMOTIONS.into_iter().enumerate() {
@@ -485,14 +505,36 @@ fn draw_asking(frame: &mut Frame, ui: &ChessUi, game: &GameView, me: piece::Colo
             });
             spans.push(Span::raw(" "));
         }
-        let hint = Line::styled("←→ choose · Enter · q r b n", dim());
-        box_over(" Promote to ", vec![Line::from(spans), hint], 30);
+        let hint = Line::styled("←→ choose · Enter · q r b n · or click", dim());
+        let inner = box_over(" Promote to ", vec![Line::from(spans), hint], 40);
+        // Each piece is 3 columns and a space.
+        let x = centered(inner, 4 * PROMOTIONS.len() as u16);
+        for i in 0..PROMOTIONS.len() {
+            let at = Rect::new(x + 4 * i as u16, inner.y, 3, 1);
+            ui.hits.add(at.intersection(inner), Hit::Promote(i));
+        }
     } else if desk.confirm_resign {
+        let (resign, keep) = (" Resign ", " Keep playing ");
+        let buttons = Line::from(vec![
+            Span::styled(resign, chosen),
+            Span::raw("   "),
+            Span::styled(keep, Style::default().add_modifier(Modifier::REVERSED)),
+        ]);
         let lines = vec![
             Line::from("Resign this game?"),
+            buttons,
             Line::styled("y resign · any other key keeps playing", dim()),
         ];
-        box_over(" Resign ", lines, 42);
+        let inner = box_over(" Resign ", lines, 42);
+        let (rw, kw) = (resign.len() as u16, keep.len() as u16);
+        let x = centered(inner, rw + 3 + kw);
+        let y = inner.y + 1;
+        ui.hits.add(
+            Rect::new(x, y, rw, 1).intersection(inner),
+            Hit::Resign(true),
+        );
+        let keep_at = Rect::new(x + rw + 3, y, kw, 1);
+        ui.hits.add(keep_at.intersection(inner), Hit::Resign(false));
     } else if let Some(row) = desk.menu {
         let items = MenuItem::offered(game, me);
         let row = row.min(items.len() - 1);
@@ -507,6 +549,14 @@ fn draw_asking(frame: &mut Frame, ui: &ChessUi, game: &GameView, me: piece::Colo
                 }
             })
             .collect();
-        box_over(" Game ", lines, 24);
+        let inner = box_over(" Game ", lines, 24);
+        for i in 0..items.len() {
+            let at = Rect {
+                y: inner.y + i as u16,
+                height: 1,
+                ..inner
+            };
+            ui.hits.add(at.intersection(inner), Hit::MenuItem(i));
+        }
     }
 }

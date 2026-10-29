@@ -12,6 +12,7 @@ actix-rt = "2.15"
 anyhow.workspace = true
 argon2 = "0.6.0"
 async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs"] }
+base64 = "0.22"
 bytes = "1"
 chess-core = { path = "../chess-core", features = ["serde"] }
 chess-tui.workspace = true

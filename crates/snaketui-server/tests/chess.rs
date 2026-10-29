@@ -265,3 +265,67 @@ async fn friends_watch_a_game() {
         ben.text()
     );
 }
+
+/// iTerm2's answers to the server's questions: its name, its cells'
+/// size, and its device attributes.
+const ITERM2: &[u8] = b"\x1bP>|iTerm2 3.7.5\x1b\\\x1b[6;16;8t\x1b[?62;4c";
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
+/// Where `p`'s board shows `square`, as in "e2": by the files along its
+/// bottom and the ranks down its left.
+fn spot(p: &Player, square: &str) -> (u16, u16) {
+    let text = p.text();
+    let lines: Vec<&str> = text.lines().collect();
+    let (file, rank) = (square.chars().next().unwrap(), &square[1..]);
+    let files = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("a ") && l.contains(" h"))
+        .expect("the files");
+    let x = files.find(file).unwrap() as u16;
+    let y = lines
+        .iter()
+        .position(|l| l.starts_with(rank))
+        .expect("the rank") as u16;
+    (x, y)
+}
+
+/// A press and release of the left button at `(x, y)`.
+async fn click(p: &Player, (x, y): (u16, u16)) {
+    p.send(format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1).as_bytes())
+        .await;
+}
+
+#[tokio::test]
+async fn iterm2_shows_pieces_as_pictures_and_the_mouse_moves_them() {
+    let server = chess_server();
+    let mut ann = Player::join(server.addr, Login::GuestNamed("chess"), 120, 40).await;
+    ann.answers = Some(ITERM2);
+    ann.wait_for("Board and pieces").await;
+    let mut ben = guest(&server).await;
+    assert!(!ann.got(MOUSE_ON), "off at home");
+
+    challenge(&mut ann, &mut ben, &[]).await;
+    assert!(ann.got(MOUSE_OFF), "off again in the lobby");
+    start(&mut ann, &mut ben).await;
+    ann.wait_until("pictures", Duration::from_secs(5), |p| {
+        p.got(b"\x1b]1337;File=inline=1;") && p.got(b"width=10;height=4;")
+    })
+    .await;
+    let last = |p: &Player, b: &[u8]| p.raw.windows(b.len()).rposition(|w| w == b);
+    assert!(
+        last(&ann, MOUSE_ON) > last(&ann, MOUSE_OFF),
+        "on in her game"
+    );
+    assert!(
+        !ben.got(b"1337;File") && !ben.got(b"\x1b_Ga=t"),
+        "ben's terminal didn't say"
+    );
+
+    // Click e2, then e4.
+    click(&ann, spot(&ann, "e2")).await;
+    click(&ann, spot(&ann, "e4")).await;
+    ben.wait_for("1. e4").await;
+    play(&mut ben, "1. e4", "e5").await;
+    ann.wait_for("1. e4      e5").await;
+}

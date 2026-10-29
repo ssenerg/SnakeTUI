@@ -16,5 +16,7 @@ pub mod ui;
 mod tests;
 
 pub use app::{App, Effect, Screen};
-pub use game::{Ctx, GameFx, GameUi, Next, QuickPlay, QuickStart, Reply, Saved};
-pub use key::Key;
+pub use game::{
+    Ctx, GameFx, GameUi, Next, Picture, Pictures, Placement, QuickPlay, QuickStart, Reply, Saved,
+};
+pub use key::{Key, Mouse, MouseKind};

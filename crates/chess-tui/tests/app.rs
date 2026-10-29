@@ -6,12 +6,13 @@ mod common;
 use chess_core::control::TimeControl;
 use chess_core::moves::Move;
 use chess_core::round::{ChessInput, ChessSettings, Side};
-use chess_tui::{BoardLook, ChessScreen, MoveInput, Prefs};
+use chess_core::square::Square;
+use chess_tui::{BoardLook, ChessScreen, Hit, MoveInput, Prefs};
 use common::*;
 use game_api::codec::decode;
 use game_api::{GameId, RatingKey};
 use shell_tui::online::{HomeItem, Profile, ShownRating};
-use shell_tui::{App, Effect, GameFx, Key, Screen};
+use shell_tui::{App, Effect, GameFx, Key, Mouse, MouseKind, Screen};
 
 /// The moves and other inputs the app sent to the room.
 fn inputs(effects: &[Effect]) -> Vec<ChessInput> {
@@ -330,4 +331,182 @@ fn results_score_and_say_how_it_ended() {
     let screen = shown(&app, 80, 24);
     assert!(screen.contains("ben wins!"), "{screen}");
     assert!(screen.contains("Black won by checkmate"), "{screen}");
+}
+
+/// Square `name`, as in "e2".
+fn square(name: &str) -> Square {
+    Square::parse(name).unwrap()
+}
+
+/// Where the screen, drawn the way the player sees it, shows `hit`.
+fn point_at(app: &mut App, hit: Hit) -> (u16, u16) {
+    shown(app, app.size.width, app.size.height);
+    let area = chess(app)
+        .hits
+        .spot(hit)
+        .unwrap_or_else(|| panic!("{hit:?} isn't on the screen"));
+    (area.x + area.width / 2, area.y + area.height / 2)
+}
+
+/// The mouse's button going `kind` at `(x, y)`, with the screen drawn
+/// first as each frame is.
+fn mouse_at(app: &mut App, kind: MouseKind, (x, y): (u16, u16)) -> Vec<Effect> {
+    shown(app, app.size.width, app.size.height);
+    app.handle(Key::Mouse(Mouse { kind, x, y }))
+}
+
+/// The button going `kind` on `hit`.
+fn mouse(app: &mut App, kind: MouseKind, hit: Hit) -> Vec<Effect> {
+    let at = point_at(app, hit);
+    mouse_at(app, kind, at)
+}
+
+/// A press and release on `hit`, in one place.
+fn click(app: &mut App, hit: Hit) -> Vec<Effect> {
+    let at = point_at(app, hit);
+    let mut effects = mouse_at(app, MouseKind::Press, at);
+    effects.extend(mouse_at(app, MouseKind::Release, at));
+    effects
+}
+
+#[test]
+fn a_click_on_a_piece_then_a_square_moves_it_and_so_does_a_drag() {
+    let mut app = app_in(ANN, playing(&[]).view());
+    assert!(app.wants_mouse(), "her game takes the mouse");
+    assert_eq!(inputs(&click(&mut app, Hit::Square(square("e2")))), []);
+    assert_eq!(chess(&mut app).picked(), Some(square("e2")));
+    assert_eq!(
+        inputs(&click(&mut app, Hit::Square(square("e4")))),
+        [uci("e2e4")]
+    );
+
+    let mut app = app_in(ANN, playing(&[]).view());
+    mouse(&mut app, MouseKind::Press, Hit::Square(square("g1")));
+    let dropped = mouse(&mut app, MouseKind::Release, Hit::Square(square("f3")));
+    assert_eq!(inputs(&dropped), [uci("g1f3")], "dragged");
+
+    // Not hers, not her turn, or not a move: nothing goes.
+    let mut app = app_in(ANN, playing(&[]).view());
+    click(&mut app, Hit::Square(square("e7")));
+    assert_eq!(chess(&mut app).picked(), None);
+    click(&mut app, Hit::Square(square("e2")));
+    assert_eq!(inputs(&click(&mut app, Hit::Square(square("e5")))), []);
+    assert!(shown(&app, 80, 24).contains("That piece can't go there."));
+    let mut app = app_in(BEN, playing(&[]).view());
+    click(&mut app, Hit::Square(square("e7")));
+    assert_eq!(inputs(&click(&mut app, Hit::Square(square("e5")))), []);
+}
+
+#[test]
+fn the_menu_promotion_and_resigning_take_clicks() {
+    let mut app = app_in(ANN, playing(&["e2e4", "e7e5"]).view());
+    click(&mut app, Hit::OpenMenu);
+    assert!(shown(&app, 80, 24).contains("Offer a draw"));
+    // A click elsewhere closes it.
+    click(&mut app, Hit::Square(square("a8")));
+    assert!(!shown(&app, 80, 24).contains("Offer a draw"));
+    click(&mut app, Hit::OpenMenu);
+    assert_eq!(
+        inputs(&click(&mut app, Hit::MenuItem(0))),
+        [ChessInput::OfferDraw]
+    );
+    click(&mut app, Hit::OpenMenu);
+    assert_eq!(inputs(&click(&mut app, Hit::MenuItem(1))), [], "asks first");
+    assert!(shown(&app, 80, 24).contains("Resign this game?"));
+    assert_eq!(inputs(&click(&mut app, Hit::Resign(false))), []);
+    click(&mut app, Hit::OpenMenu);
+    click(&mut app, Hit::MenuItem(1));
+    assert_eq!(
+        inputs(&click(&mut app, Hit::Resign(true))),
+        [ChessInput::Resign]
+    );
+
+    let mut view = playing(&[]).view();
+    let game = view.game.as_mut().unwrap();
+    game.start = Some("8/4P3/8/8/8/8/k7/4K3 w - - 0 1".to_string());
+    let mut app = app_in(ANN, view);
+    click(&mut app, Hit::Square(square("e7")));
+    click(&mut app, Hit::Square(square("e8")));
+    assert!(shown(&app, 80, 24).contains("Promote to"));
+    assert_eq!(inputs(&click(&mut app, Hit::Promote(3))), [uci("e7e8n")]);
+}
+
+#[test]
+fn the_mouse_works_only_while_the_board_or_chess_screens_show() {
+    let lobby = room(TimeControl::minutes(10, 0)).view();
+    let app = app_in(ANN, lobby);
+    assert!(!app.wants_mouse(), "the lobby's code can be selected");
+    let mut over = playing(&["f2f3", "e7e5", "g2g4"]);
+    over.play(BEN, uci("d8h4"), None);
+    let app = app_in(ANN, over.view());
+    assert!(!app.wants_mouse(), "the game is over");
+    let app = app_in(99, playing(&[]).view());
+    assert!(!app.wants_mouse(), "watching");
+
+    let mut app = App::online(
+        vec![Box::new(chess_tui::ChessUi::default())],
+        None,
+        "~ann".into(),
+        true,
+    );
+    app.resize(ratatui::layout::Size::new(80, 24));
+    assert!(!app.wants_mouse(), "home");
+    let press = Key::Mouse(Mouse {
+        kind: MouseKind::Press,
+        x: 40,
+        y: 12,
+    });
+    assert!(app.handle(press).is_empty(), "ignored at home");
+    app.go_home(HomeItem::QuickPlay, None);
+    app.handle(Key::Enter);
+    assert!(app.wants_mouse());
+    let effects = click(&mut app, Hit::Preset(0));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [_, Effect::QuickPlay { pool: "1+0", .. }]
+        ),
+        "{effects:?}"
+    );
+
+    app.go_home(HomeItem::Game(0), None);
+    app.handle(Key::Enter);
+    assert_eq!(chess(&mut app).screen, ChessScreen::Settings);
+    let effects = click(&mut app, Hit::Setting(0));
+    let Some(Effect::Game(GameId::Chess, GameFx::SavePrefs(text))) = effects.first() else {
+        panic!("saved: {effects:?}");
+    };
+    assert_eq!(Prefs::from_saved_text(text).board, BoardLook::Green);
+}
+
+#[test]
+fn pieces_are_pictures_where_nothing_covers_them() {
+    let mut app = app_in(ANN, playing(&["e2e4", "e7e5"]).view());
+    app.resize(ratatui::layout::Size::new(120, 40));
+    shown(&app, 120, 40);
+    assert!(
+        app.pictures().is_none(),
+        "until the terminal says it shows them"
+    );
+    app.show_pictures((8, 16));
+    shown(&app, 120, 40);
+    let all = app.pictures().unwrap().take();
+    assert_eq!(all.len(), 32);
+    assert!(
+        all.iter().all(|p| (p.area.width, p.area.height) == (10, 4)),
+        "the big board"
+    );
+    // The menu hides the pieces under it, and shows over them.
+    app.handle(Key::Esc);
+    let screen = shown(&app, 120, 40);
+    assert!(screen.contains("Offer a draw"), "{screen}");
+    let some = app.pictures().unwrap().take().len();
+    assert!((16..32).contains(&some), "{some} left");
+    // Turned off, they're letters or glyphs again.
+    app.handle(Key::Esc);
+    chess(&mut app).prefs.images = false;
+    shown(&app, 120, 40);
+    assert!(app.pictures().unwrap().take().is_empty());
+    let screen = shown(&app, 120, 40);
+    assert!(screen.contains('♜'), "{screen}");
 }

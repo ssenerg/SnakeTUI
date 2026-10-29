@@ -133,14 +133,18 @@ impl russh::server::Handler for ConnHandler {
         _term: &str,
         cols: u32,
         rows: u32,
-        _pix_width: u32,
-        _pix_height: u32,
+        pix_width: u32,
+        pix_height: u32,
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<()> {
         if self.ours(channel) {
             self.pty = true;
-            self.session.do_send(PtyRequested { cols, rows });
+            self.session.do_send(PtyRequested {
+                cols,
+                rows,
+                pixels: (pix_width, pix_height),
+            });
             session.channel_success(channel)?;
         } else {
             session.channel_failure(channel)?;
@@ -211,12 +215,16 @@ impl russh::server::Handler for ConnHandler {
         channel: ChannelId,
         cols: u32,
         rows: u32,
-        _pix_width: u32,
-        _pix_height: u32,
+        pix_width: u32,
+        pix_height: u32,
         _session: &mut Session,
     ) -> Result<()> {
         if self.ours(channel) {
-            let _ = self.session.try_send(Resized { cols, rows });
+            let _ = self.session.try_send(Resized {
+                cols,
+                rows,
+                pixels: (pix_width, pix_height),
+            });
         }
         Ok(())
     }

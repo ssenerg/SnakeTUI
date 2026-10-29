@@ -8,14 +8,30 @@ use chess_core::square::Square;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use shell_tui::Pictures;
 
+use super::pictures;
+use crate::app::{Hit, Hits};
 use crate::prefs::{BoardLook, PieceStyle, Prefs};
 
 /// A square's size on screen, in columns and rows.
 pub type SquareSize = (u16, u16);
 
-/// Square sizes from biggest, for terminals from 80×24 down.
-pub const SQUARES: [SquareSize; 3] = [(5, 2), (3, 1), (2, 1)];
+/// Square sizes from biggest: twice 80×24's for terminals of about
+/// 120×34, down to the smallest.
+pub const SQUARES: [SquareSize; 5] = [(10, 4), (7, 3), (5, 2), (3, 1), (2, 1)];
+
+/// The smallest square a piece is drawn as a picture on.
+const PICTURED: SquareSize = (5, 2);
+
+/// What else drawing the board does, besides its cells.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Extras<'a> {
+    /// Pieces go here as pictures, too.
+    pub pictures: Option<&'a Pictures>,
+    /// The squares go here, to be clicked.
+    pub hits: Option<&'a Hits>,
+}
 
 /// The board's size on screen, with its files and ranks when `coords`.
 pub fn board_size(square: SquareSize, coords: bool) -> (u16, u16) {
@@ -92,8 +108,16 @@ pub fn square_at(col: u16, row: u16, bottom: piece::Color) -> Option<Square> {
     }
 }
 
+fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.reset();
+        cell.set_symbol(symbol).set_style(style);
+    }
+}
+
 /// Draws `position` with its top left at `at`, its squares `square` big,
 /// as `prefs` say, and `bottom`'s side at the bottom.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     buf: &mut Buffer,
     at: (u16, u16),
@@ -102,17 +126,15 @@ pub fn draw(
     bottom: piece::Color,
     prefs: &Prefs,
     marks: &Marks,
+    extras: Extras,
 ) {
     let (w, h) = square;
     let (light, dark) = squares(prefs.board);
     let left = at.0 + if prefs.coordinates { 2 } else { 0 };
     let label = Style::default().fg(Color::DarkGray);
-    let mut put = |x: u16, y: u16, symbol: &str, style: Style| {
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.reset();
-            cell.set_symbol(symbol).set_style(style);
-        }
-    };
+    let pictures = extras
+        .pictures
+        .filter(|_| prefs.images && w >= PICTURED.0 && h >= PICTURED.1);
     for row in 0..8 {
         for col in 0..8 {
             let Some(sq) = square_at(col, row, bottom) else {
@@ -139,29 +161,46 @@ pub fn draw(
             let (x, y) = (left + col * w, at.1 + row * h);
             for dy in 0..h {
                 for dx in 0..w {
-                    put(x + dx, y + dy, " ", Style::default().bg(bg));
+                    put(buf, x + dx, y + dy, " ", Style::default().bg(bg));
                 }
             }
             let mid = x + (w - 1) / 2;
+            // Pieces sit on the square's top row, or its middle when it's
+            // tall.
+            let top = y + (h - 1) / 2;
             match piece {
                 Some((color, kind)) => {
                     let style = Style::default()
                         .fg(piece_color(color))
                         .bg(bg)
                         .add_modifier(Modifier::BOLD);
-                    put(mid, y, symbol(prefs.pieces, color, kind), style);
+                    put(buf, mid, top, symbol(prefs.pieces, color, kind), style);
                 }
                 None if marks.to.contains(&sq) => {
-                    put(mid, y, "•", Style::default().fg(DOT).bg(bg));
+                    put(buf, mid, top, "•", Style::default().fg(DOT).bg(bg));
                 }
                 None => {}
+            }
+            let area = Rect::new(x, y, w, h);
+            if let (Some(pictures), Some((color, kind))) = (pictures, piece) {
+                let size = pictures::pixels(square, pictures.cell);
+                pictures.place(buf, area, pictures::picture(color, kind, bg, size));
+            }
+            if let Some(hits) = extras.hits {
+                hits.add(area, Hit::Square(sq));
             }
         }
         if prefs.coordinates
             && let Some(sq) = square_at(0, row, bottom)
         {
             let rank = (b'1' + sq.rank()) as char;
-            put(at.0, at.1 + row * h, &rank.to_string(), label);
+            put(
+                buf,
+                at.0,
+                at.1 + row * h + (h - 1) / 2,
+                &rank.to_string(),
+                label,
+            );
         }
     }
     if prefs.coordinates {
@@ -169,6 +208,7 @@ pub fn draw(
             if let Some(sq) = square_at(col, 0, bottom) {
                 let file = (b'a' + sq.file()) as char;
                 put(
+                    buf,
                     left + col * w + (w - 1) / 2,
                     at.1 + 8 * h,
                     &file.to_string(),

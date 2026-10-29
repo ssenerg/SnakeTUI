@@ -3,11 +3,13 @@
 //! the app does the rest the same way for every game.
 
 use std::any::Any;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use game_api::{AnyView, GameId, PhaseView, PlayerId, Records};
 use ratatui::Frame;
-use ratatui::layout::Size;
+use ratatui::buffer::{Buffer, Cell, CellDiffOption};
+use ratatui::layout::{Rect, Size};
 use ratatui::style::Color;
 use ratatui::text::Span;
 
@@ -87,6 +89,8 @@ pub struct Ctx<'a> {
     pub room: Option<&'a InRoom>,
     /// The account they're signed in to, if any.
     pub account: Option<&'a Profile>,
+    /// Where to put pictures, if the player's terminal shows them.
+    pub pictures: Option<&'a Pictures>,
     /// Something to tell the player, until their next key.
     pub notice: Option<&'a str>,
 }
@@ -99,6 +103,7 @@ impl Ctx<'_> {
             online: false,
             room: None,
             account: None,
+            pictures: None,
             notice: None,
         }
     }
@@ -110,6 +115,86 @@ pub struct Saved {
     /// Their preferences, as the game writes them; empty for none yet.
     pub prefs: String,
     pub records: Records,
+}
+
+/// A picture, for terminals that show them: PNG data, and an id no other
+/// picture has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picture {
+    pub id: u64,
+    pub png: Arc<[u8]>,
+}
+
+/// A picture over `area`, and the cells under it as they were drawn: what
+/// shows wherever the picture can't.
+#[derive(Clone, Debug)]
+pub struct Placement {
+    pub area: Rect,
+    pub picture: Picture,
+    under: Vec<Cell>,
+}
+
+/// The pictures a frame shows, in a terminal that shows them.
+#[derive(Debug)]
+pub struct Pictures {
+    /// A cell's size in pixels, width then height.
+    pub cell: (u16, u16),
+    placed: Mutex<Vec<Placement>>,
+}
+
+impl Pictures {
+    pub fn new(cell: (u16, u16)) -> Self {
+        Self {
+            cell,
+            placed: Mutex::default(),
+        }
+    }
+
+    /// Shows `picture` over `area`, where `buf` holds what to show instead
+    /// if the picture can't.
+    pub fn place(&self, buf: &Buffer, area: Rect, picture: Picture) {
+        let area = area.intersection(buf.area);
+        if area.is_empty() {
+            return;
+        }
+        let under = area.positions().map(|at| buf[at].clone()).collect();
+        self.placed.lock().unwrap().push(Placement {
+            area,
+            picture,
+            under,
+        });
+    }
+
+    /// A new frame starts, with none yet.
+    pub(crate) fn clear(&self) {
+        self.placed.lock().unwrap().clear();
+    }
+
+    /// The frame is drawn: keeps the pictures nothing was drawn over since
+    /// they were put there, and keeps text from being drawn under those.
+    /// A menu over the board hides the pieces under it this way.
+    pub(crate) fn settle(&self, buf: &mut Buffer) {
+        self.placed.lock().unwrap().retain(|p| {
+            let untouched = p
+                .area
+                .positions()
+                .zip(&p.under)
+                .all(|(at, cell)| buf.cell(at) == Some(cell));
+            if untouched {
+                for at in p.area.positions() {
+                    if let Some(cell) = buf.cell_mut(at) {
+                        cell.set_diff_option(CellDiffOption::Skip);
+                    }
+                }
+            }
+            untouched
+        });
+    }
+
+    /// The pictures the frame shows, for whoever draws them.
+    pub fn take(&self) -> Vec<Placement> {
+        std::mem::take(&mut *self.placed.lock().unwrap())
+    }
 }
 
 /// What choosing quick play does.
@@ -217,6 +302,13 @@ pub trait GameUi: Any + Send + Sync {
         let _ = (frame, ctx);
     }
 
+    /// Whether its own screens take the mouse: while they show, the app
+    /// turns the mouse on and passes [`Key::Mouse`] on. Elsewhere the mouse
+    /// stays off, and selects text.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+
     // Rooms. The app runs their lobby and results; the game adds to them
     // and draws its rounds.
 
@@ -227,6 +319,13 @@ pub trait GameUi: Any + Send + Sync {
             room.shell().phase,
             PhaseView::Countdown { .. } | PhaseView::Running { .. }
         ) && room.my_seat().is_some_and(|s| s.slot.is_some())
+    }
+
+    /// Whether the room's round, as it is now, takes the mouse, as
+    /// [`Self::wants_mouse`] for the game's own screens.
+    fn room_wants_mouse(&self, room: &InRoom) -> bool {
+        let _ = room;
+        false
     }
 
     /// A key in the room, before the app's own room keys; `None` if it's

@@ -145,8 +145,20 @@ opens it, and new players choose between the two.
   3 minutes, and the host's side: white, black or drawn. A game starts once
   both players are ready, and the room's next game is the rematch.
   Challenges are unrated.
-- **The board** fits an 80×24 terminal with the clocks, what each side has
-  taken and the moves beside it. Smaller terminals get a smaller board.
+- **The board** grows with the terminal, with the clocks, what each side
+  has taken and the moves beside it. Its squares are 5×2 cells at 80×24,
+  7×3 from about 83×25, and twice 80×24's, 10×4, from about 110×33.
+  Smaller terminals get a smaller board.
+- **Pieces as pictures.** In terminals that show pictures, such as iTerm2,
+  WezTerm, kitty and Ghostty, the pieces are pictures: Cburnett's set, the
+  one Wikipedia uses. The server asks the terminal when you connect, and
+  uses iTerm2's inline images or Kitty's graphics. Elsewhere, Terminal.app
+  and tmux among them, they're glyphs or letters.
+- **The mouse** works on chess's screens: click a piece and then its
+  square, or drag it there. The game menu, a promotion's pieces, resigning,
+  quick pairing's presets and the settings take clicks too. Everywhere
+  else the mouse is left alone, so a drag still selects text, such as a
+  room's code.
 - **Moves.** Type them, as `Nf3`, `exd5`, `O-O` or `e7e8q`: as you type,
   the squares the move could mean light up, and Enter plays it once only
   one move fits. Or pick a piece with the arrows and Enter, then its
@@ -155,8 +167,9 @@ opens it, and new players choose between the two.
 - **Clocks** are the server's, with the increment added after each move
   and a little of each move's lag given back. Each side has 30 seconds for
   their first move, or the game is aborted.
-- **Settings**, on chess's home menu: the board's colors, glyphs or letters
-  for the pieces (some terminals draw the glyphs badly), coordinates,
+- **Settings**, on chess's home menu: the board's colors, pieces as
+  pictures or not, glyphs or letters for them otherwise (some terminals
+  draw the glyphs badly), coordinates,
   promoting to a queen without asking, whether letter keys type moves or
   move the cursor like WASD and HJKL, and asking before resigning.
 - **Dropped connections.** If a signed-in player's connection drops
@@ -403,7 +416,7 @@ The code is a Cargo workspace:
 | `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess; and rooms' chess (`Chess`, a `Game`) |
 | `crates/shell-tui` | The app around every game, drawn through any ratatui backend: the home menu, accounts, friends, the leaderboard, the game picker, and rooms' lobby and results. Each game adds its screens through `GameUi` |
 | `crates/snake-tui` | Snake's screens: single player, and its part of rooms (`SnakeUi`, a `GameUi`). The local game drives them on their own |
-| `crates/chess-tui` | Chess's screens: the board, typed and picked moves, the game menu, a room's challenge and the settings (`ChessUi`, a `GameUi`) |
+| `crates/chess-tui` | Chess's screens: the board with its pieces as pictures where the terminal shows them, typed, picked and clicked moves, the game menu, quick pairing, a room's challenge and the settings (`ChessUi`, a `GameUi`) |
 | `crates/snaketui-server` | The SSH server: sign-in, accounts, friends and ratings, one actor per player session and per room of any game (actix), the games it serves (`games/`), the quick-play matcher with a pool per game and kind of match, private-room codes, the store (SQLite, or Postgres for several servers), rooms and presence shared between servers through NATS, draining on shutdown, health and metrics over HTTP, the PROXY protocol, `server.toml`; and `snaketui-matchmaker`, the quick-play queue for a cluster of servers |
 | `crates/loadbot` | `snaketui-loadbot`: thousands of bot players, to see how servers hold up |
 | `crates/test-services` | Postgres and NATS for the tests, in throwaway Docker containers |
@@ -420,3 +433,9 @@ Some server tests need Postgres and NATS. They start them in Docker on their
 own, and remove the containers when they finish. To use servers you already
 run, set `SNAKETUI_TEST_POSTGRES` to the URL of a database whose user may
 create databases, and `SNAKETUI_TEST_NATS` to a NATS server.
+
+## Credits
+
+The chess pieces are by [Cburnett](https://commons.wikimedia.org/wiki/User:Cburnett),
+from Wikimedia Commons, used under the BSD license: see
+[`crates/chess-tui/assets/pieces/LICENSE`](crates/chess-tui/assets/pieces/LICENSE).

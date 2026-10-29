@@ -2,6 +2,7 @@
 //! games.
 
 mod board;
+mod pictures;
 mod round;
 
 use chess_core::control::{PRESET_NAMES, PRESETS};
@@ -17,10 +18,10 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use shell_tui::Ctx;
 use shell_tui::ui::{centered_rect, dim};
 
-use crate::app::{ChessScreen, ChessUi, RATINGS, chess_view, pairing_rows, speed};
+use crate::app::{ChessScreen, ChessUi, Hit, RATINGS, chess_view, pairing_rows, speed};
 use crate::prefs::{BoardLook, MoveInput, PieceStyle, Prefs};
 
-pub use board::{SQUARES, board_size};
+pub use board::board_size;
 pub(crate) use round::draw_round;
 
 pub const LOGO: [&str; 3] = ["┌─┐┬ ┬┌─┐┌─┐┌─┐", "│  ├─┤├┤ └─┐└─┐", "└─┘┴ ┴└─┘└─┘└─┘"];
@@ -29,6 +30,7 @@ pub const LOGO: [&str; 3] = ["┌─┐┬ ┬┌─┐┌─┐┌─┐", "│
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     Board,
+    Images,
     Pieces,
     Coordinates,
     AutoQueen,
@@ -36,8 +38,9 @@ pub enum Setting {
     ConfirmResign,
 }
 
-pub const SETTINGS: [Setting; 6] = [
+pub const SETTINGS: [Setting; 7] = [
     Setting::Board,
+    Setting::Images,
     Setting::Pieces,
     Setting::Coordinates,
     Setting::AutoQueen,
@@ -56,7 +59,8 @@ impl Setting {
     pub fn label(self) -> &'static str {
         match self {
             Setting::Board => "Board",
-            Setting::Pieces => "Pieces",
+            Setting::Images => "Piece pictures",
+            Setting::Pieces => "Pieces as text",
             Setting::Coordinates => "Coordinates",
             Setting::AutoQueen => "Promote to a queen",
             Setting::Input => "Letter keys",
@@ -68,6 +72,13 @@ impl Setting {
         let yes_no = |on: bool| if on { "yes" } else { "no" };
         match self {
             Setting::Board => prefs.board.name(),
+            Setting::Images => {
+                if prefs.images {
+                    "if the terminal can"
+                } else {
+                    "never"
+                }
+            }
             Setting::Pieces => prefs.pieces.name(),
             Setting::Coordinates => yes_no(prefs.coordinates),
             Setting::AutoQueen => {
@@ -88,6 +99,7 @@ impl Setting {
     pub fn change(self, prefs: &mut Prefs, back: bool) {
         match self {
             Setting::Board => prefs.board = cycle(&BoardLook::ALL, prefs.board, back),
+            Setting::Images => prefs.images = !prefs.images,
             Setting::Pieces => prefs.pieces = cycle(&PieceStyle::ALL, prefs.pieces, back),
             Setting::Coordinates => prefs.coordinates = !prefs.coordinates,
             Setting::AutoQueen => prefs.auto_queen = !prefs.auto_queen,
@@ -98,10 +110,25 @@ impl Setting {
 }
 
 pub(crate) fn draw(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx) {
+    ui.hits.clear();
     match ui.screen {
-        ChessScreen::Settings => draw_settings(frame, ui),
+        ChessScreen::Settings => draw_settings(frame, ui, ctx),
         ChessScreen::Challenge { selected } => draw_challenge(frame, ui, ctx, selected),
-        ChessScreen::Pairing { selected } => draw_pairing(frame, ctx, selected),
+        ChessScreen::Pairing { selected } => draw_pairing(frame, ui, ctx, selected),
+    }
+}
+
+/// Each of `rows`' lines, from the top of `inner`, as `hit(i)` to click.
+fn hit_rows(ui: &ChessUi, inner: Rect, rows: usize, hit: impl Fn(usize) -> Hit) {
+    for i in 0..rows.min(inner.height as usize) {
+        ui.hits.add(
+            Rect {
+                y: inner.y + i as u16,
+                height: 1,
+                ..inner
+            },
+            hit(i),
+        );
     }
 }
 
@@ -169,7 +196,7 @@ fn footer(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     );
 }
 
-fn draw_settings(frame: &mut Frame, ui: &ChessUi) {
+fn draw_settings(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx) {
     let area = frame.area();
     let width = 48;
     let rows = SETTINGS.len() as u16;
@@ -180,11 +207,15 @@ fn draw_settings(frame: &mut Frame, ui: &ChessUi) {
         .map(|(i, s)| row(s.label(), s.value(&ui.prefs), i == ui.selected, true))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
-    // A board as these settings draw it, if it fits.
-    let square = SQUARES[1];
-    let (bw, bh) = board_size(square, ui.prefs.coordinates);
+    hit_rows(ui, inner, SETTINGS.len(), Hit::Setting);
+    // A board as these settings draw it, as big as fits up to 5×2.
     let top = inner.bottom() + 2;
-    if area.height >= top + bh + 2 && area.width >= bw {
+    let fits = |square| {
+        let (bw, bh) = board_size(square, ui.prefs.coordinates);
+        area.height >= top + bh + 2 && area.width >= bw
+    };
+    if let Some(square) = [(5, 2), (3, 1)].into_iter().find(|&s| fits(s)) {
+        let (bw, _) = board_size(square, ui.prefs.coordinates);
         let x = area.x + (area.width - bw) / 2;
         board::draw(
             frame.buffer_mut(),
@@ -194,6 +225,10 @@ fn draw_settings(frame: &mut Frame, ui: &ChessUi) {
             piece::Color::White,
             &ui.prefs,
             &board::Marks::default(),
+            board::Extras {
+                pictures: ctx.pictures,
+                hits: None,
+            },
         );
     }
     footer(
@@ -216,12 +251,17 @@ fn status(ctx: &Ctx, otherwise: Line<'static>) -> Line<'static> {
     }
 }
 
-fn draw_pairing(frame: &mut Frame, ctx: &Ctx, selected: usize) {
+fn draw_pairing(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
     let area = frame.area();
     let rows = pairing_rows();
     let inner = framed(frame, area, " Quick pairing ", 48, rows.len() as u16 + 2);
     let mut lines = vec![Line::default()];
-    for (speed, presets) in rows {
+    for (r, (speed, presets)) in rows.into_iter().enumerate() {
+        // Each preset's 7 columns, after the 11 of the speed.
+        for (k, &i) in presets.iter().enumerate() {
+            let at = Rect::new(inner.x + 11 + 7 * k as u16, inner.y + 1 + r as u16, 7, 1);
+            ui.hits.add(at.intersection(inner), Hit::Preset(i));
+        }
         let label = RATINGS.iter().find(|c| c.id == speed.name());
         let label = label.map_or("", |c| c.label);
         let mut spans = vec![Span::raw(format!(" {label:<10}"))];
@@ -318,7 +358,7 @@ fn draw_challenge(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
     ];
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
-    let _ = ui;
+    hit_rows(ui, inner, 3, Hit::Challenge);
     let status = status(
         ctx,
         if hosting {

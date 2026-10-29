@@ -7,5 +7,5 @@ mod entry;
 mod prefs;
 mod ui;
 
-pub use app::{ChessScreen, ChessUi, MenuItem, chess_view};
+pub use app::{ChessScreen, ChessUi, Hit, Hits, MenuItem, chess_view};
 pub use prefs::{BoardLook, MoveInput, PieceStyle, Prefs};

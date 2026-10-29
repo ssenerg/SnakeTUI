@@ -12,6 +12,7 @@ pub mod backend;
 pub mod cluster;
 pub mod config;
 pub mod games;
+pub mod graphics;
 pub mod identity;
 pub mod input;
 pub mod lobby;

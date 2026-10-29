@@ -9,4 +9,5 @@ publish = false
 chess-core = { path = "../chess-core", features = ["serde"] }
 game-api = { workspace = true, features = ["serde"] }
 ratatui.workspace = true
+resvg = { version = "0.49.0", default-features = false }
 shell-tui.workspace = true

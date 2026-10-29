@@ -431,3 +431,41 @@ fn the_account_shows_the_open_games_ratings() {
     let home = shown(&app);
     assert!(home.contains("Signed in as ann · duels 1500"), "{home}");
 }
+
+#[test]
+fn pictures_show_only_where_nothing_was_drawn_over_them() {
+    use ratatui::buffer::{Buffer, CellDiffOption};
+    use ratatui::layout::Rect;
+
+    use crate::{Picture, Pictures};
+
+    let pictures = Pictures::new((8, 16));
+    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 2));
+    let picture = |id| Picture {
+        id,
+        png: Arc::from(vec![1]),
+    };
+    pictures.place(&buf, Rect::new(0, 0, 3, 2), picture(1));
+    pictures.place(&buf, Rect::new(4, 0, 3, 2), picture(2));
+    // Off the edge: what's on the screen of it.
+    pictures.place(&buf, Rect::new(8, 0, 5, 2), picture(3));
+    pictures.place(&buf, Rect::new(20, 0, 3, 2), picture(4));
+    // Something drawn over the second, as a menu would be.
+    buf[(5, 1)].set_symbol("x");
+    pictures.settle(&mut buf);
+    let shown = pictures.take();
+    let ids: Vec<u64> = shown.iter().map(|p| p.picture.id).collect();
+    assert_eq!(ids, [1, 3]);
+    assert_eq!(shown[1].area, Rect::new(8, 0, 2, 2));
+    assert_eq!(
+        buf[(0, 0)].diff_option,
+        CellDiffOption::Skip,
+        "text stays off it"
+    );
+    assert_eq!(
+        buf[(4, 0)].diff_option,
+        CellDiffOption::None,
+        "drawn as text"
+    );
+    assert!(pictures.take().is_empty(), "taken");
+}

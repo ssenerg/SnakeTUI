@@ -141,6 +141,24 @@ fn screens() -> Vec<App> {
     apps.push(app(ANN, &opening, |app| {
         app.notify("Welcome back: your game went on.".into());
     }));
+    // Pieces as pictures, in terminals that show them: on the board, under
+    // the menu and a promotion, and in the settings' preview.
+    for view in [&views[3], &views[4], &views[10]] {
+        apps.push(app(ANN, view, |app| app.show_pictures((8, 16))));
+    }
+    apps.push(app(ANN, &opening, |app| {
+        app.show_pictures((9, 19));
+        app.handle(Key::Esc);
+    }));
+    apps.push(app(ANN, &promoting, |app| {
+        app.show_pictures((8, 16));
+        typed(app, "e8\r");
+    }));
+    let mut preview = app(ANN, &views[1], home);
+    preview.show_pictures((8, 16));
+    preview.screen = Screen::Game;
+    chess(&mut preview).screen = ChessScreen::Settings;
+    apps.push(preview);
     // Esc in the countdown asks about leaving.
     apps.push(app(ANN, &views[2], |app| {
         app.handle(Key::Esc);
@@ -230,20 +248,20 @@ fn draw_all(apps: &[App], sizes: &[(u16, u16)]) {
 #[test]
 fn every_screen_draws_at_every_size() {
     let started = Instant::now();
-    let apps = screens();
     let sizes: Vec<(u16, u16)> = (1..=120)
         .flat_map(|w| (1..=40).map(move |h| (w, h)))
         .collect();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // Each thread its own apps: an app keeps the frame it's drawing, such
+    // as its pictures, as a session's does.
     std::thread::scope(|s| {
         for chunk in sizes.chunks(sizes.len().div_ceil(threads)) {
-            let apps = &apps;
-            s.spawn(move || draw_all(apps, chunk));
+            s.spawn(move || draw_all(&screens(), chunk));
         }
     });
     eprintln!(
         "drew {} screens at {} sizes in {:?}",
-        apps.len(),
+        screens().len(),
         sizes.len(),
         started.elapsed()
     );
