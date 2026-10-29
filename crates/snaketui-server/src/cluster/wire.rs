@@ -17,7 +17,7 @@ use crate::rating::Skill;
 use crate::room::{RoomCmd, RoomRef, ServerId};
 use crate::store::AccountId;
 
-pub const VERSION: u8 = 12;
+pub const VERSION: u8 = 13;
 
 /// Subjects for one server: `<prefix>.server.<server>.<what>`.
 pub fn server_subject(prefix: &str, server: ServerId, what: &str) -> String {

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use chess_core::control::{MAX_BASE, MAX_INCREMENT, PRESET_NAMES, PRESETS, TimeControl};
-use chess_core::round::{ChessSettings, Side};
+use chess_core::round::{ChessSettings, LEVELS, Side};
 
 /// The squares' colors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,11 +94,14 @@ pub struct Prefs {
     /// Resigning asks first.
     pub confirm_resign: bool,
     /// What a private room this player makes plays by. A host's changes in
-    /// the lobby are kept here too.
+    /// the lobby are kept here too. Its level is the computer's wherever
+    /// they play it.
     pub challenge: ChessSettings,
     /// The preset quick pairing last found them a game in, one of
     /// [`PRESETS`].
     pub pairing: TimeControl,
+    /// Quick pairing plays the computer, instead of finding a person.
+    pub computer: bool,
 }
 
 impl Default for Prefs {
@@ -114,6 +117,7 @@ impl Default for Prefs {
             confirm_resign: true,
             challenge: ChessSettings::default(),
             pairing: TimeControl::minutes(5, 3),
+            computer: false,
         }
     }
 }
@@ -142,7 +146,9 @@ impl Prefs {
             ("base_s", control.base.as_secs().to_string()),
             ("increment_s", control.increment.as_secs().to_string()),
             ("side", self.challenge.side.name().to_string()),
+            ("level", self.challenge.level.to_string()),
             ("pairing", self.pairing.to_string()),
+            ("against", against(self.computer).to_string()),
         ]
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))
@@ -193,6 +199,10 @@ impl Prefs {
                     &mut prefs.challenge.side,
                     named(&Side::ALL, Side::name, value),
                 ),
+                "level" => set(
+                    &mut prefs.challenge.level,
+                    value.parse().ok().filter(|l| LEVELS.contains(l)),
+                ),
                 "pairing" => set(
                     &mut prefs.pairing,
                     PRESET_NAMES
@@ -200,11 +210,39 @@ impl Prefs {
                         .position(|&name| name == value)
                         .map(|i| PRESETS[i]),
                 ),
+                "against" => set(
+                    &mut prefs.computer,
+                    [false, true].into_iter().find(|&c| against(c) == value),
+                ),
                 _ => {}
             }
         }
         prefs
     }
+
+    /// Who quick pairing plays: a person, or the computer at its level.
+    pub fn opponent(&self) -> Option<u8> {
+        self.computer.then_some(self.challenge.level)
+    }
+
+    /// The opponent after this one, or before it when `back`: a person,
+    /// then the computer at each level, then a person again.
+    pub fn step_opponent(&mut self, back: bool) {
+        let all: Vec<Option<u8>> = std::iter::once(None).chain(LEVELS.map(Some)).collect();
+        let i = all.iter().position(|&o| o == self.opponent()).unwrap_or(0);
+        let n = all.len();
+        match all[if back { (i + n - 1) % n } else { (i + 1) % n }] {
+            Some(level) => {
+                self.computer = true;
+                self.challenge.level = level;
+            }
+            None => self.computer = false,
+        }
+    }
+}
+
+fn against(computer: bool) -> &'static str {
+    if computer { "computer" } else { "person" }
 }
 
 fn set<T>(slot: &mut T, value: Option<T>) {
@@ -255,6 +293,17 @@ pub fn step_increment(control: TimeControl, down: bool) -> TimeControl {
     }
 }
 
+/// The computer's level above `level`, or below it when `down`, stopping
+/// at either end.
+pub fn step_level(level: u8, down: bool) -> u8 {
+    let level = if down {
+        level.saturating_sub(1)
+    } else {
+        level.saturating_add(1)
+    };
+    level.clamp(*LEVELS.start(), *LEVELS.end())
+}
+
 /// The side after `side` in [`Side::ALL`], or before it when `back`.
 pub fn step_side(side: Side, back: bool) -> Side {
     let i = Side::ALL.iter().position(|&s| s == side).unwrap_or(0);
@@ -280,13 +329,15 @@ mod tests {
             challenge: ChessSettings {
                 control: TimeControl::minutes(3, 2),
                 side: Side::Black,
+                level: 5,
             },
             pairing: TimeControl::minutes(1, 0),
+            computer: true,
         };
         assert_eq!(Prefs::from_saved_text(&prefs.to_saved_text()), prefs);
         assert_eq!(Prefs::from_saved_text(""), Prefs::default());
         let odd = Prefs::from_saved_text(
-            "board=plaid\nbase_s=0\nincrement_s=x\nnoise\npieces=letters\npairing=4+0",
+            "board=plaid\nbase_s=0\nincrement_s=x\nnoise\npieces=letters\npairing=4+0\nlevel=9\nagainst=cat",
         );
         assert_eq!(
             odd,
@@ -314,5 +365,23 @@ mod tests {
         assert_eq!(step_increment(longest, false), longest);
         assert_eq!(step_side(Side::Black, false), Side::Random);
         assert_eq!(step_side(Side::Random, true), Side::Black);
+        assert_eq!(step_level(1, true), 1);
+        assert_eq!(step_level(3, false), 4);
+        assert_eq!(step_level(5, false), 5);
+    }
+
+    #[test]
+    fn the_opponent_steps_from_a_person_through_each_level() {
+        let mut prefs = Prefs::default();
+        assert_eq!(prefs.opponent(), None);
+        prefs.step_opponent(false);
+        assert_eq!(prefs.opponent(), Some(1));
+        prefs.step_opponent(true);
+        assert_eq!(prefs.opponent(), None);
+        prefs.step_opponent(true);
+        assert_eq!(prefs.opponent(), Some(5));
+        prefs.step_opponent(false);
+        assert_eq!(prefs.opponent(), None);
+        assert_eq!(prefs.challenge.level, 5, "the level stays for next time");
     }
 }

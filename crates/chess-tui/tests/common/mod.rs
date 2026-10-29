@@ -38,10 +38,25 @@ pub fn room(control: TimeControl) -> Room<Chess> {
     let settings = ChessSettings {
         control,
         side: Side::White,
+        ..ChessSettings::default()
     };
     let mut room = Room::new(RoomSettings::new(settings, RoomKind::Private).unwrap(), 1);
     room.join(entrant(ANN)).unwrap();
     room.join(entrant(BEN)).unwrap();
+    room
+}
+
+/// Ann's private room at 5+3, where she plays white against the computer
+/// at `level`.
+pub fn against_computer(level: u8) -> Room<Chess> {
+    let settings = ChessSettings {
+        control: TimeControl::minutes(5, 3),
+        side: Side::White,
+        level,
+    };
+    let mut room = Room::new(RoomSettings::new(settings, RoomKind::Private).unwrap(), 1);
+    room.join(entrant(ANN)).unwrap();
+    assert!(room.add_bot(ANN));
     room
 }
 

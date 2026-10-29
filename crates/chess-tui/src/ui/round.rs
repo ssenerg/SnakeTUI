@@ -10,7 +10,7 @@ use chess_core::position::Position;
 use chess_core::san;
 use chess_core::square::Square;
 use chess_core::view::GameView;
-use game_api::{PhaseView, SeatView};
+use game_api::{PhaseView, SeatView, is_bot};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -118,7 +118,11 @@ impl Scene<'_> {
             return color.name().to_string();
         };
         let mut name = seat.who.name.clone();
-        if seat.who.id == self.room.me {
+        if is_bot(seat.who.id) {
+            if let Some(view) = chess_view(self.room) {
+                name.push_str(&format!(" · level {}", view.settings.level));
+            }
+        } else if seat.who.id == self.room.me {
             name.push_str(" (you)");
         } else if seat.left {
             name.push_str(" (left)");

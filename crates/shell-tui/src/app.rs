@@ -78,9 +78,14 @@ pub enum Effect {
     AddBot,
     /// The host takes the last bot out.
     RemoveBot,
-    /// Leave the queue for an unrated match against bots; answer with
-    /// [`App::enter_room`].
-    PlayBots,
+    /// An unrated match against `game`'s bots at `pool`'s settings, as the
+    /// player `choice` of them; out of the queue first if they're in it.
+    /// Answer with [`App::enter_room`], or [`App::bots_failed`].
+    PlayBots {
+        game: GameId,
+        pool: &'static str,
+        choice: Vec<u8>,
+    },
     /// Watch this friend's game; answer with [`App::watch_room`] or
     /// [`App::watch_failed`].
     Watch(String),
@@ -389,6 +394,11 @@ impl App {
             Next::Room if self.in_room() => self.screen = Screen::Room,
             Next::Room => self.go_home(HomeItem::QuickPlay, None),
             Next::Queue(pool) => self.queue(id, pool, effects),
+            Next::PlayBots(pool) => {
+                self.online.confirm_small = false;
+                self.screen = Screen::Joining { by_code: false };
+                effects.push(self.play_bots(i, pool));
+            }
         }
         if reply.notice.is_some() {
             self.online.notice = reply.notice;
@@ -657,6 +667,26 @@ impl App {
         }
     }
 
+    /// A match against `games[i]`'s bots at `pool`, as the player chose
+    /// them.
+    fn play_bots(&self, i: usize, pool: &'static str) -> Effect {
+        Effect::PlayBots {
+            game: self.games[i].id(),
+            pool,
+            choice: self.games[i].bot_choice(),
+        }
+    }
+
+    /// A match against bots couldn't start; `why` says so.
+    pub fn bots_failed(&mut self, why: String) {
+        if matches!(
+            self.screen,
+            Screen::Finding | Screen::Joining { by_code: false }
+        ) {
+            self.go_home(HomeItem::QuickPlay, Some(why));
+        }
+    }
+
     /// Into quick play, waiting in `game`'s `pool`.
     fn queue(&mut self, game: GameId, pool: &'static str, effects: &mut Vec<Effect>) {
         let online = &mut self.online;
@@ -674,7 +704,11 @@ impl App {
                 self.go_home(HomeItem::QuickPlay, None);
             }
             // The match comes back like any other.
-            Key::Char('b') if self.bots_offered() => effects.push(Effect::PlayBots),
+            Key::Char('b') if self.bots_offered() => {
+                if let Some(pool) = self.online.pool {
+                    effects.push(self.play_bots(self.open, pool));
+                }
+            }
             _ => {}
         }
     }

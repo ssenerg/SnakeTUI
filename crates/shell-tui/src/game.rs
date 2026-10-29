@@ -45,6 +45,24 @@ pub enum Next {
     Room,
     /// Into quick play, waiting in this pool of the game's.
     Queue(&'static str),
+    /// Into a match against the game's bots, at this pool's settings.
+    PlayBots(&'static str),
+}
+
+/// What the app says of a game's bots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BotWords {
+    /// Them all, as the queue offers them: "Play bots now".
+    pub them: &'static str,
+    /// The host's keys for them in a private room's lobby.
+    pub host_keys: &'static str,
+}
+
+impl BotWords {
+    pub const BOTS: BotWords = BotWords {
+        them: "bots",
+        host_keys: "b add a bot · x take one out",
+    };
 }
 
 /// What a game made of a key.
@@ -266,6 +284,23 @@ pub trait GameUi: Any + Send + Sync {
     /// Whether its rooms take bots, which hosts add and quick play offers.
     fn bots(&self) -> bool {
         false
+    }
+
+    /// What the app calls its bots.
+    fn bot_words(&self) -> BotWords {
+        BotWords::BOTS
+    }
+
+    /// What follows a bot's name in `room`'s lists of players.
+    fn bot_tag(&self, room: &InRoom) -> Option<String> {
+        let _ = room;
+        Some("(bot)".to_string())
+    }
+
+    /// The player's choice of bots for a match against them, such as how
+    /// strong, as the game's server reads it.
+    fn bot_choice(&self) -> Vec<u8> {
+        Vec::new()
     }
 
     // The game's own screens: what shows while the app's screen is

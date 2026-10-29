@@ -3,13 +3,13 @@
 
 mod common;
 
-use chess_core::control::TimeControl;
+use chess_core::control::{PRESET_NAMES, TimeControl};
 use chess_core::moves::Move;
 use chess_core::round::{ChessInput, ChessSettings, Side};
 use chess_core::square::Square;
 use chess_tui::{BoardLook, ChessScreen, Hit, MoveInput, Prefs};
 use common::*;
-use game_api::codec::decode;
+use game_api::codec::{decode, encode};
 use game_api::{GameId, RatingKey};
 use shell_tui::online::{HomeItem, Profile, ShownRating};
 use shell_tui::{App, Effect, GameFx, Key, Mouse, MouseKind, Screen};
@@ -169,6 +169,7 @@ fn the_host_sets_the_challenge() {
     let five_three = ChessSettings {
         control: TimeControl::minutes(5, 3),
         side: Side::White,
+        ..ChessSettings::default()
     };
     assert_eq!(challenged(&effects), Some(five_three));
     assert_eq!(
@@ -240,7 +241,10 @@ fn quick_pairing_picks_a_preset_and_waits_in_its_pool() {
     assert_eq!(app.screen, Screen::Game);
     assert_eq!(
         chess(&mut app).screen,
-        ChessScreen::Pairing { selected: 5 },
+        ChessScreen::Pairing {
+            selected: 5,
+            against: false
+        },
         "on 5+3 to begin with"
     );
     let screen = shown(&app, 80, 24);
@@ -274,12 +278,180 @@ fn quick_pairing_picks_a_preset_and_waits_in_its_pool() {
     app.handle(Key::Esc);
     app.go_home(HomeItem::QuickPlay, None);
     app.handle(Key::Enter);
-    assert_eq!(chess(&mut app).screen, ChessScreen::Pairing { selected: 1 });
+    assert_eq!(
+        chess(&mut app).screen,
+        ChessScreen::Pairing {
+            selected: 1,
+            against: false
+        }
+    );
     app.handle(Key::Esc);
     let Screen::Home { selected } = app.screen else {
         panic!("{:?}", app.screen);
     };
     assert_eq!(app.home_items()[selected], HomeItem::QuickPlay);
+}
+
+/// Quick pairing, open on 5+3, as a guest.
+fn pairing() -> App {
+    let mut app = App::online(
+        vec![Box::new(chess_tui::ChessUi::default())],
+        None,
+        "~ann".into(),
+        true,
+    );
+    app.resize(ratatui::layout::Size::new(80, 24));
+    app.go_home(HomeItem::QuickPlay, None);
+    app.handle(Key::Enter);
+    app
+}
+
+#[test]
+fn pairing_plays_the_computer_at_the_level_chosen() {
+    let mut app = pairing();
+    assert!(shown(&app, 80, 24).contains("Against     a person"));
+    // Down past the presets to who to play, keeping the preset.
+    let mut presets = Vec::new();
+    for _ in 0..4 {
+        app.handle(Key::Down);
+        presets.push(chess(&mut app).screen);
+    }
+    let ChessScreen::Pairing {
+        selected,
+        against: true,
+    } = chess(&mut app).screen
+    else {
+        panic!("{presets:?}");
+    };
+    assert!(
+        presets.contains(&ChessScreen::Pairing {
+            selected,
+            against: false
+        }),
+        "the preset above stays chosen: {presets:?}"
+    );
+    let effects = keys(&mut app, &[Key::Right, Key::Right, Key::Right]);
+    let Some(Effect::Game(GameId::Chess, GameFx::SavePrefs(text))) = effects.last() else {
+        panic!("saved: {effects:?}");
+    };
+    let prefs = Prefs::from_saved_text(text);
+    assert_eq!((prefs.computer, prefs.challenge.level), (true, 3));
+    let screen = shown(&app, 80, 24);
+    assert!(
+        screen.contains("❯Against   ◂ the computer, level 3 ▸"),
+        "{screen}"
+    );
+    assert!(screen.contains("sides drawn · unrated"), "{screen}");
+
+    // A click turns it on a level; and Enter plays the preset, which a
+    // click on a preset does too.
+    click(&mut app, Hit::Against);
+    assert_eq!(chess(&mut app).prefs.challenge.level, 4);
+    let effects = app.handle(Key::Enter);
+    let pool = PRESET_NAMES[selected];
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [_, Effect::PlayBots { game: GameId::Chess, pool: p, choice }]
+                if *p == pool && *choice == encode(&4u8)
+        ),
+        "{effects:?}"
+    );
+    assert_eq!(app.screen, Screen::Joining { by_code: false });
+    app.bots_failed("Try again.".into());
+    assert!(matches!(app.screen, Screen::Home { .. }));
+    app.handle(Key::Enter);
+    let effects = click(&mut app, Hit::Preset(0));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [_, Effect::PlayBots { pool: "1+0", .. }]
+        ),
+        "{effects:?}"
+    );
+
+    // Back to people, and up to the presets again.
+    let mut app = pairing();
+    chess(&mut app).prefs.computer = true;
+    chess(&mut app).screen = ChessScreen::Pairing {
+        selected: 5,
+        against: true,
+    };
+    // From level 3, down to 1, then a person.
+    keys(&mut app, &[Key::Left; 3]);
+    assert_eq!(chess(&mut app).prefs.opponent(), None);
+    app.handle(Key::Up);
+    assert_eq!(
+        chess(&mut app).screen,
+        ChessScreen::Pairing {
+            selected: 5,
+            against: false
+        }
+    );
+    assert!(matches!(
+        app.handle(Key::Enter).as_slice(),
+        [_, Effect::QuickPlay { pool: "5+3", .. }]
+    ));
+}
+
+#[test]
+fn the_queue_offers_the_computer_after_a_wait() {
+    let mut app = pairing();
+    chess(&mut app).prefs.challenge.level = 2;
+    app.handle(Key::Enter);
+    assert_eq!(app.screen, Screen::Finding);
+    assert_eq!(app.handle(Key::Char('b')), [], "not yet");
+    app.online.waited = shell_tui::app::BOTS_OFFERED_AFTER;
+    let screen = shown(&app, 80, 24);
+    assert!(
+        screen.contains("Play the computer now, unrated."),
+        "{screen}"
+    );
+    assert!(screen.contains("b play the computer"), "{screen}");
+    let effects = app.handle(Key::Char('b'));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::PlayBots { game: GameId::Chess, pool: "5+3", choice }]
+                if *choice == encode(&2u8)
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn a_host_plays_the_computer_at_a_level_they_set() {
+    // Ann alone adds the computer.
+    let mut alone = room(TimeControl::minutes(5, 3)).view();
+    alone.shell.seats.truncate(1);
+    let mut app = app_in(ANN, alone);
+    let lobby = shown(&app, 80, 24);
+    assert!(lobby.contains("b add the computer"), "{lobby}");
+    assert!(app.handle(Key::Char('b')).contains(&Effect::AddBot));
+
+    let mut app = app_in(ANN, against_computer(2).view());
+    let lobby = shown(&app, 80, 24);
+    assert!(lobby.contains("Computer · level 2"), "{lobby}");
+    assert!(!lobby.contains("(bot)"), "{lobby}");
+    assert!(app.handle(Key::Char('x')).contains(&Effect::RemoveBot));
+    typed(&mut app, "e");
+    assert!(shown(&app, 80, 24).contains("Computer level"));
+    let effects = keys(&mut app, &[Key::Down, Key::Down, Key::Down, Key::Right]);
+    assert_eq!(challenged(&effects).map(|s| s.level), Some(3));
+    // Up to 5, where it stops.
+    let effects = keys(&mut app, &[Key::Right, Key::Right, Key::Right]);
+    let levels: Vec<u8> = effects
+        .iter()
+        .filter_map(|e| challenged(std::slice::from_ref(e)).map(|s| s.level))
+        .collect();
+    assert_eq!(levels, [4, 5]);
+    assert_eq!(chess(&mut app).prefs.challenge.level, 5, "kept");
+    // Its seat says its level in the game.
+    let mut room = against_computer(4);
+    room.toggle_ready(ANN);
+    room.advance(std::time::Duration::from_secs(3));
+    let game = shown(&app_in(ANN, room.view()), 80, 24);
+    assert!(game.contains("Computer · level 4"), "{game}");
 }
 
 #[test]

@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chess_core::control::{PRESET_NAMES, PRESETS, TimeControl};
-use chess_core::round::{Chess, ChessSettings, Side};
+use chess_core::round::{Chess, ChessSettings, LEVELS, Side};
 use chess_tui::ChessUi;
-use game_api::{Entrant, GameId, Room, RoomKind, RoomSettings};
+use game_api::{Entrant, Game, GameId, Room, RoomKind, RoomSettings};
 use shell_tui::GameUi;
 
 use super::{AnyRoomView, GameInfo, GameServer, PoolInfo, RatingSystem, decode, decode_view};
@@ -82,13 +82,30 @@ impl GameServer for ChessServer {
         let chess = ChessSettings {
             control: preset(pool).unwrap_or(ChessSettings::default().control),
             side: Side::Random,
+            ..ChessSettings::default()
         };
         let room = settings(chess, RoomKind::Match).expect("chess seats two in any room");
         Box::new(Room::<Chess>::new_match(room, seed, players))
     }
 
-    fn bot_match(&self, _: u64, _: Entrant) -> Option<Box<dyn NewRoom>> {
-        None
+    /// The pool's preset against the computer, at the level chosen, with
+    /// sides drawn.
+    fn bot_match(
+        &self,
+        pool: &PoolInfo,
+        seed: u64,
+        who: Entrant,
+        choice: &[u8],
+    ) -> Option<Box<dyn NewRoom>> {
+        let level = decode::<u8>(choice).filter(|level| LEVELS.contains(level));
+        let chess = ChessSettings {
+            control: preset(pool)?,
+            side: Side::Random,
+            level: level.unwrap_or(ChessSettings::default().level),
+        };
+        let room = settings(chess, RoomKind::Match)?;
+        let players = vec![who, Chess::bot(0)];
+        Some(Box::new(Room::<Chess>::new_match(room, seed, players)))
     }
 
     fn private_room(&self, bytes: &[u8], seed: u64) -> Result<Box<dyn NewRoom>, &'static str> {

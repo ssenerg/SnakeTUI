@@ -176,20 +176,7 @@ impl Position {
     /// the same pieces on the same squares, the same side to move, the same
     /// castling rights, and an en passant capture only if one is legal.
     pub(crate) fn repetition_key(&self) -> u64 {
-        let Some(file) = self.board.en_passant() else {
-            return self.board.hash_without_ep();
-        };
-        let us = self.board.side_to_move();
-        let target = cozy_chess::Square::new(file, cozy_chess::Rank::Sixth.relative_to(us));
-        let pawns = self.board.colored_pieces(us, cozy_chess::Piece::Pawn);
-        let capturable = self
-            .board
-            .generate_moves_for(pawns, |moves| moves.to.has(target));
-        if capturable {
-            self.board.hash()
-        } else {
-            self.board.hash_without_ep()
-        }
+        repetition_key(&self.board)
     }
 
     pub(crate) fn cozy(&self) -> &cozy_chess::Board {
@@ -226,6 +213,22 @@ impl Position {
             to,
             promotion: mv.promotion.map(Piece::to_cozy),
         })
+    }
+}
+
+/// [`Position::repetition_key`] for a bare board, which the engine searches.
+pub(crate) fn repetition_key(board: &cozy_chess::Board) -> u64 {
+    let Some(file) = board.en_passant() else {
+        return board.hash_without_ep();
+    };
+    let us = board.side_to_move();
+    let target = cozy_chess::Square::new(file, cozy_chess::Rank::Sixth.relative_to(us));
+    let pawns = board.colored_pieces(us, cozy_chess::Piece::Pawn);
+    let capturable = board.generate_moves_for(pawns, |moves| moves.to.has(target));
+    if capturable {
+        board.hash()
+    } else {
+        board.hash_without_ep()
     }
 }
 

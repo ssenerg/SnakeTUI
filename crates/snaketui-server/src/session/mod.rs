@@ -243,7 +243,7 @@ fn costly(effect: &Effect) -> bool {
             | Effect::Watch(_)
             | Effect::CreateRoom { .. }
             | Effect::JoinRoom(_)
-            | Effect::PlayBots
+            | Effect::PlayBots { .. }
     )
 }
 
@@ -797,7 +797,7 @@ impl SessionActor {
                 Effect::ToggleReady => self.tell_room(RoomCmd::Ready),
                 Effect::AddBot => self.tell_room(RoomCmd::AddBot),
                 Effect::RemoveBot => self.tell_room(RoomCmd::RemoveBot),
-                Effect::PlayBots => self.shared.matchmaker.do_send(BotMatch(self.id)),
+                Effect::PlayBots { game, pool, choice } => self.play_bots(game, pool, choice, ctx),
                 Effect::Watch(name) => self.watch(name, ctx),
                 Effect::LeaveRoom => self.leave_room(ctx),
                 Effect::SetNickname(name) => self.rename(&name, ctx),
@@ -921,6 +921,37 @@ impl SessionActor {
             reply: ctx.address().recipient(),
             on_rated: ctx.address().recipient(),
         });
+    }
+
+    /// Into a match against `game`'s bots at `pool`, out of the queue if
+    /// waiting there.
+    fn play_bots(&mut self, game: GameId, pool: &str, choice: Vec<u8>, ctx: &mut Context<Self>) {
+        if self.room.is_some() {
+            return;
+        }
+        let queued = self.queued.take().is_some();
+        let asked = self.shared.matchmaker.send(BotMatch {
+            pool: PoolKey {
+                game,
+                pool: pool.to_string(),
+            },
+            who: self.entrant(),
+            presence: Arc::downgrade(&self.presence),
+            reply: ctx.address().recipient(),
+            choice,
+            queued,
+        });
+        ctx.spawn(asked.into_actor(self).map(|started, act, ctx| {
+            if matches!(started, Ok(true)) {
+                return;
+            }
+            // Still in the queue, perhaps: out of it too.
+            act.shared.matchmaker.do_send(Dequeue(act.id));
+            if let Some(app) = act.app.as_mut() {
+                app.bots_failed(TRY_AGAIN.to_string());
+            }
+            act.render(ctx);
+        }));
     }
 
     /// Makes a private room of `game` with `settings`, as its screens

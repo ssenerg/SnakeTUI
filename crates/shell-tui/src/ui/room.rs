@@ -77,8 +77,8 @@ fn draw_lobby(
         if seat.who.id == room.me {
             spans.push(Span::styled(" (you)", dim()));
         }
-        if is_bot(seat.who.id) {
-            spans.push(Span::styled(" (bot)", dim()));
+        if let Some(tag) = ui.bot_tag(room).filter(|_| is_bot(seat.who.id)) {
+            spans.push(Span::styled(format!(" {tag}"), dim()));
         }
         if seat.wins > 0 {
             let s = if seat.wins == 1 { "" } else { "s" };
@@ -124,7 +124,7 @@ fn draw_lobby(
         let mut host = Vec::new();
         host.extend(ui.host_keys());
         if ui.bots() {
-            host.push("b add a bot · x take one out");
+            host.push(ui.bot_words().host_keys);
         }
         lines.push(Line::from(host.join(" · ")).style(dim()));
     }
@@ -136,7 +136,10 @@ fn draw_results(frame: &mut Frame, ui: &dyn GameUi, room: &InRoom, next_in: Opti
     let height = 9 + view.placements.len() as u16;
     let (headline, color) = match view.winner() {
         Some(winner) if winner.id == room.me => ("★ You win! ★".to_string(), Color::LightGreen),
-        Some(winner) => (format!("{} wins!", named(winner)), Color::LightCyan),
+        Some(winner) => (
+            format!("{} wins!", named(winner, ui.bot_tag(room).as_deref())),
+            Color::LightCyan,
+        ),
         // Called off before it counted.
         None if view.placements.is_empty() => ("No result".to_string(), Color::Gray),
         None => ("Draw!".to_string(), Color::LightYellow),
@@ -162,7 +165,8 @@ fn draw_results(frame: &mut Frame, ui: &dyn GameUi, room: &InRoom, next_in: Opti
         } else {
             Style::default()
         };
-        let name: String = named(&p.who).chars().take(18).collect();
+        let tag = ui.bot_tag(room);
+        let name: String = named(&p.who, tag.as_deref()).chars().take(18).collect();
         let score: String = ui.score(room, p.who.id).chars().take(4).collect();
         let mut spans = vec![Span::styled(
             format!("{:>2}. {name:<18} {score:>4}", p.place),

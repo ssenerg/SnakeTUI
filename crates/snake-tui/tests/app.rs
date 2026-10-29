@@ -164,7 +164,17 @@ fn quick_play_offers_bots_after_a_while() {
     assert_eq!(choose(&mut app, HomeItem::QuickPlay), [quick_play()]);
     assert_eq!(app.handle(Key::Char('b')), [], "people may come yet");
     app.online.waited = BOTS_OFFERED_AFTER;
-    assert_eq!(app.handle(Key::Char('b')), [Effect::PlayBots]);
+    let effects = app.handle(Key::Char('b'));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::PlayBots {
+                game: GameId::Snake,
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
     assert_eq!(app.screen, Screen::Finding, "until the match comes");
     app.enter_room(1, matched_view());
     assert_eq!(app.screen, Screen::Room);

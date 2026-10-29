@@ -143,8 +143,16 @@ pub trait GameServer: Send + Sync + 'static {
     /// A matched room in `pool` for `players`, longest-waiting first.
     fn new_match(&self, pool: &PoolInfo, seed: u64, players: Vec<Entrant>) -> Box<dyn NewRoom>;
 
-    /// A match for `who` alone against bots, if the game has bots.
-    fn bot_match(&self, seed: u64, who: Entrant) -> Option<Box<dyn NewRoom>>;
+    /// A match for `who` alone against bots at `pool`'s settings, as they
+    /// chose them (`choice`, as the game's screens wrote it); `None` if the
+    /// game has no bots.
+    fn bot_match(
+        &self,
+        pool: &PoolInfo,
+        seed: u64,
+        who: Entrant,
+        choice: &[u8],
+    ) -> Option<Box<dyn NewRoom>>;
 
     /// A private room with `settings`, as the game's screens wrote them;
     /// or what to tell the player if it can't have those.

@@ -166,12 +166,11 @@ pub fn secs(d: Duration) -> u64 {
     d.as_secs_f64().ceil() as u64
 }
 
-/// A player's name, marked if they're a bot.
-pub fn named(who: &Entrant) -> String {
-    if is_bot(who.id) {
-        format!("{} (bot)", who.name)
-    } else {
-        who.name.clone()
+/// A player's name, followed by `tag` if they're a bot.
+pub fn named(who: &Entrant, tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) if is_bot(who.id) => format!("{} {tag}", who.name),
+        _ => who.name.clone(),
     }
 }
 

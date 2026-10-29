@@ -18,7 +18,9 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use shell_tui::Ctx;
 use shell_tui::ui::{centered_rect, dim};
 
-use crate::app::{ChessScreen, ChessUi, Hit, RATINGS, chess_view, pairing_rows, speed};
+use crate::app::{
+    CHALLENGE_ROWS, ChessScreen, ChessUi, Hit, RATINGS, chess_view, pairing_rows, speed,
+};
 use crate::prefs::{BoardLook, MoveInput, PieceStyle, Prefs};
 
 pub use board::board_size;
@@ -119,7 +121,9 @@ pub(crate) fn draw(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx) {
     match ui.screen {
         ChessScreen::Settings => draw_settings(frame, ui, ctx),
         ChessScreen::Challenge { selected } => draw_challenge(frame, ui, ctx, selected),
-        ChessScreen::Pairing { selected } => draw_pairing(frame, ui, ctx, selected),
+        ChessScreen::Pairing { selected, against } => {
+            draw_pairing(frame, ui, ctx, selected, against)
+        }
     }
 }
 
@@ -256,10 +260,22 @@ fn status(ctx: &Ctx, otherwise: Line<'static>) -> Line<'static> {
     }
 }
 
-fn draw_pairing(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
+/// Who quick pairing plays, in words.
+fn opponent(level: Option<u8>) -> String {
+    match level {
+        Some(level) => format!("the computer, level {level}"),
+        None => "a person".to_string(),
+    }
+}
+
+fn draw_pairing(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize, against: bool) {
     let area = frame.area();
     let rows = pairing_rows();
-    let inner = framed(frame, area, " Quick pairing ", 48, rows.len() as u16 + 2);
+    let speeds = rows.len() as u16;
+    let inner = framed(frame, area, " Quick pairing ", 48, speeds + 4);
+    let chosen = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::default()];
     for (r, (speed, presets)) in rows.into_iter().enumerate() {
         // Each preset's 7 columns, after the 11 of the speed.
@@ -272,15 +288,11 @@ fn draw_pairing(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
         let mut spans = vec![Span::raw(format!(" {label:<10}"))];
         for i in presets.iter().copied() {
             let name = PRESET_NAMES[i];
-            spans.push(if i == selected {
-                Span::styled(
-                    format!("❯{name:<6}"),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw(format!(" {name:<6}"))
+            spans.push(match (i == selected, against) {
+                (true, false) => Span::styled(format!("❯{name:<6}"), chosen),
+                // Still what Enter plays.
+                (true, true) => Span::styled(format!(" {name:<6}"), Color::Yellow),
+                _ => Span::raw(format!(" {name:<6}")),
             });
         }
         let used = 11 + 7 * presets.len();
@@ -296,13 +308,26 @@ fn draw_pairing(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
         }
         lines.push(Line::from(spans));
     }
+    let who = opponent(ui.prefs.opponent());
+    let label = format!("{}Against   ", if against { "❯" } else { " " });
+    lines.push(Line::default());
+    lines.push(Line::from(if against {
+        vec![
+            Span::styled(label, chosen),
+            Span::styled(format!("◂ {who} ▸"), Color::LightYellow),
+        ]
+    } else {
+        vec![Span::raw(label), Span::styled(format!("  {who}"), dim())]
+    }));
+    let against_at = Rect::new(inner.x, inner.y + speeds + 2, inner.width, 1);
+    ui.hits.add(against_at.intersection(inner), Hit::Against);
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
     let control = PRESETS[selected.min(PRESETS.len() - 1)];
-    let rated = if ctx.account.is_some() {
-        "rated"
-    } else {
-        "unrated: sign in to be rated"
+    let rated = match (ui.prefs.computer, ctx.account.is_some()) {
+        (true, _) => "unrated",
+        (false, true) => "rated",
+        (false, false) => "unrated: sign in to be rated",
     };
     let about = Line::styled(
         format!("{control} {} · sides drawn · {rated}", speed(control)),
@@ -338,7 +363,7 @@ fn draw_challenge(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
     let area = frame.area();
     let settings = view.settings;
     let hosting = room.hosting();
-    let inner = framed(frame, area, " Challenge ", 48, 5);
+    let inner = framed(frame, area, " Challenge ", 48, CHALLENGE_ROWS as u16 + 2);
     let increment = format!("{} s", settings.control.increment.as_secs());
     let side = settings.side.name();
     let host_side = if hosting {
@@ -350,6 +375,12 @@ fn draw_challenge(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
         row("Minutes each", &minutes(&settings), selected == 0, hosting),
         row("Added each move", &increment, selected == 1, hosting),
         row(host_side, side, selected == 2, hosting),
+        row(
+            "Computer level",
+            &settings.level.to_string(),
+            selected == 3,
+            hosting,
+        ),
         Line::default(),
         Line::styled(
             format!(
@@ -363,7 +394,7 @@ fn draw_challenge(frame: &mut Frame, ui: &ChessUi, ctx: &Ctx, selected: usize) {
     ];
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
-    hit_rows(ui, inner, 3, Hit::Challenge);
+    hit_rows(ui, inner, CHALLENGE_ROWS, Hit::Challenge);
     let status = status(
         ctx,
         if hosting {

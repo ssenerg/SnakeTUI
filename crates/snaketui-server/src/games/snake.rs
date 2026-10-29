@@ -68,7 +68,14 @@ impl GameServer for SnakeServer {
         ))
     }
 
-    fn bot_match(&self, seed: u64, who: Entrant) -> Option<Box<dyn NewRoom>> {
+    /// Quick play's rules against a few bots; Snake's bots are all alike.
+    fn bot_match(
+        &self,
+        _: &PoolInfo,
+        seed: u64,
+        who: Entrant,
+        _: &[u8],
+    ) -> Option<Box<dyn NewRoom>> {
         let mut players = vec![who];
         players.extend((0..BOT_MATCH_BOTS).map(bot_entrant));
         Some(Box::new(game_api::Room::<Snake>::new_match(

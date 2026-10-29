@@ -132,6 +132,14 @@ opens it, and new players choose between the two.
   classical 30+0 and 30+20. Pick one with the arrows and Enter, and you're
   paired with the next player who picks the same, sides drawn. Quick play
   opens on the preset you played last.
+- **The computer.** Below the presets, "Against" turns from a person to
+  the computer at levels 1 to 5, and Enter then plays it at once, at the
+  preset chosen. Level 1 often blunders; level 5 looks as deep as its
+  budget of positions allows. Games against the computer are unrated. It
+  thinks for a moment on its own clock, turns draws down, and never
+  resigns. Quick pairing keeps your choice, so after a game one Enter
+  opens it and another plays again. After 20 seconds waiting for a person,
+  `b` plays the computer instead, at the level you last chose.
 - **Ratings.** Signed-in players' quick-pairing games are rated with
   Glicko-2, one rating for each speed, so a rapid game never moves your
   bullet rating. Everyone starts at 1500. A rating shows a `?` while it's
@@ -144,7 +152,8 @@ opens it, and new players choose between the two.
   starting time from a quarter of a minute to 3 hours, any increment up to
   3 minutes, and the host's side: white, black or drawn. A game starts once
   both players are ready, and the room's next game is the rematch.
-  Challenges are unrated.
+  Challenges are unrated. A host alone adds the computer with `b`, and
+  takes it out with `x`; the challenge's last row sets its level.
 - **The board** grows with the terminal, with the clocks, what each side
   has taken and the moves beside it. Its squares are 5×2 cells at 80×24,
   7×3 from about 83×25, and twice 80×24's, 10×4, from about 110×33.
@@ -156,7 +165,7 @@ opens it, and new players choose between the two.
   and tmux among them, they're glyphs or letters.
 - **The mouse** works on chess's screens: click a piece and then its
   square, or drag it there. The game menu, a promotion's pieces, resigning,
-  quick pairing's presets and the settings take clicks too. Everywhere
+  quick pairing's presets and opponent, and the settings take clicks too. Everywhere
   else the mouse is left alone, so a drag still selects text, such as a
   room's code.
 - **Moves.** Type them, as `Nf3`, `exd5`, `O-O` or `e7e8q`: as you type,
@@ -417,7 +426,7 @@ The code is a Cargo workspace:
 | `snaketui` (repository root) | The local game: terminal loop and `~/.snaketui` files |
 | `crates/game-api` | What every game shares: players, the `Game` and `Round` traits a game implements, and `Room`, which runs any game's lobby, countdown and results |
 | `crates/snake-core` | Game rules: board generation, any number of snakes moving together (`World`), single player (`SoloGame`), multiplayer rounds (`Snake`, a `Game`), settings, records. No terminal or file access |
-| `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess; and rooms' chess (`Chess`, a `Game`) |
+| `crates/chess-core` | Chess rules: moves, SAN, clocks, endings and Glicko-2 ratings, on cozy-chess; the computer opponent (`engine`); and rooms' chess (`Chess`, a `Game`) |
 | `crates/shell-tui` | The app around every game, drawn through any ratatui backend: the home menu, accounts, friends, the leaderboard, the game picker, and rooms' lobby and results. Each game adds its screens through `GameUi` |
 | `crates/snake-tui` | Snake's screens: single player, and its part of rooms (`SnakeUi`, a `GameUi`). The local game drives them on their own |
 | `crates/chess-tui` | Chess's screens: the board with its pieces as pictures where the terminal shows them, typed, picked and clicked moves, the game menu, quick pairing, a room's challenge and the settings (`ChessUi`, a `GameUi`) |

@@ -71,10 +71,12 @@ pub fn draw_finding(frame: &mut Frame, app: &App) {
     }
     lines.extend([Line::from(status), Line::default()]);
     if bots {
-        lines.push(Line::from("Nobody yet? Play bots now, unrated."));
+        let them = app.ui().bot_words().them;
+        lines.push(Line::from(format!("Nobody yet? Play {them} now, unrated.")));
         lines.push(Line::default());
         lines.push(
-            Line::from("b play bots · Esc cancel").style(Style::default().fg(Color::DarkGray)),
+            Line::from(format!("b play {them} · Esc cancel"))
+                .style(Style::default().fg(Color::DarkGray)),
         );
     } else {
         lines.push(Line::from("Esc cancel").style(Style::default().fg(Color::DarkGray)));

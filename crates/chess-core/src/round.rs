@@ -5,13 +5,17 @@
 //! The [`Game`](game::Game) inside knows its players by their slots in the
 //! room, 0 and 1, rather than by id, so a player who reconnects as someone
 //! new takes their side back.
+//!
+//! A bot in the room is the computer: the round moves for it, after a
+//! while on its clock, with the [`engine`](crate::engine).
 
 use std::time::Duration;
 
-use game_api::{Entrant, Game, GameId, Placement, RoomRng, Round, RoundEnd};
-use rand::RngExt;
+use game_api::{Entrant, Game, GameId, Placement, RoomRng, Round, RoundEnd, is_bot};
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::control::TimeControl;
+use crate::engine;
 use crate::game::{self, Players};
 use crate::moves::Move;
 use crate::outcome::Outcome;
@@ -41,6 +45,8 @@ impl Side {
     }
 }
 
+pub use crate::engine::LEVELS;
+
 /// What a room plays by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -48,6 +54,8 @@ pub struct ChessSettings {
     pub control: TimeControl,
     /// The host's side; matched rooms draw sides.
     pub side: Side,
+    /// The computer's level, if the computer plays: one of [`LEVELS`].
+    pub level: u8,
 }
 
 impl Default for ChessSettings {
@@ -55,6 +63,7 @@ impl Default for ChessSettings {
         Self {
             control: TimeControl::minutes(10, 0),
             side: Side::Random,
+            level: 3,
         }
     }
 }
@@ -73,11 +82,12 @@ pub enum ChessInput {
     Abort,
 }
 
-/// Chess, as rooms play it. It has no bots.
+/// Chess, as rooms play it. Its one bot is the computer.
 pub struct Chess;
 
 impl Game for Chess {
     const ID: GameId = GameId::Chess;
+    const BOT_NAMES: &'static [&'static str] = &["Computer"];
     const REJOIN: bool = true;
 
     type Settings = ChessSettings;
@@ -87,7 +97,7 @@ impl Game for Chess {
     type Round = ChessRound;
 
     fn allowed(settings: &ChessSettings) -> bool {
-        settings.control.is_playable()
+        settings.control.is_playable() && LEVELS.contains(&settings.level)
     }
 
     fn seats(_: &ChessSettings) -> Option<usize> {
@@ -95,10 +105,46 @@ impl Game for Chess {
     }
 }
 
+/// The least and the most the computer takes over a move.
+const THINK: (Duration, Duration) = (Duration::from_millis(300), Duration::from_secs(5));
+
+/// The most it takes over a first move, while no clock runs.
+const FIRST_THINK: Duration = Duration::from_secs(2);
+
+/// The computer, in a game it plays.
+struct Bot {
+    color: Color,
+    level: u8,
+    /// Its own, drawn from the room's at the start, so a room's seed plays
+    /// the same games.
+    rng: RoomRng,
+    /// When it moves, on the game's clock, while it's its turn.
+    move_at: Option<Duration>,
+}
+
+impl Bot {
+    /// How long it takes over its move at `t`: about a fortieth of the
+    /// time it has left and half its increment, more or less.
+    fn think(&mut self, game: &game::Game, t: Duration) -> Duration {
+        let clock = game.clock();
+        let left = clock.remaining(self.color, t);
+        let about = left / 40 + clock.control().increment / 2;
+        let most = if clock.running().is_some() {
+            THINK.1
+        } else {
+            FIRST_THINK
+        };
+        let think = about.mul_f64(self.rng.random_range(0.5..1.5));
+        think.clamp(THINK.0, most).min(left / 2)
+    }
+}
+
 pub struct ChessRound {
     game: game::Game,
     /// The players, by slot, for the results.
     players: Vec<Entrant>,
+    /// The computer, if it plays.
+    bot: Option<Bot>,
     /// When play started, on the room's clock: the game's own clock
     /// counts from then.
     began: Option<Duration>,
@@ -135,6 +181,48 @@ impl ChessRound {
         match self.counting(t) {
             Some((color, left)) => (color, whole_secs(left)),
             None => (None, 0),
+        }
+    }
+
+    /// Has the computer move a while after its turn comes at `t`.
+    fn schedule(&mut self, t: Duration) {
+        let Some(bot) = self.bot.as_mut() else {
+            return;
+        };
+        let turn = self.game.outcome().is_none() && self.game.side_to_move() == bot.color;
+        if !turn {
+            bot.move_at = None;
+        } else if bot.move_at.is_none() {
+            bot.move_at = Some(t + bot.think(&self.game, t));
+        }
+    }
+
+    /// The computer moves, if its time has come by `t`.
+    fn bot_turn(&mut self, t: Duration) {
+        let Some(bot) = self.bot.as_mut() else {
+            return;
+        };
+        if bot.move_at.is_none_or(|at| at > t) {
+            return;
+        }
+        bot.move_at = None;
+        let color = bot.color;
+        let Some(mv) = engine::choose_in(&self.game, bot.level, &mut bot.rng) else {
+            return;
+        };
+        if self.game.play(color, mv, t).is_ok() || self.game.outcome().is_some() {
+            self.changed = true;
+            self.shown = self.shown_at(t);
+        }
+    }
+
+    /// The computer turns down a draw offered to it, at once.
+    fn decline_for_bot(&mut self) {
+        if let Some(bot) = &self.bot
+            && self.game.draw_offer() == Some(!bot.color)
+        {
+            let _ = self.game.decline_draw(bot.color);
+            self.changed = true;
         }
     }
 
@@ -183,9 +271,20 @@ impl Round<Chess> for ChessRound {
         };
         let (white, black) = if host_white { (0, 1) } else { (1, 0) };
         let game = game::Game::new(settings.control, Players { white, black });
+        let bot = players.iter().position(|p| is_bot(p.id)).map(|slot| Bot {
+            color: if slot == white as usize {
+                Color::White
+            } else {
+                Color::Black
+            },
+            level: settings.level,
+            rng: RoomRng::seed_from_u64(rng.next_u64()),
+            move_at: None,
+        });
         let mut round = Self {
             game,
             players: players.to_vec(),
+            bot,
             began: None,
             shown: (None, 0),
             changed: true,
@@ -197,6 +296,7 @@ impl Round<Chess> for ChessRound {
     fn go(&mut self, at: Duration) -> Option<RoundEnd> {
         self.began = Some(at);
         self.changed = true;
+        self.schedule(Duration::ZERO);
         None
     }
 
@@ -205,6 +305,11 @@ impl Round<Chess> for ChessRound {
         if self.game.check_time(t).is_some() {
             return self.ended();
         }
+        self.bot_turn(t);
+        if self.game.outcome().is_some() {
+            return self.ended();
+        }
+        self.schedule(t);
         let shown = self.shown_at(t);
         if shown != self.shown {
             self.shown = shown;
@@ -240,6 +345,8 @@ impl Round<Chess> for ChessRound {
             self.changed = true;
             self.shown = self.shown_at(t);
         }
+        self.decline_for_bot();
+        self.schedule(t);
         self.ended()
     }
 
@@ -261,7 +368,10 @@ impl Round<Chess> for ChessRound {
             (!left.is_zero())
                 .then(|| left.saturating_sub(Duration::from_secs(whole_secs(left) - 1)))
         });
-        [tick, self.game.until_next(t)]
+        // And the computer's move.
+        let bot = self.bot.as_ref().and_then(|b| b.move_at);
+        let bot = bot.map(|at| at.saturating_sub(t));
+        [tick, self.game.until_next(t), bot]
             .into_iter()
             .flatten()
             .min()
@@ -302,6 +412,7 @@ mod tests {
         let settings = ChessSettings {
             control: TimeControl::minutes(1, 0),
             side,
+            ..ChessSettings::default()
         };
         let mut rng = RoomRng::seed_from_u64(1);
         let mut round = ChessRound::start(&settings, &players(), &mut rng).unwrap();
@@ -437,6 +548,135 @@ mod tests {
         assert!(matches!(round.leave(0, secs(1)), Some(RoundEnd::Aborted)));
     }
 
+    /// A game of `control` between p1 and the computer at `level`, p1
+    /// hosting with `side`, from `seed`, under way from 3 s.
+    fn against_bot(control: TimeControl, side: Side, level: u8, seed: u64) -> ChessRound {
+        let settings = ChessSettings {
+            control,
+            side,
+            level,
+        };
+        let players = [players()[0].clone(), Chess::bot(0)];
+        let mut rng = RoomRng::seed_from_u64(seed);
+        let mut round = ChessRound::start(&settings, &players, &mut rng).unwrap();
+        round.go(secs(3));
+        round
+    }
+
+    /// Wakes the round as a room would, from `at`, until a move more than
+    /// `moves` is on the board; returns when.
+    fn wake_until_moved(round: &mut ChessRound, mut at: Duration, moves: usize) -> Duration {
+        for _ in 0..1000 {
+            if round.view(at).unwrap().moves.len() > moves {
+                return at;
+            }
+            at += round.until_next(at);
+            assert_eq!(round.advance(at, Duration::ZERO), None);
+        }
+        panic!("no move");
+    }
+
+    /// The first of p1's legal moves.
+    fn any_move(round: &ChessRound) -> ChessInput {
+        ChessInput::Move(round.game.position().legal_moves()[0])
+    }
+
+    #[test]
+    fn the_computer_thinks_then_moves_first_as_white() {
+        let mut round = against_bot(TimeControl::minutes(3, 2), Side::Black, 3, 1);
+        assert!(round.until_next(secs(3)) <= FIRST_THINK);
+        round.advance(secs(3) + Duration::from_millis(250), Duration::ZERO);
+        assert!(round.view(secs(3)).unwrap().moves.is_empty(), "too soon");
+        let moved = wake_until_moved(&mut round, secs(3), 0) - secs(3);
+        assert!(moved >= THINK.0 && moved <= FIRST_THINK, "{moved:?}");
+        assert!(round.take_changed());
+        assert_eq!(round.game.side_to_move(), Color::Black);
+        assert_eq!(round.bot.as_ref().unwrap().move_at, None, "p1's turn");
+    }
+
+    #[test]
+    fn the_computer_answers_and_its_clock_runs() {
+        let mut round = against_bot(TimeControl::minutes(1, 0), Side::White, 1, 2);
+        let mut at = secs(4);
+        for ply in [0, 2, 4] {
+            assert_eq!(round.input(0, any_move(&round), at, None), None);
+            at = wake_until_moved(&mut round, at, ply + 1);
+            at += secs(1);
+        }
+        let view = round.view(at).unwrap();
+        assert_eq!(view.moves.len(), 6);
+        assert!(view.clocks[Color::Black.index()] < secs(60), "{view:?}");
+    }
+
+    #[test]
+    fn the_computer_turns_draws_down() {
+        let mut round = against_bot(TimeControl::minutes(5, 0), Side::White, 2, 3);
+        round.input(0, any_move(&round), secs(4), None);
+        let at = wake_until_moved(&mut round, secs(4), 1);
+        assert_eq!(round.input(0, ChessInput::OfferDraw, at, None), None);
+        assert_eq!(round.game.draw_offer(), None);
+        assert_eq!(round.game.outcome(), None);
+    }
+
+    #[test]
+    fn a_seed_plays_the_same_game_again() {
+        let game = |seed| {
+            let mut round = against_bot(TimeControl::minutes(5, 0), Side::Random, 1, seed);
+            let mut at = secs(3);
+            while round.view(at).unwrap().moves.len() < 12 {
+                if round.bot.as_ref().unwrap().move_at.is_none() {
+                    at += secs(1);
+                    round.input(0, any_move(&round), at, None);
+                }
+                at += round.until_next(at);
+                round.advance(at, Duration::ZERO);
+            }
+            round.view(at).unwrap().moves
+        };
+        assert_eq!(game(7), game(7));
+    }
+
+    #[test]
+    fn a_room_wakes_for_the_computer_until_the_game_ends() {
+        for level in [1, 5] {
+            let settings = ChessSettings {
+                control: TimeControl::minutes(10, 0),
+                side: Side::Random,
+                level,
+            };
+            let settings = RoomSettings::<Chess>::new(settings, RoomKind::Match).unwrap();
+            let me = players()[0].clone();
+            let mut room = Room::<Chess>::new_match(settings, 11, vec![me.clone(), Chess::bot(0)]);
+            room.advance(secs(3));
+            let mut end = None;
+            for _ in 0..2000 {
+                let game = room.view().game.unwrap();
+                if game.moves.len() >= 120 {
+                    break;
+                }
+                let mine =
+                    game.players.color_of(0) == Some(game.replay().unwrap().0.side_to_move());
+                end = if mine {
+                    let (position, _) = game.replay().unwrap();
+                    let moves = position.legal_moves();
+                    let mv = moves[game.moves.len() * 7 % moves.len()];
+                    room.advance(secs(1));
+                    room.play(me.id, ChessInput::Move(mv), None)
+                } else {
+                    room.advance(room.until_next())
+                };
+                if end.is_some() {
+                    break;
+                }
+            }
+            let game = room.view().game.unwrap();
+            assert!(
+                end.is_some() || game.moves.len() >= 120,
+                "level {level}: {game:?}"
+            );
+        }
+    }
+
     #[test]
     fn rooms_seat_two_and_play_chess() {
         let settings =
@@ -455,6 +695,11 @@ mod tests {
         assert!(!Chess::allowed(&ChessSettings {
             control: TimeControl::minutes(0, 5),
             side: Side::White,
+            ..ChessSettings::default()
+        }));
+        assert!(!Chess::allowed(&ChessSettings {
+            level: 6,
+            ..ChessSettings::default()
         }));
     }
 }

@@ -52,11 +52,21 @@ pub struct Enqueue {
 #[rtype(result = "()")]
 pub struct Dequeue(pub PlayerId);
 
-/// A waiting player gives up on people: they leave the queue for an
-/// unrated match against bots, here, and get [`Matched`].
+/// A player wants an unrated match against `pool`'s game's bots, here, as
+/// they `choice` them: they leave the queue if they're in it, and get
+/// [`Matched`]. Answers whether a match is coming, this one or one made
+/// meanwhile.
 #[derive(Message)]
-#[rtype(result = "()")]
-pub struct BotMatch(pub PlayerId);
+#[rtype(result = "bool")]
+pub struct BotMatch {
+    pub pool: PoolKey,
+    pub who: Entrant,
+    pub presence: Presence,
+    pub reply: Recipient<Matched>,
+    pub choice: Vec<u8>,
+    /// Whether they were waiting in the queue when they asked.
+    pub queued: bool,
+}
 
 /// A match formed: the player is already seated in this room.
 #[derive(Message)]
@@ -525,34 +535,40 @@ impl Handler<Drain> for MatchmakerActor {
 }
 
 impl Handler<BotMatch> for MatchmakerActor {
-    type Result = ();
+    type Result = bool;
 
-    fn handle(&mut self, BotMatch(id): BotMatch, _: &mut Self::Context) {
-        // Matched meanwhile, or the server is stopping: they stay as they
-        // are.
+    fn handle(&mut self, msg: BotMatch, _: &mut Self::Context) -> bool {
+        // The server is stopping: no new matches here.
         if self.draining {
-            return;
+            return false;
+        }
+        let id = msg.who.id;
+        // Matched with people meanwhile, perhaps elsewhere: they stay as
+        // they are.
+        if msg.queued && !self.waiting.contains_key(&id) {
+            return true;
         }
         let seed = self.seed.unwrap_or_else(rand::random);
-        let Some(room) = self.waiting.get(&id).and_then(|w| {
-            let game = games::get(w.pool.game)?;
-            game.bot_match(seed, w.who.clone())
-        }) else {
-            // Not waiting any more, or a game without bots: as they were.
-            return;
+        let Some(room) = msg
+            .pool
+            .find()
+            .and_then(|(game, info)| game.bot_match(info, seed, msg.who, &msg.choice))
+        else {
+            // A game without bots, or a pool it doesn't have.
+            return false;
         };
-        let Some(waiter) = self.waiting.remove(&id) else {
-            return;
-        };
-        self.unqueue(id);
+        if self.waiting.remove(&id).is_some() {
+            self.unqueue(id);
+        }
         // No ratings: nothing about it is saved.
         let setup = RoomSetup {
-            present: HashMap::from([(id, waiter.presence.clone())]),
+            present: HashMap::from([(id, msg.presence)]),
             ..RoomSetup::default()
         };
         let (room, view) = room.start(&self.host, self.host.new_id(), setup);
-        debug!(player = id, pool = %waiter.pool, "a match against bots");
-        waiter.reply.do_send(Matched { room, view });
+        debug!(player = id, pool = %msg.pool, "a match against bots");
+        msg.reply.do_send(Matched { room, view });
+        true
     }
 }
 

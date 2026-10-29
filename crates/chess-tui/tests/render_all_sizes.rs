@@ -187,7 +187,7 @@ fn screens() -> Vec<App> {
         ui.selected = selected;
         apps.push(app);
     }
-    for (me, selected) in [(ANN, 0), (ANN, 2), (BEN, 1)] {
+    for (me, selected) in [(ANN, 0), (ANN, 2), (ANN, 3), (BEN, 1)] {
         let mut app = app(me, &views[1], |_| {});
         app.screen = Screen::Game;
         chess(&mut app).screen = ChessScreen::Challenge { selected };
@@ -198,6 +198,19 @@ fn screens() -> Vec<App> {
     chess(&mut noted).screen = ChessScreen::Challenge { selected: 0 };
     noted.notify("ann-with-a-long-name made it 3+2 blitz".into());
     apps.push(noted);
+    // Against the computer: in the lobby, its challenge, and the game.
+    let lobby = against_computer(5);
+    let mut game = against_computer(1);
+    game.toggle_ready(ANN);
+    game.advance(Duration::from_secs(3));
+    for view in [lobby.view(), game.view()] {
+        apps.push(app(ANN, &view, |_| {}));
+        apps.push(app(99, &view, |_| {}));
+    }
+    let mut app_ = app(ANN, &lobby.view(), |_| {});
+    app_.screen = Screen::Game;
+    chess(&mut app_).screen = ChessScreen::Challenge { selected: 3 };
+    apps.push(app_);
     // The home menu; quick pairing's presets, with every one chosen, a
     // signed-in player's ratings and a notice; and waiting in a pool.
     apps.push(app(ANN, &views[1], home));
@@ -205,7 +218,23 @@ fn screens() -> Vec<App> {
         let mut app = app(ANN, &views[1], home);
         app.go_home(HomeItem::QuickPlay, None);
         app.handle(Key::Enter);
-        chess(&mut app).screen = ChessScreen::Pairing { selected };
+        chess(&mut app).screen = ChessScreen::Pairing {
+            selected,
+            against: false,
+        };
+        apps.push(app);
+    }
+    // Who to play: a person, and the computer.
+    for computer in [false, true] {
+        let mut app = app(ANN, &views[1], home);
+        app.go_home(HomeItem::QuickPlay, None);
+        app.handle(Key::Enter);
+        let ui = chess(&mut app);
+        ui.prefs.computer = computer;
+        ui.screen = ChessScreen::Pairing {
+            selected: 9,
+            against: true,
+        };
         apps.push(app);
     }
     let rated = |app: &mut App| {

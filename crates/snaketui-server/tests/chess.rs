@@ -343,3 +343,83 @@ async fn a_premove_is_played_the_moment_the_other_side_moves() {
     ann.wait_for("1. e4      e5").await;
     ann.wait_for("Your move").await;
 }
+
+/// `p` makes their move once it's theirs, whichever side they play, and
+/// waits for the computer's answer.
+async fn a_move_and_the_computer_answers(p: &mut Player) {
+    p.wait_until("my move", Duration::from_secs(10), |p| {
+        p.text().contains("Your move")
+    })
+    .await;
+    let black = p.text().contains("1. ");
+    p.send(if black { b"e5" } else { b"e4" }).await;
+    p.send(ENTER).await;
+    let answered = if black { "2. " } else { "1. e4      " };
+    p.wait_until("the computer's answer", Duration::from_secs(10), |p| {
+        let text = p.text();
+        text.contains("Your move") && line_of(&text, answered).len() > answered.len() + 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_guest_plays_the_computer_from_quick_pairing() {
+    let server = chess_server();
+    let mut p = guest(&server).await;
+    p.send(DOWN).await;
+    p.send(ENTER).await;
+    p.wait_for("Quick pairing").await;
+    // From 5+3 down to who to play, to level 1; then up to bullet's 2+1,
+    // and left to 1+0.
+    for key in [DOWN, DOWN, DOWN, RIGHT] {
+        p.send(key).await;
+    }
+    p.wait_for("◂ the computer, level 1 ▸").await;
+    for key in [UP, UP, UP, UP, LEFT] {
+        p.send(key).await;
+    }
+    p.wait_for("1+0 bullet · sides drawn · unrated").await;
+    p.send(ENTER).await;
+    p.wait_for("Computer · level 1").await;
+    a_move_and_the_computer_answers(&mut p).await;
+}
+
+#[tokio::test]
+async fn the_queue_offers_the_computer_after_a_wait() {
+    let server = chess_server();
+    let mut p = guest(&server).await;
+    p.send(DOWN).await;
+    p.send(ENTER).await;
+    p.wait_for("Quick pairing").await;
+    p.send(ENTER).await;
+    p.wait_for("Finding a match").await;
+    assert!(!p.text().contains("computer"), "{}", p.text());
+    p.wait_until("the computer offered", Duration::from_secs(30), |p| {
+        p.text().contains("b play the computer")
+    })
+    .await;
+    p.send(b"b").await;
+    p.wait_for("Computer · level 3").await;
+    a_move_and_the_computer_answers(&mut p).await;
+}
+
+#[tokio::test]
+async fn a_host_plays_the_computer_in_a_private_room() {
+    let server = chess_server();
+    let mut ann = guest(&server).await;
+    create_room(&mut ann).await;
+    ann.wait_for("b add the computer").await;
+    ann.send(b"b").await;
+    ann.wait_for("Computer · level 3").await;
+    // A level up, on the challenge screen.
+    ann.send(b"e").await;
+    ann.wait_for("Computer level").await;
+    for key in [DOWN, DOWN, DOWN, RIGHT] {
+        ann.send(key).await;
+    }
+    ann.wait_for("◂ 4 ▸").await;
+    ann.send(ESC).await;
+    ann.wait_for("Computer · level 4").await;
+    ann.send(ENTER).await;
+    a_move_and_the_computer_answers(&mut ann).await;
+}

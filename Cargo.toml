@@ -36,3 +36,10 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# The chess engine searches thousands of positions a move.
+[profile.dev.package.chess-core]
+opt-level = 3
+
+[profile.dev.package.cozy-chess]
+opt-level = 3

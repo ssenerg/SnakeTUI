@@ -6,10 +6,12 @@
 //! adds the history, the [`clock::Clock`]s, draw offers and every way a
 //! game ends, and [`view::GameView`] is the snapshot that gets drawn or
 //! sent. [`control`] sorts time controls into the categories [`rating`]
-//! keeps Glicko-2 ratings in, and [`round`] plays games in rooms.
+//! keeps Glicko-2 ratings in, [`round`] plays games in rooms, and
+//! [`engine`] is the computer opponent.
 
 pub mod clock;
 pub mod control;
+pub mod engine;
 pub mod game;
 mod material;
 pub mod moves;

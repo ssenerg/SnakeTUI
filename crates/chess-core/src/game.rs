@@ -121,6 +121,12 @@ impl Game {
         &self.moves
     }
 
+    /// The repetition key of every position since the last capture or pawn
+    /// move, the current one last.
+    pub(crate) fn seen(&self) -> &[u64] {
+        &self.seen
+    }
+
     pub fn last_move(&self) -> Option<Move> {
         self.moves.last().copied().and_then(Move::unpack)
     }
